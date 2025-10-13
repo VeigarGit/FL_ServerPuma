@@ -7,6 +7,8 @@ import torch.nn as nn
 import copy
 from torch.utils.data import DataLoader
 import time
+import argparse
+import sys
 # Assuming you already have a test dataset available on the server side
 from data_utils import read_client_data  # Utility to read the server's dataset
 
@@ -77,14 +79,6 @@ def evaluate_model(model, data_loader):
     average_loss = total_loss / len(data_loader)
     return accuracy, average_loss
 
-HOST = '0.0.0.0'
-PORT = 9090
-NUM_CLIENTS_PER_ROUND = 2  # how many client updates to wait for each round
-NUM_ROUNDS = 4
-
-global_model = SimpleModel()
-global_state = global_model.state_dict()
-
 # Helper to send pickled data with a header indicating its length
 def send_data(conn, data):
     data_bytes = pickle.dumps(data)
@@ -110,77 +104,190 @@ def recvall(conn, n):
     return data
 
 # Thread function to handle a single client connection:
-def handle_client(conn, client_updates, lock):
-    # Send the current global model state
-    start_time = time.time()
-    send_data(conn, global_state)
-    # Receive the updated model from the client
-    updated_state = recv_data(conn)
-    
-    end_time = time.time()
-    if updated_state is not None:
+def handle_client(conn, client_updates, lock, round_num, client_id):
+    try:
+        start_time = time.time()
+        print(f"Round {round_num}: Handling client {client_id}")
+        
+        # Send the current global model state
         with lock:
-            client_updates.append(updated_state)
-    training_time = end_time - start_time  # Calculate the training time
-    print(f"Client training time: {training_time:.2f} seconds")  # Log the training time
+            current_global_state = global_state.copy()
+        
+        send_data(conn, current_global_state)
+        print(f"Round {round_num}: Sent global model to client {client_id}")
+        
+        # Receive the updated model from the client
+        updated_state = recv_data(conn)
+        
+        end_time = time.time()
+        
+        if updated_state is not None:
+            with lock:
+                client_updates.append(updated_state)
+            training_time = end_time - start_time
+            print(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
+        else:
+            print(f"Round {round_num}: No update received from client {client_id}")
+            
+    except Exception as e:
+        print(f"Round {round_num}: Error handling client {client_id}: {e}")
 
-def load_test_data(dataset, client_idx, is_train=True, batch_size=32):
-    # Placeholder for loading test data, you can customize it according to your needs
-    test_data = read_client_data(dataset, client_idx, is_train)  # Update this based on actual test dataset
-    X, y = zip(*test_data)
-    X = torch.stack(X)
-    y = torch.tensor(y)
-    dataset = torch.utils.data.TensorDataset(X, y)
-    return DataLoader(dataset, batch_size=32)
+def load_test_data(dataset, client_idx, batch_size=32):
+    try:
+        test_data = read_client_data(dataset, client_idx, is_train=False)
+        X, y = zip(*test_data)
+        X = torch.stack(X)
+        y = torch.tensor(y)
+        dataset = torch.utils.data.TensorDataset(X, y)
+        return DataLoader(dataset, batch_size=batch_size)
+    except Exception as e:
+        print(f"Error loading test data: {e}")
+        return None
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Federated Learning Server')
+    
+    # Server configuration
+    parser.add_argument('--host', type=str, default='0.0.0.0', 
+                       help='Server host (default: 0.0.0.0)')
+    parser.add_argument('--port', type=int, default=9090, 
+                       help='Server port (default: 9090)')
+    
+    # Federated learning parameters
+    parser.add_argument('--clients-per-round', type=int, default=2, 
+                       help='Number of clients per round (default: 2)')
+    parser.add_argument('--rounds', type=int, default=4, 
+                       help='Number of training rounds (default: 4)')
+    
+    # Dataset and model parameters
+    parser.add_argument('--dataset', type=str, default='Cifar10', 
+                       choices=['Cifar10', 'MNIST', 'FashionMNIST'],
+                       help='Dataset name (default: Cifar10)')
+    parser.add_argument('--test-client-idx', type=int, default=100, 
+                       help='Client index for test data (default: 100)')
+    
+    # Model architecture
+    parser.add_argument('--in-features', type=int, default=3, 
+                       help='Input features/channels (default: 3)')
+    parser.add_argument('--num-classes', type=int, default=10, 
+                       help='Number of classes (default: 10)')
+    parser.add_argument('--dim', type=int, default=1600, 
+                       help='Dimension for first linear layer (default: 1600)')
+    
+    # Evaluation parameters
+    parser.add_argument('--batch-size', type=int, default=32, 
+                       help='Batch size for evaluation (default: 32)')
+    
+    # Server options
+    parser.add_argument('--max-clients', type=int, default=10, 
+                       help='Maximum number of client connections (default: 10)')
+    
+    return parser.parse_args()
 
 def main():
     global global_state
+    
+    args = parse_args()
+    
+    print("=== Federated Learning Server ===")
+    print(f"Host: {args.host}:{args.port}")
+    print(f"Dataset: {args.dataset}")
+    print(f"Clients per round: {args.clients_per_round}")
+    print(f"Total rounds: {args.rounds}")
+    print(f"Test client index: {args.test_client_idx}")
+    print("=" * 40)
+    
+    # Initialize global model with arguments
+    global_model = SimpleModel(
+        in_features=args.in_features,
+        num_classes=args.num_classes,
+        dim=args.dim
+    )
+    global_state = global_model.state_dict()
+    
     lock = threading.Lock()
-    dataset = "Cifar10"
-    client_idx=100
-    test_loader = load_test_data(dataset, client_idx, is_train=False, batch_size=32)  # Load test data for evaluation after aggregation
+    
+    # Load test data
+    test_loader = load_test_data(args.dataset, args.test_client_idx, args.batch_size)
+    if test_loader is None:
+        print("Warning: Could not load test data. Evaluation will be skipped.")
+        test_loader = None
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((HOST, PORT))
-        s.listen()
-        print(f"Server listening on {(HOST, PORT)}")
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((args.host, args.port))
+        s.listen(args.max_clients)
+        print(f"Server listening on {args.host}:{args.port}")
+        print(f"Waiting for {args.clients_per_round} clients to connect...")
+        
+        # Wait for initial client connections
         client_connections = []
+        client_addresses = []
         
-        while len(client_connections) < NUM_CLIENTS_PER_ROUND:
+        while len(client_connections) < args.clients_per_round:
             conn, addr = s.accept()
-            print(f"Client connected: {addr}")
+            print(f"Client {len(client_connections) + 1} connected: {addr}")
             client_connections.append(conn)
+            client_addresses.append(addr)
         
-        for round_num in range(NUM_ROUNDS):
-            print(f"\n--- Round {round_num} ---")
+        print(f"All {args.clients_per_round} clients connected. Starting training...")
+        
+        for round_num in range(args.rounds):
+            print(f"\n--- Round {round_num + 1}/{args.rounds} ---")
             client_updates = []
             threads = []
             
-            for conn in client_connections:
-                t = threading.Thread(target=handle_client, args=(conn, client_updates, lock))
+            # Handle each client in a separate thread
+            for i, conn in enumerate(client_connections):
+                t = threading.Thread(
+                    target=handle_client, 
+                    args=(conn, client_updates, lock, round_num + 1, i + 1)
+                )
                 t.start()
                 threads.append(t)
             
+            # Wait for all threads to complete
             for t in threads:
                 t.join()
             
             # Aggregate the client updates
             if client_updates:
+                print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
                 aggregated_state = aggregate_models(client_updates)
-                global_state = aggregated_state
-                global_model.load_state_dict(global_state)
+                
+                with lock:
+                    global_state = aggregated_state
+                    global_model.load_state_dict(global_state)
                 
                 # Evaluate model on the test dataset after aggregation
-                
-                accuracy, avg_loss = evaluate_model(global_model, test_loader)
-                print(f"Round {round_num}: Test Accuracy: {accuracy:.2f}% | Test Loss: {avg_loss:.4f}")
+                if test_loader is not None:
+                    accuracy, avg_loss = evaluate_model(global_model, test_loader)
+                    print(f"Round {round_num + 1}: Test Accuracy: {accuracy:.2f}% | Test Loss: {avg_loss:.4f}")
+                else:
+                    print(f"Round {round_num + 1}: Model aggregated (no test data for evaluation)")
                 
                 # Notify clients that the round ended
+                successful_notifications = 0
                 for conn in client_connections:
-                    conn.send('end'.encode('utf-8'))
-                print("Global model updated and evaluated after aggregation.")
+                    try:
+                        conn.send('end'.encode('utf-8'))
+                        successful_notifications += 1
+                    except Exception as e:
+                        print(f"Error notifying client: {e}")
+                
+                print(f"Round {round_num + 1}: Global model updated. Notified {successful_notifications} clients.")
             else:
-                print("No client updates received this round.")
+                print(f"Round {round_num + 1}: No client updates received this round.")
+        
+        print(f"\nTraining completed after {args.rounds} rounds!")
+        
+        # Close all client connections
+        for conn in client_connections:
+            try:
+                conn.close()
+            except:
+                pass
+        print("All client connections closed.")
 
 if __name__ == '__main__':
     main()

@@ -8,6 +8,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from data_utils import read_client_data  # Importing the data reading utility
+import argparse
+import sys
 
 # Simple CNN model for MNIST or other datasets
 class SimpleModel(nn.Module):
@@ -60,10 +62,10 @@ def recvall(conn, n):
     return data
 
 # Update local training to use data loaded via read_client_data
-def local_training(model, state_dict, train_loader):
+def local_training(model, state_dict, train_loader, learning_rate=0.01):
     model.load_state_dict(state_dict)
     model.train()
-    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    optimizer = optim.SGD(model.parameters(), lr=learning_rate)
     loss_fn = nn.CrossEntropyLoss()  # appropriate for classification
     
     for x, y in train_loader:  # Train on batches from the loaded data
@@ -105,42 +107,119 @@ def load_data(dataset, client_idx, is_train=True, batch_size=32):
     dataset = torch.utils.data.TensorDataset(X, y)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Federated Learning Client')
+    
+    # Connection arguments
+    parser.add_argument('--host', type=str, default='10.0.23.189', 
+                       help='Server IP address (default: 10.0.23.189)')
+    parser.add_argument('--port', type=int, default=9090, 
+                       help='Server port (default: 9090)')
+    
+    # Training arguments
+    parser.add_argument('--rounds', type=int, default=4, 
+                       help='Number of training rounds (default: 4)')
+    parser.add_argument('--dataset', type=str, default='Cifar10', 
+                       choices=['Cifar10', 'MNIST', 'FashionMNIST'], 
+                       help='Dataset name (default: Cifar10)')
+    parser.add_argument('--client-idx', type=int, default=0, 
+                       help='Client index (default: 0)')
+    
+    # Model arguments
+    parser.add_argument('--in-features', type=int, default=3, 
+                       help='Input features/channels (default: 3)')
+    parser.add_argument('--num-classes', type=int, default=10, 
+                       help='Number of classes (default: 10)')
+    parser.add_argument('--dim', type=int, default=1600, 
+                       help='Dimension for first linear layer (default: 1600)')
+    
+    # Training hyperparameters
+    parser.add_argument('--batch-size', type=int, default=32, 
+                       help='Batch size (default: 32)')
+    parser.add_argument('--learning-rate', type=float, default=0.01, 
+                       help='Learning rate (default: 0.01)')
+    
+    # Other options
+    parser.add_argument('--random-client', action='store_true', 
+                       help='Use random client index instead of fixed')
+    
+    return parser.parse_args()
+
 def main():
-    HOST = '10.0.23.189'  # Change to the server's IP if needed.
-    PORT = 9090
-    NUM_ROUNDS = 4
-    dataset = "Cifar10"  # Specify the dataset you are working with
-    client_idx =0 #random.randint(0, 5)  # Specify the client index
-    model = SimpleModel()
+    args = parse_args()
+    
+    # Set random client if requested
+    if args.random_client:
+        args.client_idx = random.randint(0, 5)
+    
+    print("=== Federated Learning Client ===")
+    print(f"Host: {args.host}:{args.port}")
+    print(f"Dataset: {args.dataset}")
+    print(f"Client: {args.client_idx}")
+    print(f"Rounds: {args.rounds}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Learning rate: {args.learning_rate}")
+    print("=" * 40)
+    
+    # Initialize model with arguments
+    model = SimpleModel(
+        in_features=args.in_features,
+        num_classes=args.num_classes,
+        dim=args.dim
+    )
 
     # Load the dataset using the custom data loader
-    train_loader = load_data(dataset, client_idx, is_train=True, batch_size=32)
-    test_loader = load_data(dataset, client_idx, is_train=False, batch_size=32)
+    try:
+        train_loader = load_data(args.dataset, args.client_idx, is_train=True, batch_size=args.batch_size)
+        test_loader = load_data(args.dataset, args.client_idx, is_train=False, batch_size=args.batch_size)
+        print(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        sys.exit(1)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((HOST, PORT))
+        try:
+            s.connect((args.host, args.port))
+            print(f"Connected to server {args.host}:{args.port}")
+        except Exception as e:
+            print(f"Connection failed: {e}")
+            sys.exit(1)
         
-        for round_num in range(NUM_ROUNDS):
-            print(f"\n--- Round {round_num} ---")
+        for round_num in range(args.rounds):
+            print(f"\n--- Round {round_num + 1}/{args.rounds} ---")
+            
             # Receive the global model from the server
             global_state = recv_data(s)
+            if global_state is None:
+                print("Failed to receive global model. Connection may be closed.")
+                break
             print("Received global model.")
+            
             # Perform local training using the received global model
-            updated_state = local_training(model, global_state, train_loader)
-            print("Client update sent.")
+            updated_state = local_training(model, global_state, train_loader, args.learning_rate)
+            print("Local training completed.")
 
             # Evaluate training performance
             train_accuracy, train_loss = evaluate_model(model, train_loader)
-            print(f"Client {client_idx}: Training Accuracy: {train_accuracy:.2f}% | Training Loss: {train_loss:.4f}")
+            print(f"Client {args.client_idx}: Training Accuracy: {train_accuracy:.2f}% | Training Loss: {train_loss:.4f}")
             
             # Evaluate test performance
             test_accuracy, test_loss = evaluate_model(model, test_loader)
-            print(f"Client {client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
+            print(f"Client {args.client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
             
             # Send the updated model state back to the server
             send_data(s, updated_state)
+            print("Client update sent.")
+            
             # Wait for the server to finish the round
-            s.recv(3)
+            try:
+                s.recv(3)
+                print("Ready for next round...")
+            except Exception as e:
+                print(f"Error waiting for server: {e}")
+                break
+
+    print("\nTraining completed!")
 
 if __name__ == '__main__':
     main()
