@@ -11,7 +11,8 @@ import argparse
 import sys
 # Assuming you already have a test dataset available on the server side
 from data_utils import read_client_data  # Utility to read the server's dataset
-
+from prunning import restore_to_original_size, prune_and_restructure
+from size_mode import get_model_size
 # A simple model for demonstration; replace with your actual model (e.g., from your FedAvg code)
 class SimpleModel(nn.Module):
     def __init__(self, in_features=3, num_classes=10, dim=1600):
@@ -50,99 +51,230 @@ class SimpleModel(nn.Module):
         out = self.fc(out)
         return out
 
-# Aggregates a list of state_dicts by averaging their values
-def aggregate_models(model_list):
-    agg_state = {}
-    for key in model_list[0].keys():
-        agg_state[key] = sum([m[key] for m in model_list]) / len(model_list)
-    return agg_state
+class FederatedLearningServer:
+    def __init__(self, args):
+        self.args = args
+        self.global_model = SimpleModel(
+            in_features=args.in_features,
+            num_classes=args.num_classes,
+            dim=args.dim
+        )
+        self.global_state = self.global_model.state_dict()
+        self.lock = threading.Lock()
+        self.client_data = {}
+        self.client_connections = []
+        self.client_addresses = []
+        self.size_fc = 25
+        self.prune = args.prune
+        # Load test data
+        self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
+        if self.test_loader is None:
+            print("Warning: Could not load test data. Evaluation will be skipped.")
+            self.test_loader = None
 
-# Assuming you have a method to evaluate the model on test data
-def evaluate_model(model, data_loader):
-    model.eval()
-    correct = 0
-    total = 0
-    loss_fn = nn.CrossEntropyLoss()
-    total_loss = 0.0
+    # Aggregates a list of state_dicts by averaging their values
+    def aggregate_models(self, model_list):
+        agg_state = {}
+        for key in model_list[0].keys():
+            agg_state[key] = sum([m[key] for m in model_list]) / len(model_list)
+        return agg_state
 
-    with torch.no_grad():
-        for x, y in data_loader:
-            output = model(x)
-            loss = loss_fn(output, y)
-            total_loss += loss.item()
+    # Assuming you have a method to evaluate the model on test data
+    def evaluate_model(self, model, data_loader):
+        model.eval()
+        correct = 0
+        total = 0
+        loss_fn = nn.CrossEntropyLoss()
+        total_loss = 0.0
 
-            _, predicted = torch.max(output, 1)
-            total += y.size(0)
-            correct += (predicted == y).sum().item()
+        with torch.no_grad():
+            for x, y in data_loader:
+                output = model(x)
+                loss = loss_fn(output, y)
+                total_loss += loss.item()
 
-    accuracy = 100 * correct / total
-    average_loss = total_loss / len(data_loader)
-    return accuracy, average_loss
+                _, predicted = torch.max(output, 1)
+                total += y.size(0)
+                correct += (predicted == y).sum().item()
 
-# Helper to send pickled data with a header indicating its length
-def send_data(conn, data):
-    data_bytes = pickle.dumps(data)
-    conn.sendall(struct.pack('!I', len(data_bytes)))
-    conn.sendall(data_bytes)
+        accuracy = 100 * correct / total
+        average_loss = total_loss / len(data_loader)
+        return accuracy, average_loss
 
-# Helper to receive data given the 4-byte length header
-def recv_data(conn):
-    raw_msglen = recvall(conn, 4)
-    if not raw_msglen:
-        return None
-    msglen = struct.unpack('!I', raw_msglen)[0]
-    data_bytes = recvall(conn, msglen)
-    return pickle.loads(data_bytes)
+    # Helper to send pickled data with a header indicating its length
+    def send_data(self, conn, data):
+        data_bytes = pickle.dumps(data)
+        conn.sendall(struct.pack('!I', len(data_bytes)))
+        conn.sendall(data_bytes)
 
-def recvall(conn, n):
-    data = b'' 
-    while len(data) < n:
-        packet = conn.recv(n - len(data))
-        if not packet:
+    # Helper to receive data given the 4-byte length header
+    def recv_data(self, conn):
+        raw_msglen = self.recvall(conn, 4)
+        if not raw_msglen:
             return None
-        data += packet
-    return data
+        msglen = struct.unpack('!I', raw_msglen)[0]
+        data_bytes = self.recvall(conn, msglen)
+        return pickle.loads(data_bytes)
 
-# Thread function to handle a single client connection:
-def handle_client(conn, client_updates, lock, round_num, client_id):
-    try:
-        start_time = time.time()
-        print(f"Round {round_num}: Handling client {client_id}")
-        
-        # Send the current global model state
-        with lock:
-            current_global_state = global_state.copy()
-        
-        send_data(conn, current_global_state)
-        print(f"Round {round_num}: Sent global model to client {client_id}")
-        
-        # Receive the updated model from the client
-        updated_state = recv_data(conn)
-        
-        end_time = time.time()
-        
-        if updated_state is not None:
-            with lock:
-                client_updates.append(updated_state)
-            training_time = end_time - start_time
-            print(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
-        else:
-            print(f"Round {round_num}: No update received from client {client_id}")
+    def recvall(self, conn, n):
+        data = b'' 
+        while len(data) < n:
+            packet = conn.recv(n - len(data))
+            if not packet:
+                return None
+            data += packet
+        return data
+
+    # Thread function to handle a single client connection:
+    def handle_client(self, conn, client_updates, round_num, client_id):
+        try:
+            start_time = time.time()
+            print(f"Round {round_num}: Handling client {client_id}")
             
-    except Exception as e:
-        print(f"Round {round_num}: Error handling client {client_id}: {e}")
+            # Send the current global model state
+            with self.lock:
+                current_global_state = self.global_state.copy()
+            if round_num == 2 and self.prune==0:
+                max_amount = self.set_amount_prune()
+                print(max_amount)
+                g_model_pruned = copy.deepcopy(self.global_model)
+                g_model_pruned, _ = prune_and_restructure(model=self.global_model,
+                                                        pruning_rate=max_amount, 
+                                                        size_fc=self.size_fc)
+                g_model_pruned = g_model_pruned.state_dict()
+            if round_num == 2 and self.prune==0:
+                self.send_data(conn, g_model_pruned)
+                print("oi")
+            else:
+                self.send_data(conn, current_global_state)
+            print(f"Round {round_num}: Sent global model to client {client_id}")
+            
+            # Receive the updated model from the client
+            updated_state = self.recv_data(conn)
+            self.client_data[client_id] = self.recv_data(conn)
+            end_time = time.time()
+            
+            if updated_state is not None:
+                with self.lock:
+                    client_updates.append(updated_state)
+                training_time = end_time - start_time
+                print(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
+            else:
+                print(f"Round {round_num}: No update received from client {client_id}")
+                
+        except Exception as e:
+            print(f"Round {round_num}: Error handling client {client_id}: {e}")
 
-def load_test_data(dataset, client_idx, batch_size=32):
-    try:
-        test_data = read_client_data(dataset, client_idx, is_train=False)
-        X, y = zip(*test_data)
-        X = torch.stack(X)
-        y = torch.tensor(y)
-        dataset = torch.utils.data.TensorDataset(X, y)
-        return DataLoader(dataset, batch_size=batch_size)
-    except Exception as e:
-        print(f"Error loading test data: {e}")
-        return None
+    def load_test_data(self, dataset, client_idx, batch_size=32):
+        try:
+            test_data = read_client_data(dataset, client_idx, is_train=False)
+            X, y = zip(*test_data)
+            X = torch.stack(X)
+            y = torch.tensor(y)
+            dataset = torch.utils.data.TensorDataset(X, y)
+            return DataLoader(dataset, batch_size=batch_size)
+        except Exception as e:
+            print(f"Error loading test data: {e}")
+            return None
+    
+    def set_amount_prune(self):
+        total = sum(self.client_data.values())
+        max_amount = 0
+        
+        for client_key, client_value in self.client_data.items():
+            # Usando client_value (valor) em vez de client_key (chave)
+            amount = 1 - (total / (2 * client_value)) if client_value != 0 else 0
+            amount = max(0, min(amount, 0.9))
+
+            if amount > max_amount:
+                max_amount = amount
+        
+        return max_amount
+
+    def run_server(self):
+        print("=== Federated Learning Server ===")
+        print(f"Host: {self.args.host}:{self.args.port}")
+        print(f"Dataset: {self.args.dataset}")
+        print(f"Clients per round: {self.args.clients_per_round}")
+        print(f"Total rounds: {self.args.rounds}")
+        print(f"Test client index: {self.args.test_client_idx}")
+        print("=" * 40)
+        
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.args.host, self.args.port))
+            s.listen(self.args.max_clients)
+            print(f"Server listening on {self.args.host}:{self.args.port}")
+            print(f"Waiting for {self.args.clients_per_round} clients to connect...")
+            
+            # Wait for initial client connections
+            self.client_data = {index: None for index in range(1, self.args.clients_per_round+1)}
+            while len(self.client_connections) < self.args.clients_per_round:
+                conn, addr = s.accept()
+                print(f"Client {len(self.client_connections) + 1} connected: {addr}")
+                self.client_connections.append(conn)
+                self.client_addresses.append(addr)
+            
+            print(f"All {self.args.clients_per_round} clients connected. Starting training...")
+            
+            for round_num in range(self.args.rounds):
+                print(f"\n--- Round {round_num + 1}/{self.args.rounds} ---")
+                client_updates = []
+                threads = []
+                
+                # Handle each client in a separate thread
+                for i, conn in enumerate(self.client_connections):
+                    t = threading.Thread(
+                        target=self.handle_client, 
+                        args=(conn, client_updates, round_num + 1, i + 1)
+                    )
+                    t.start()
+                    threads.append(t)
+                
+                # Wait for all threads to complete
+                for t in threads:
+                    t.join()
+                
+                # Aggregate the client updates
+                if client_updates:
+                    print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
+                    aggregated_state = self.aggregate_models(client_updates)
+                    
+                    with self.lock:
+                        self.global_state = aggregated_state
+                        self.global_model.load_state_dict(self.global_state)
+                    
+                    # Evaluate model on the test dataset after aggregation
+                    if self.test_loader is not None:
+                        accuracy, avg_loss = self.evaluate_model(self.global_model, self.test_loader)
+                        print(f"Round {round_num + 1}: Test Accuracy: {accuracy:.2f}% | Test Loss: {avg_loss:.4f}")
+                    else:
+                        print(f"Round {round_num + 1}: Model aggregated (no test data for evaluation)")
+                    size_global_model = get_model_size(self.global_model)
+                    print(f'Size Global Model: {size_global_model:.2f}MB')
+                    
+                    # Notify clients that the round ended
+                    successful_notifications = 0
+                    for conn in self.client_connections:
+                        try:
+                            conn.send('end'.encode('utf-8'))
+                            successful_notifications += 1
+                        except Exception as e:
+                            print(f"Error notifying client: {e}")
+                    
+                    print(f"Round {round_num + 1}: Global model updated. Notified {successful_notifications} clients.")
+                else:
+                    print(f"Round {round_num + 1}: No client updates received this round.")
+            
+            print(f"\nTraining completed after {self.args.rounds} rounds!")
+            
+            # Close all client connections
+            for conn in self.client_connections:
+                try:
+                    conn.close()
+                except:
+                    pass
+            print("All client connections closed.")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Server')
@@ -156,7 +288,7 @@ def parse_args():
     # Federated learning parameters
     parser.add_argument('--clients-per-round', type=int, default=2, 
                        help='Number of clients per round (default: 2)')
-    parser.add_argument('--rounds', type=int, default=4, 
+    parser.add_argument('--rounds', type=int, default=10, 
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters
@@ -181,113 +313,15 @@ def parse_args():
     # Server options
     parser.add_argument('--max-clients', type=int, default=10, 
                        help='Maximum number of client connections (default: 10)')
+    parser.add_argument('--prune', type=int, default=0, 
+                       help='Maximum number of client connections (default: 10)')
     
     return parser.parse_args()
 
 def main():
-    global global_state
-    
     args = parse_args()
-    
-    print("=== Federated Learning Server ===")
-    print(f"Host: {args.host}:{args.port}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Clients per round: {args.clients_per_round}")
-    print(f"Total rounds: {args.rounds}")
-    print(f"Test client index: {args.test_client_idx}")
-    print("=" * 40)
-    
-    # Initialize global model with arguments
-    global_model = SimpleModel(
-        in_features=args.in_features,
-        num_classes=args.num_classes,
-        dim=args.dim
-    )
-    global_state = global_model.state_dict()
-    
-    lock = threading.Lock()
-    
-    # Load test data
-    test_loader = load_test_data(args.dataset, args.test_client_idx, args.batch_size)
-    if test_loader is None:
-        print("Warning: Could not load test data. Evaluation will be skipped.")
-        test_loader = None
-    
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((args.host, args.port))
-        s.listen(args.max_clients)
-        print(f"Server listening on {args.host}:{args.port}")
-        print(f"Waiting for {args.clients_per_round} clients to connect...")
-        
-        # Wait for initial client connections
-        client_connections = []
-        client_addresses = []
-        
-        while len(client_connections) < args.clients_per_round:
-            conn, addr = s.accept()
-            print(f"Client {len(client_connections) + 1} connected: {addr}")
-            client_connections.append(conn)
-            client_addresses.append(addr)
-        
-        print(f"All {args.clients_per_round} clients connected. Starting training...")
-        
-        for round_num in range(args.rounds):
-            print(f"\n--- Round {round_num + 1}/{args.rounds} ---")
-            client_updates = []
-            threads = []
-            
-            # Handle each client in a separate thread
-            for i, conn in enumerate(client_connections):
-                t = threading.Thread(
-                    target=handle_client, 
-                    args=(conn, client_updates, lock, round_num + 1, i + 1)
-                )
-                t.start()
-                threads.append(t)
-            
-            # Wait for all threads to complete
-            for t in threads:
-                t.join()
-            
-            # Aggregate the client updates
-            if client_updates:
-                print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
-                aggregated_state = aggregate_models(client_updates)
-                
-                with lock:
-                    global_state = aggregated_state
-                    global_model.load_state_dict(global_state)
-                
-                # Evaluate model on the test dataset after aggregation
-                if test_loader is not None:
-                    accuracy, avg_loss = evaluate_model(global_model, test_loader)
-                    print(f"Round {round_num + 1}: Test Accuracy: {accuracy:.2f}% | Test Loss: {avg_loss:.4f}")
-                else:
-                    print(f"Round {round_num + 1}: Model aggregated (no test data for evaluation)")
-                
-                # Notify clients that the round ended
-                successful_notifications = 0
-                for conn in client_connections:
-                    try:
-                        conn.send('end'.encode('utf-8'))
-                        successful_notifications += 1
-                    except Exception as e:
-                        print(f"Error notifying client: {e}")
-                
-                print(f"Round {round_num + 1}: Global model updated. Notified {successful_notifications} clients.")
-            else:
-                print(f"Round {round_num + 1}: No client updates received this round.")
-        
-        print(f"\nTraining completed after {args.rounds} rounds!")
-        
-        # Close all client connections
-        for conn in client_connections:
-            try:
-                conn.close()
-            except:
-                pass
-        print("All client connections closed.")
+    server = FederatedLearningServer(args)
+    server.run_server()
 
 if __name__ == '__main__':
     main()
