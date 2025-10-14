@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from data_utils import read_client_data  # Importing the data reading utility
 import argparse
 import sys
-
+from prunning import restore_to_original_size, prune_and_restructure
 # Simple CNN model for MNIST or other datasets
 class SimpleModel(nn.Module):
     def __init__(self, in_features=3, num_classes=10, dim=1600):
@@ -106,7 +106,9 @@ def load_data(dataset, client_idx, is_train=True, batch_size=32):
     y = torch.tensor(y)  # Convert labels into a tensor
     dataset = torch.utils.data.TensorDataset(X, y)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
+def set_parameters(self, model):
+        for new_param, old_param in zip(model.parameters(), self.model.parameters()):
+            old_param.data = new_param.data.clone()
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Client')
     
@@ -117,12 +119,12 @@ def parse_args():
                        help='Server port (default: 9090)')
     
     # Training arguments
-    parser.add_argument('--rounds', type=int, default=4, 
+    parser.add_argument('--rounds', type=int, default=10, 
                        help='Number of training rounds (default: 4)')
     parser.add_argument('--dataset', type=str, default='Cifar10', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST'], 
                        help='Dataset name (default: Cifar10)')
-    parser.add_argument('--client-idx', type=int, default=0, 
+    parser.add_argument('--client-idx', type=int, default=1, 
                        help='Client index (default: 0)')
     
     # Model arguments
@@ -190,6 +192,13 @@ def main():
             
             # Receive the global model from the server
             global_state = recv_data(s)
+            if round_num ==2:
+                print("hentai")
+                ammount = recv_data(s)
+                local_model, _ = prune_and_restructure(model=model, 
+                                                           pruning_rate=ammount, 
+                                                           size_fc=25)
+                set_parameters(local_model)
             if global_state is None:
                 print("Failed to receive global model. Connection may be closed.")
                 break
@@ -209,6 +218,8 @@ def main():
             
             # Send the updated model state back to the server
             send_data(s, updated_state)
+            
+            send_data(s, len(train_loader))
             print("Client update sent.")
             
             # Wait for the server to finish the round
