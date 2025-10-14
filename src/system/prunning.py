@@ -108,6 +108,7 @@ def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25):
             
         
         new_model = nn.Sequential(*layers)
+    print("rapaz ne que foi")
     return new_model, masks
 
 def restore_to_original_size(model, masks, size_fc=25):

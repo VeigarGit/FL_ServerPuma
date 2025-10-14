@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from data_utils import read_client_data  # Importing the data reading utility
 import argparse
 import sys
+import copy
 from prunning import restore_to_original_size, prune_and_restructure
 # Simple CNN model for MNIST or other datasets
 class SimpleModel(nn.Module):
@@ -60,10 +61,37 @@ def recvall(conn, n):
             return None
         data += packet
     return data
-
+def map_sequential_to_simplemodel(state_dict):
+    """
+    Mapeia state_dict de modelo Sequential para estrutura SimpleModel
+    """
+    mapped_dict = {}
+    
+    # Mapeamento baseado na estrutura Sequential típica
+    mapping = {
+        '0.weight': 'conv1.0.weight',
+        '0.bias': 'conv1.0.bias',
+        '3.weight': 'conv2.0.weight', 
+        '3.bias': 'conv2.0.bias',
+        '7.weight': 'fc1.0.weight',
+        '7.bias': 'fc1.0.bias',
+        '9.weight': 'fc.weight',
+        '9.bias': 'fc.bias'
+    }
+    for sequential_key, simple_key in mapping.items():
+        if sequential_key in state_dict:
+            mapped_dict[simple_key] = state_dict[sequential_key]
+    
+    return mapped_dict
 # Update local training to use data loaded via read_client_data
-def local_training(model, state_dict, train_loader, learning_rate=0.01):
-    model.load_state_dict(state_dict)
+def local_training(model, state_dict, train_loader, learning_rate=0.01, round=2):
+    #model.load_state_dict(state_dict)
+    if round==2:
+        state_dict = map_sequential_to_simplemodel(state_dict)
+    
+    state = copy.deepcopy(model)
+    state.load_state_dict(state_dict)
+    set_parameters(model, state)
     model.train()
     optimizer = optim.SGD(model.parameters(), lr=learning_rate)
     loss_fn = nn.CrossEntropyLoss()  # appropriate for classification
@@ -106,8 +134,8 @@ def load_data(dataset, client_idx, is_train=True, batch_size=32):
     y = torch.tensor(y)  # Convert labels into a tensor
     dataset = torch.utils.data.TensorDataset(X, y)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
-def set_parameters(self, model):
-        for new_param, old_param in zip(model.parameters(), self.model.parameters()):
+def set_parameters(model, state_new):
+        for new_param, old_param in zip(state_new.parameters(), model.parameters()):
             old_param.data = new_param.data.clone()
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Client')
@@ -121,16 +149,16 @@ def parse_args():
     # Training arguments
     parser.add_argument('--rounds', type=int, default=10, 
                        help='Number of training rounds (default: 4)')
-    parser.add_argument('--dataset', type=str, default='Cifar10', 
+    parser.add_argument('--dataset', type=str, default='Cifar100', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST'], 
                        help='Dataset name (default: Cifar10)')
-    parser.add_argument('--client-idx', type=int, default=1, 
+    parser.add_argument('--client-idx', type=int, default=0, 
                        help='Client index (default: 0)')
     
     # Model arguments
     parser.add_argument('--in-features', type=int, default=3, 
                        help='Input features/channels (default: 3)')
-    parser.add_argument('--num-classes', type=int, default=10, 
+    parser.add_argument('--num-classes', type=int, default=100, 
                        help='Number of classes (default: 10)')
     parser.add_argument('--dim', type=int, default=1600, 
                        help='Dimension for first linear layer (default: 1600)')
@@ -192,20 +220,20 @@ def main():
             
             # Receive the global model from the server
             global_state = recv_data(s)
-            if round_num ==2:
+            if round_num+1 ==2:
                 print("hentai")
                 ammount = recv_data(s)
                 local_model, _ = prune_and_restructure(model=model, 
                                                            pruning_rate=ammount, 
                                                            size_fc=25)
-                set_parameters(local_model)
+                set_parameters(model, local_model)
             if global_state is None:
                 print("Failed to receive global model. Connection may be closed.")
                 break
             print("Received global model.")
-            
+            #set_parameters(local_model)
             # Perform local training using the received global model
-            updated_state = local_training(model, global_state, train_loader, args.learning_rate)
+            updated_state = local_training(model, global_state, train_loader, args.learning_rate, round_num+1)
             print("Local training completed.")
 
             # Evaluate training performance

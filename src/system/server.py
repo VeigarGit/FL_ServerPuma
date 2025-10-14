@@ -124,6 +124,10 @@ class FederatedLearningServer:
                 return None
             data += packet
         return data
+    
+    def set_parameters(self, model):
+        for new_param, old_param in zip(model.parameters(), self.global_model.parameters()):
+            old_param.data = new_param.data.clone()
 
     # Thread function to handle a single client connection:
     def handle_client(self, conn, client_updates, round_num, client_id):
@@ -135,13 +139,15 @@ class FederatedLearningServer:
             with self.lock:
                 current_global_state = self.global_state.copy()
             if round_num == 2 and self.prune==0:
-                max_amount = self.set_amount_prune()
+                max_amount = 0.8#self.set_amount_prune()
                 print(max_amount)
                 g_model_pruned = copy.deepcopy(self.global_model)
                 g_model_pruned, _ = prune_and_restructure(model=self.global_model,
                                                         pruning_rate=max_amount, 
                                                         size_fc=self.size_fc)
+                self.set_parameters(g_model_pruned)
                 g_model_pruned = g_model_pruned.state_dict()
+                
             if round_num == 2 and self.prune==0:
                 self.send_data(conn, g_model_pruned)
                 self.send_data(conn, max_amount)
@@ -292,7 +298,7 @@ def parse_args():
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters
-    parser.add_argument('--dataset', type=str, default='Cifar10', 
+    parser.add_argument('--dataset', type=str, default='Cifar100', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST'],
                        help='Dataset name (default: Cifar10)')
     parser.add_argument('--test-client-idx', type=int, default=100, 
@@ -301,7 +307,7 @@ def parse_args():
     # Model architecture
     parser.add_argument('--in-features', type=int, default=3, 
                        help='Input features/channels (default: 3)')
-    parser.add_argument('--num-classes', type=int, default=10, 
+    parser.add_argument('--num-classes', type=int, default=100, 
                        help='Number of classes (default: 10)')
     parser.add_argument('--dim', type=int, default=1600, 
                        help='Dimension for first linear layer (default: 1600)')
