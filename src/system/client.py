@@ -117,7 +117,7 @@ def parse_args():
                        help='Server port (default: 9090)')
     
     # Training arguments
-    parser.add_argument('--rounds', type=int, default=10, 
+    parser.add_argument('--rounds', type=int, default=4, 
                        help='Number of training rounds (default: 4)')
     parser.add_argument('--dataset', type=str, default='Cifar10', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST'], 
@@ -209,8 +209,6 @@ def main():
             
             # Send the updated model state back to the server
             send_data(s, updated_state)
-            
-            send_data(s, len(train_loader))
             print("Client update sent.")
             
             # Wait for the server to finish the round
