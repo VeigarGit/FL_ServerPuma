@@ -223,6 +223,7 @@ def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.connect((args.host, args.port))
+            send_data(s, args.client_idx)
             print(f"Connected to server {args.host}:{args.port}")
         except Exception as e:
             print(f"Connection failed: {e}")

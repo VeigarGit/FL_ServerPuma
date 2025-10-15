@@ -65,6 +65,7 @@ class FederatedLearningServer:
         self.client_connections = []
         self.client_addresses = []
         self.size_fc = 25
+        self.client_idx =[]
         self.prune = args.prune
         # Load test data
         self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
@@ -217,7 +218,11 @@ class FederatedLearningServer:
             self.client_data = {index: None for index in range(1, self.args.clients_per_round+1)}
             while len(self.client_connections) < self.args.clients_per_round:
                 conn, addr = s.accept()
+                idx = self.recv_data(conn)
+                print("client idx:", idx) 
+
                 print(f"Client {len(self.client_connections) + 1} connected: {addr}")
+                self.client_idx.append(idx)
                 self.client_connections.append(conn)
                 self.client_addresses.append(addr)
             
