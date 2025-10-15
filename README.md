@@ -5,6 +5,20 @@
 
 This bash script automates the setup and execution of a Federated Learning system using `tmux` to manage multiple processes in a single terminal session.
 
+## ⚙️ Prerequisites
+
+### 1. **Environment Setup**
+Before running the script, you must set up the conda environment:
+
+```bash
+# Create the environment from YAML file
+conda env create -f env_cuda_latest.yaml
+
+# Activate the environment
+conda activate pfllib
+# Tmux instalation
+sudo apt update && sudo apt install tmux
+```
 ## 🚀 Quick Start
 
 ```bash
