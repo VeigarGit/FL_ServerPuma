@@ -4,7 +4,7 @@ import torch.nn.utils.prune as prune
 import copy
 import numpy as np
 
-def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25):
+def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25, data='Cifar100'):
     model_copy = copy.deepcopy(model)
     layers = []
     indices_not_remove_weight = []
@@ -80,9 +80,12 @@ def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25):
             # remove os pesos que não serão utilizados
             weight_prunned = module.weight[:, indices_not_remove_weight]
             # aplica o filtragem nos neuronios com valores 0
-
+            if data=='Cifar100' or 'Cifar10':
+                ind=100
+            else:
+                ind=10
             if n == index_last_layer: # não reestrutura a ultima camada
-                indices_not_remove_perceptron = torch.tensor([True] * 100)
+                indices_not_remove_perceptron = torch.tensor([True] * ind)
                 masks[-1] = masks[-1] + 1
             
             weight_prunned = weight_prunned[indices_not_remove_perceptron]
@@ -108,7 +111,7 @@ def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25):
             
         
         new_model = nn.Sequential(*layers)
-    print("rapaz ne que foi")
+    #print("rapaz ne que foi")
     return new_model, masks
 
 def restore_to_original_size(model, masks, size_fc=25):

@@ -145,7 +145,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Client')
     
     # Connection arguments
-    parser.add_argument('--host', type=str, default='10.0.23.189', 
+    parser.add_argument('--host', type=str, default='localhost', 
                        help='Server IP address (default: 10.0.23.189)')
     parser.add_argument('--port', type=int, default=9090, 
                        help='Server port (default: 9090)')
@@ -153,7 +153,7 @@ def parse_args():
     # Training arguments
     parser.add_argument('--rounds', type=int, default=10, 
                        help='Number of training rounds (default: 4)')
-    parser.add_argument('--dataset', type=str, default='Cifar100', 
+    parser.add_argument('--dataset', type=str, default='Cifar10', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST'], 
                        help='Dataset name (default: Cifar10)')
     parser.add_argument('--client-idx', type=int, default=0, 
@@ -238,7 +238,7 @@ def main():
                 ammount = recv_data(s)
                 local_model, _ = prune_and_restructure(model=model, 
                                                            pruning_rate=ammount, 
-                                                           size_fc=25)
+                                                           size_fc=25, data=args.dataset)
                 set_parameters(model, local_model)
             if global_state is None:
                 print("Failed to receive global model. Connection may be closed.")

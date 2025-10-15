@@ -13,8 +13,8 @@ sleep 15
 tmux new-session -d -s myapp 'python server.py'
 
 # Create panes for clients
-tmux split-window -h 'python client.py --client-idx 0'
-tmux split-window -v 'python client.py --client-idx 1'  # Corrigido: idx 1
+tmux split-window -h 'python client.py --client-idx 0 --host 'localhost''
+tmux split-window -v 'python client.py --client-idx 1 --host 'localhost''  # Corrigido: idx 1
 
 # Attach to session
 tmux attach-session -t myapp

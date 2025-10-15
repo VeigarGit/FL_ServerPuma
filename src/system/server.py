@@ -145,7 +145,7 @@ class FederatedLearningServer:
                 g_model_pruned = copy.deepcopy(self.global_model)
                 g_model_pruned, _ = prune_and_restructure(model=self.global_model,
                                                         pruning_rate=max_amount, 
-                                                        size_fc=self.size_fc)
+                                                        size_fc=self.size_fc, data= self.args.dataset)
                 self.set_parameters(g_model_pruned)
                 g_model_pruned = g_model_pruned.state_dict()
                 
@@ -303,7 +303,7 @@ def parse_args():
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters
-    parser.add_argument('--dataset', type=str, default='Cifar100', 
+    parser.add_argument('--dataset', type=str, default='Cifar10', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST'],
                        help='Dataset name (default: Cifar10)')
     parser.add_argument('--test-client-idx', type=int, default=0, 
