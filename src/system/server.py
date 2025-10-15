@@ -321,6 +321,8 @@ def parse_args():
                        help='Maximum number of client connections (default: 10)')
     parser.add_argument('--prune', type=int, default=0, 
                        help='Maximum number of client connections (default: 10)')
+    parser.add_argument("--device", type=str, default="cuda",
+                        choices=["cpu", "cuda"])
     
     return parser.parse_args()
 

@@ -12,6 +12,7 @@ import argparse
 import sys
 import copy
 from prunning import restore_to_original_size, prune_and_restructure
+from ALA import ALA
 # Simple CNN model for MNIST or other datasets
 class SimpleModel(nn.Module):
     def __init__(self, in_features=3, num_classes=10, dim=1600):
@@ -84,14 +85,17 @@ def map_sequential_to_simplemodel(state_dict):
     
     return mapped_dict
 # Update local training to use data loaded via read_client_data
-def local_training(model, state_dict, train_loader, learning_rate=0.01, round=2):
+def local_training(model, state_dict, train_loader, learning_rate=0.01, round=2, alaarg=1, ala=None):
     #model.load_state_dict(state_dict)
     if round==2:
         state_dict = map_sequential_to_simplemodel(state_dict)
     
     state = copy.deepcopy(model)
     state.load_state_dict(state_dict)
+    if alaarg==0 and round==2:
+        local_initialization(ala, state, model)
     set_parameters(model, state)
+    
     model.train()
     optimizer = optim.SGD(model.parameters(), lr=learning_rate)
     loss_fn = nn.CrossEntropyLoss()  # appropriate for classification
@@ -172,8 +176,13 @@ def parse_args():
     # Other options
     parser.add_argument('--random-client', action='store_true', 
                        help='Use random client index instead of fixed')
+    parser.add_argument("--device", type=str, default="cpu",
+                        choices=["cpu", "cuda"])
+    parser.add_argument("--ala", type=int, default=0)
     
     return parser.parse_args()
+def local_initialization(ala, received_global_model, model, mask = None):
+        ala.adaptive_local_aggregation(received_global_model, model, mask = mask)
 
 def main():
     args = parse_args()
@@ -197,7 +206,10 @@ def main():
         num_classes=args.num_classes,
         dim=args.dim
     )
-
+    loss = nn.CrossEntropyLoss()
+    eta = 1
+    rand_percent = 80
+    layer_idx = 2
     # Load the dataset using the custom data loader
     try:
         train_loader = load_data(args.dataset, args.client_idx, is_train=True, batch_size=args.batch_size)
@@ -206,7 +218,8 @@ def main():
     except Exception as e:
         print(f"Error loading data: {e}")
         sys.exit(1)
-
+    ala = ALA(args.client_idx, loss, train_loader, 32, 
+                    80, 2, 1.0, args.device)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.connect((args.host, args.port))
@@ -233,7 +246,7 @@ def main():
             print("Received global model.")
             #set_parameters(local_model)
             # Perform local training using the received global model
-            updated_state = local_training(model, global_state, train_loader, args.learning_rate, round_num+1)
+            updated_state = local_training(model, global_state, train_loader, args.learning_rate, round_num+1, args.ala, ala)
             print("Local training completed.")
 
             # Evaluate training performance
