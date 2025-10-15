@@ -234,7 +234,6 @@ def main():
             # Receive the global model from the server
             global_state = recv_data(s)
             if round_num+1 ==2:
-                print("hentai")
                 ammount = recv_data(s)
                 local_model, _ = prune_and_restructure(model=model, 
                                                            pruning_rate=ammount, 
