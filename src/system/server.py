@@ -139,7 +139,7 @@ class FederatedLearningServer:
             with self.lock:
                 current_global_state = self.global_state.copy()
             if round_num == 2 and self.prune==0:
-                max_amount = 0.8#self.set_amount_prune()
+                max_amount = self.set_amount_prune()
                 print(max_amount)
                 g_model_pruned = copy.deepcopy(self.global_model)
                 g_model_pruned, _ = prune_and_restructure(model=self.global_model,
@@ -301,7 +301,7 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='Cifar100', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST'],
                        help='Dataset name (default: Cifar10)')
-    parser.add_argument('--test-client-idx', type=int, default=100, 
+    parser.add_argument('--test-client-idx', type=int, default=0, 
                        help='Client index for test data (default: 100)')
     
     # Model architecture

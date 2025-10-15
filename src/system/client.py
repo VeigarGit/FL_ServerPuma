@@ -244,6 +244,9 @@ def main():
                 print("Failed to receive global model. Connection may be closed.")
                 break
             print("Received global model.")
+            # Evaluate test performance
+            test_accuracy, test_loss = evaluate_model(model, test_loader)
+            print(f"Client {args.client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
             #set_parameters(local_model)
             # Perform local training using the received global model
             updated_state = local_training(model, global_state, train_loader, args.learning_rate, round_num+1, args.ala, ala)
@@ -253,9 +256,7 @@ def main():
             train_accuracy, train_loss = evaluate_model(model, train_loader)
             print(f"Client {args.client_idx}: Training Accuracy: {train_accuracy:.2f}% | Training Loss: {train_loss:.4f}")
             
-            # Evaluate test performance
-            test_accuracy, test_loss = evaluate_model(model, test_loader)
-            print(f"Client {args.client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
+            
             
             # Send the updated model state back to the server
             send_data(s, updated_state)
