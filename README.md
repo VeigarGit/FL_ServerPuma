@@ -17,7 +17,7 @@ conda env create -f env_cuda_latest.yaml
 # Activate the environment
 conda activate pfllib
 # Tmux instalation
-sudo apt update && sudo apt install tmux
+sudo apt update && sudo apt install tmuxvim
 ```
 ## 🚀 Quick Start
 
@@ -73,4 +73,3 @@ Once inside the tmux session:
 | `Ctrl+b p` | Previous window |
 | `Ctrl+b "` | Split pane horizontally |
 | `Ctrl+b %` | Split pane vertically |
-```

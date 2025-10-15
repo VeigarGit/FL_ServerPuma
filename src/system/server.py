@@ -139,7 +139,7 @@ class FederatedLearningServer:
             with self.lock:
                 current_global_state = self.global_state.copy()
             if round_num == 2 and self.prune==0:
-                max_amount = self.set_amount_prune()
+                max_amount = 0.5 #self.set_amount_prune()
                 print(max_amount)
                 g_model_pruned = copy.deepcopy(self.global_model)
                 g_model_pruned, _ = prune_and_restructure(model=self.global_model,
