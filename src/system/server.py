@@ -300,6 +300,7 @@ class FederatedLearningServer:
                         acc=[]
                         loss =[]
                         for i in self.client_idx:
+                            self.test_loader = self.load_test_data(self.args.dataset, i, self.args.batch_size)
                             accuracy, avg_loss = self.evaluate_model(self.global_model, self.test_loader)
                             acc.append(accuracy)
                             loss.append(avg_loss)

@@ -207,6 +207,12 @@ def main():
                 num_classes=10,
                 dim=1024
             )
+    if args.dataset  =='Cifar10':
+            model= SimpleModel(
+                in_features=args.in_features,
+                num_classes=10,
+                dim=args.dim
+            )
     else:
         model = SimpleModel(
             in_features=args.in_features,
