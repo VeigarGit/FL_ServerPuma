@@ -10,6 +10,8 @@ import time
 import argparse
 import sys
 import traceback
+import os
+import h5py
 # Assuming you already have a test dataset available on the server side
 from data_utils import read_client_data  # Utility to read the server's dataset
 from prunning import restore_to_original_size, prune_and_restructure
@@ -67,6 +69,8 @@ class FederatedLearningServer:
                 num_classes=args.num_classes,
                 dim=args.dim
             )
+        self.rs_test_acc=[]
+        self.rs_test_loss=[]
         self.global_state = self.global_model.state_dict()
         self.lock = threading.Lock()
         self.client_data = {}
@@ -167,6 +171,7 @@ class FederatedLearningServer:
             # Receive the updated model from the client
             updated_state = self.recv_data(conn)
             self.client_data[client_id] = self.recv_data(conn)
+            self.argalgo= self.recv_data(conn)
             end_time = time.time()
             
             if updated_state is not None:
@@ -207,6 +212,24 @@ class FederatedLearningServer:
                 max_amount = amount
         
         return max_amount
+    def save_results(self):
+        if self.args.prune==0:
+            a= "prune"
+        else:
+            a = "withou_Prune"
+        b = self.argalgo
+        if b==0:
+            b = "FedALA"
+        else:
+            b = "FedAVG"
+        algo = self.args.dataset + "_" + a + "_" + b
+        result_path = "../results/"
+        if not os.path.exists(result_path):
+            os.makedirs(result_path)
+        file_path = result_path + "{}.h5".format(algo)
+        with h5py.File(file_path, 'w') as hf:
+                hf.create_dataset('rs_test_acc', data=self.rs_test_acc)
+                hf.create_dataset('rs_train_loss', data=self.rs_test_loss)
 
     def run_server(self):
         print("=== Federated Learning Server ===")
@@ -268,6 +291,8 @@ class FederatedLearningServer:
                     # Evaluate model on the test dataset after aggregation
                     if self.test_loader is not None:
                         accuracy, avg_loss = self.evaluate_model(self.global_model, self.test_loader)
+                        self.rs_test_acc.append(accuracy)
+                        self.rs_test_loss.append(avg_loss)
                         print(f"Round {round_num + 1}: Test Accuracy: {accuracy:.2f}% | Test Loss: {avg_loss:.4f}")
                     else:
                         print(f"Round {round_num + 1}: Model aggregated (no test data for evaluation)")
@@ -296,6 +321,7 @@ class FederatedLearningServer:
                 except:
                     pass
             print("All client connections closed.")
+        self.save_results()
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Server')
@@ -309,7 +335,7 @@ def parse_args():
     # Federated learning parameters
     parser.add_argument('--clients-per-round', type=int, default=2, 
                        help='Number of clients per round (default: 2)')
-    parser.add_argument('--rounds', type=int, default=10, 
+    parser.add_argument('--rounds', type=int, default=2, 
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters
