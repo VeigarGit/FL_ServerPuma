@@ -346,8 +346,8 @@ def parse_args():
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters
-    parser.add_argument('--dataset', type=str, default='Cifar100', 
-                       choices=['Cifar10', 'MNIST', 'FashionMNIST'],
+    parser.add_argument('--dataset', type=str, default='Cifar10', 
+                       choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'],
                        help='Dataset name (default: Cifar10)')
     parser.add_argument('--test-client-idx', type=int, default=0, 
                        help='Client index for test data (default: 100)')

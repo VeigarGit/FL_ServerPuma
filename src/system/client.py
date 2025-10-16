@@ -153,8 +153,8 @@ def parse_args():
     # Training arguments
     parser.add_argument('--rounds', type=int, default=2, 
                        help='Number of training rounds (default: 4)')
-    parser.add_argument('--dataset', type=str, default='Cifar10', 
-                       choices=['Cifar10', 'MNIST', 'FashionMNIST'], 
+    parser.add_argument('--dataset', type=str, default='Cifar100', 
+                       choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'], 
                        help='Dataset name (default: Cifar10)')
     parser.add_argument('--client-idx', type=int, default=0, 
                        help='Client index (default: 0)')
