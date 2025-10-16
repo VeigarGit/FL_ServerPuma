@@ -151,7 +151,7 @@ def parse_args():
                        help='Server port (default: 9090)')
     
     # Training arguments
-    parser.add_argument('--rounds', type=int, default=2, 
+    parser.add_argument('--rounds', type=int, default=10, 
                        help='Number of training rounds (default: 4)')
     parser.add_argument('--dataset', type=str, default='Cifar100', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'], 

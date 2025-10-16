@@ -63,6 +63,12 @@ class FederatedLearningServer:
                 num_classes=10,
                 dim=1024
             )
+        if args.dataset  =='Cifar10':
+            self.global_model = SimpleModel(
+                in_features=args.in_features,
+                num_classes=10,
+                dim=args.dim
+            )
         else:
             self.global_model = SimpleModel(
                 in_features=args.in_features,
@@ -111,6 +117,7 @@ class FederatedLearningServer:
                 correct += (predicted == y).sum().item()
 
         accuracy = 100 * correct / total
+        print("corretos:", correct)
         average_loss = total_loss / len(data_loader)
         return accuracy, average_loss
 
@@ -296,7 +303,10 @@ class FederatedLearningServer:
                             accuracy, avg_loss = self.evaluate_model(self.global_model, self.test_loader)
                             acc.append(accuracy)
                             loss.append(avg_loss)
+                        print('acc: ',acc)
+                        print('len acc', len(acc))
                         accuracy = sum(acc)/len(acc)
+                        print('avg acc: ', accuracy)
                         avg_loss = sum(loss)/len(loss)
                         self.rs_test_acc.append(accuracy)
                         self.rs_test_loss.append(avg_loss)
@@ -342,7 +352,7 @@ def parse_args():
     # Federated learning parameters
     parser.add_argument('--clients-per-round', type=int, default=2, 
                        help='Number of clients per round (default: 2)')
-    parser.add_argument('--rounds', type=int, default=2, 
+    parser.add_argument('--rounds', type=int, default=10, 
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters

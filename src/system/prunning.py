@@ -85,7 +85,7 @@ def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25, dat
             # remove os pesos que não serão utilizados
             weight_prunned = module.weight[:, indices_not_remove_weight]
             # aplica o filtragem nos neuronios com valores 0
-            if data=='Cifar100' or data=='Cifar10':
+            if data=='Cifar100':
                 ind=100
             else:
                 ind=10

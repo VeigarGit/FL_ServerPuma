@@ -63,7 +63,7 @@ sleep 15
 
 # Create tmux session
 tmux new-session -d -s "$SESSION_NAME" "python server.py --dataset $DATASET"
-
+sleep 2
 # Create panes for clients
 for i in $(seq 0 $((CLIENT_COUNT-1))); do
     if [ "$i" -eq 0 ]; then
