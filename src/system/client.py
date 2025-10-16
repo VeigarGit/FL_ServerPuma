@@ -201,11 +201,18 @@ def main():
     print("=" * 40)
     
     # Initialize model with arguments
-    model = SimpleModel(
-        in_features=args.in_features,
-        num_classes=args.num_classes,
-        dim=args.dim
-    )
+    if args.dataset  =='MNIST':
+        model = SimpleModel(
+                in_features=1,
+                num_classes=10,
+                dim=1024
+            )
+    else:
+        model = SimpleModel(
+            in_features=args.in_features,
+            num_classes=args.num_classes,
+            dim=args.dim
+        )
     loss = nn.CrossEntropyLoss()
     eta = 1
     rand_percent = 80

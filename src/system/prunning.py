@@ -12,7 +12,7 @@ def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25, dat
     first_linear = True
     index_last_layer = 0
     masks = []
-
+    a = 0
     for n, module in enumerate(model_copy.modules()):
         if isinstance(module, nn.Linear):
             index_last_layer = n
@@ -71,7 +71,12 @@ def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25, dat
 
             # filtra os pesos da camada
             if first_linear:
-                indices_not_remove_weight = indices_not_remove_weight.repeat(25)
+                if data=='Cifar100' or data=='Cifar10':
+                    print('oi')
+                    indices_not_remove_weight = indices_not_remove_weight.repeat(25)
+                if data=='MNIST':
+                    print('xau')
+                    indices_not_remove_weight = indices_not_remove_weight.repeat(16)
                 first_linear = False
                 
                 n_in = sum(indices_not_remove_weight)
@@ -80,7 +85,7 @@ def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25, dat
             # remove os pesos que não serão utilizados
             weight_prunned = module.weight[:, indices_not_remove_weight]
             # aplica o filtragem nos neuronios com valores 0
-            if data=='Cifar100' or 'Cifar10':
+            if data=='Cifar100' or data=='Cifar10':
                 ind=100
             else:
                 ind=10

@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 import time
 import argparse
 import sys
+import traceback
 # Assuming you already have a test dataset available on the server side
 from data_utils import read_client_data  # Utility to read the server's dataset
 from prunning import restore_to_original_size, prune_and_restructure
@@ -178,6 +179,8 @@ class FederatedLearningServer:
                 
         except Exception as e:
             print(f"Round {round_num}: Error handling client {client_id}: {e}")
+            print("Traceback:")
+            traceback.print_exc()
 
     def load_test_data(self, dataset, client_idx, batch_size=32):
         try:
@@ -310,7 +313,7 @@ def parse_args():
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters
-    parser.add_argument('--dataset', type=str, default='Cifar10', 
+    parser.add_argument('--dataset', type=str, default='Cifar100', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST'],
                        help='Dataset name (default: Cifar10)')
     parser.add_argument('--test-client-idx', type=int, default=0, 

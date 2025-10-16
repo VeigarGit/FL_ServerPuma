@@ -29,6 +29,13 @@ or just
 sh run.sh
 ```
 
+## 🚀 sh deploy changing dataset
+
+```bash
+sh run.sh --clients 3 --host "localhost" --dataset "Cifar100" --session "myapp"
+sh run.sh -c 4 -h "localhost" -d "Cifar100" -s "fl_session"
+```
+
 ## 🔧 What the Script Does
 
 ### 1. **Dataset Generation**
