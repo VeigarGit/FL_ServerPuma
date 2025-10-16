@@ -290,7 +290,14 @@ class FederatedLearningServer:
                     
                     # Evaluate model on the test dataset after aggregation
                     if self.test_loader is not None:
-                        accuracy, avg_loss = self.evaluate_model(self.global_model, self.test_loader)
+                        acc=[]
+                        loss =[]
+                        for i in self.client_idx:
+                            accuracy, avg_loss = self.evaluate_model(self.global_model, self.test_loader)
+                            acc.append(accuracy)
+                            loss.append(avg_loss)
+                        accuracy = sum(acc)/len(acc)
+                        avg_loss = sum(loss)/len(loss)
                         self.rs_test_acc.append(accuracy)
                         self.rs_test_loss.append(avg_loss)
                         print(f"Round {round_num + 1}: Test Accuracy: {accuracy:.2f}% | Test Loss: {avg_loss:.4f}")

@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: fl-server
+    ports:
+      - "8080:8080"
+    networks:
+      - fl-network
+    environment:
+      - DATASET=${DATASET:-Cifar100}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 8080), timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  client-0:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: fl-client-0
+    networks:
+      - fl-network
+    environment:
+      - CLIENT_IDX=0
+      - SERVER_HOST=fl-server
+      - DATASET=${DATASET:-Cifar100}
+    depends_on:
+      server:
+        condition: service_healthy
+    command: ["python", "client.py", "--client-idx", "0", "--host", "fl-server", "--dataset", "${DATASET:-Cifar100}"]
+
+  client-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: fl-client-1
+    networks:
+      - fl-network
+    environment:
+      - CLIENT_IDX=1
+      - SERVER_HOST=fl-server
+      - DATASET=${DATASET:-Cifar100}
+    depends_on:
+      server:
+        condition: service_healthy
+    command: ["python", "client.py", "--client-idx", "1", "--host", "fl-server", "--dataset", "${DATASET:-Cifar100}"]
+
+  client-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: fl-client-2
+    networks:
+      - fl-network
+    environment:
+      - CLIENT_IDX=2
+      - SERVER_HOST=fl-server
+      - DATASET=${DATASET:-Cifar100}
+    depends_on:
+      server:
+        condition: service_healthy
+    command: ["python", "client.py", "--client-idx", "2", "--host", "fl-server", "--dataset", "${DATASET:-Cifar100}"]
+
+networks:
+  fl-network:
+    driver: bridge
+
+volumes:
+  shared-data:
+    driver: local
