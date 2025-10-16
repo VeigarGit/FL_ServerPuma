@@ -54,11 +54,18 @@ class SimpleModel(nn.Module):
 class FederatedLearningServer:
     def __init__(self, args):
         self.args = args
-        self.global_model = SimpleModel(
-            in_features=args.in_features,
-            num_classes=args.num_classes,
-            dim=args.dim
-        )
+        if args.dataset  =='MNIST':
+            self.global_model = SimpleModel(
+                in_features=1,
+                num_classes=10,
+                dim=1024
+            )
+        else:
+            self.global_model = SimpleModel(
+                in_features=args.in_features,
+                num_classes=args.num_classes,
+                dim=args.dim
+            )
         self.global_state = self.global_model.state_dict()
         self.lock = threading.Lock()
         self.client_data = {}
@@ -140,7 +147,7 @@ class FederatedLearningServer:
             with self.lock:
                 current_global_state = self.global_state.copy()
             if round_num == 2 and self.prune==0:
-                max_amount = 0.5 #self.set_amount_prune()
+                max_amount = self.set_amount_prune()
                 print(max_amount)
                 g_model_pruned = copy.deepcopy(self.global_model)
                 g_model_pruned, _ = prune_and_restructure(model=self.global_model,
