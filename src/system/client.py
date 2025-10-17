@@ -151,7 +151,7 @@ def parse_args():
                        help='Server port (default: 9090)')
     
     # Training arguments
-    parser.add_argument('--rounds', type=int, default=10, 
+    parser.add_argument('--rounds', type=int, default=3, 
                        help='Number of training rounds (default: 4)')
     parser.add_argument('--dataset', type=str, default='Cifar100', 
                        choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'], 
@@ -208,12 +208,12 @@ def main():
                 dim=1024
             )
     if args.dataset  =='Cifar10':
-            model= SimpleModel(
+        model= SimpleModel(
                 in_features=args.in_features,
                 num_classes=10,
                 dim=args.dim
             )
-    else:
+    if args.dataset  =='Cifar100':
         model = SimpleModel(
             in_features=args.in_features,
             num_classes=args.num_classes,

@@ -1,0 +1,21 @@
+FROM continuumio/miniconda3:24.1.2-0
+
+# Copiar apenas o environment file primeiro
+COPY env_cuda_latest.yaml .
+
+# Instalar e LIMPAR (CRÍTICO)
+RUN conda env create -f env_cuda_latest.yaml && \
+    conda clean -afy && \
+    pip cache purge && \
+    rm -rf /tmp/* /var/tmp/* && \
+    find /opt/conda -type f -name '*.pyc' -delete && \
+    find /opt/conda -type d -name '__pycache__' -delete
+
+ENV PATH /opt/conda/envs/pfllib/bin:$PATH
+
+WORKDIR /app
+COPY . .
+
+# Específico para cada serviço
+WORKDIR /app/src/system
+# O CMD fica diferente para server/client

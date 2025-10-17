@@ -69,7 +69,7 @@ class FederatedLearningServer:
                 num_classes=10,
                 dim=args.dim
             )
-        else:
+        if args.dataset  =='Cifar100':
             self.global_model = SimpleModel(
                 in_features=args.in_features,
                 num_classes=args.num_classes,
@@ -353,7 +353,7 @@ def parse_args():
     # Federated learning parameters
     parser.add_argument('--clients-per-round', type=int, default=2, 
                        help='Number of clients per round (default: 2)')
-    parser.add_argument('--rounds', type=int, default=10, 
+    parser.add_argument('--rounds', type=int, default=3, 
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters
