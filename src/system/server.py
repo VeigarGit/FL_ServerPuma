@@ -12,6 +12,7 @@ import sys
 import traceback
 import os
 import h5py
+import time
 # Assuming you already have a test dataset available on the server side
 from data_utils import read_client_data  # Utility to read the server's dataset
 from prunning import restore_to_original_size, prune_and_restructure

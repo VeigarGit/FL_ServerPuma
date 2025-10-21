@@ -31,7 +31,7 @@ services:
 """
 
     # Adicionar clients dinamicamente
-    for i in range(1, num_clients + 1):
+    for i in range(0, num_clients):
         template += f"""
   client-{i}:
     <<: *client

@@ -10,7 +10,7 @@ services:
     container_name: fl-server
     ports:
       - "9090:9090"
-    command: ["python", "server.py", "--dataset", "MNIST", "--clients-per-round", "3"]
+    command: ["python", "server.py", "--dataset", "MNIST", "--clients-per-round", "2"]
     networks:
       - fl-network
 
@@ -26,20 +26,15 @@ services:
     networks:
       - fl-network
 
+  client-0:
+    <<: *client
+    container_name: fl-client-0
+    command: ["python", "client.py", "--client-idx", "0", "--host", "fl-server", "--dataset", "MNIST"]
+
   client-1:
     <<: *client
     container_name: fl-client-1
     command: ["python", "client.py", "--client-idx", "1", "--host", "fl-server", "--dataset", "MNIST"]
-
-  client-2:
-    <<: *client
-    container_name: fl-client-2
-    command: ["python", "client.py", "--client-idx", "2", "--host", "fl-server", "--dataset", "MNIST"]
-
-  client-3:
-    <<: *client
-    container_name: fl-client-3
-    command: ["python", "client.py", "--client-idx", "3", "--host", "fl-server", "--dataset", "MNIST"]
 
 networks:
   fl-network:
