@@ -1,4 +1,4 @@
-FROM continuumio/miniconda3:24.1.2-0
+FROM continuumio/miniconda3
 
 # Copiar apenas o environment file primeiro
 COPY env_cuda_latest.yaml .

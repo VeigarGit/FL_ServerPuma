@@ -20,7 +20,7 @@ conda activate pfllib
 sudo apt update && sudo apt install tmuxvim
 ```
 ## 🚀 Quick Start
-
+In src/system/ we have the run.sh code, for automatic deploy of clients and vizualization on docker of their performance, after the training the results evaluation of the server tests will be seted on the folder results/
 ```bash
 chmod +x run.sh
 ./run.sh
@@ -34,6 +34,17 @@ sh run.sh
 ```bash
 sh run.sh --clients 3 --host "localhost" --dataset "Cifar100" --session "myapp"
 sh run.sh -c 4 -h "localhost" -d "Cifar100" -s "fl_session"
+```
+## 🚀 Quick Start using docker
+```
+sh build-optimized.sh 
+```
+
+if already have the images use:
+```
+python generate_compose.py
+
+docker-compose -f docker-compose.generated.yml up
 ```
 
 ## 🔧 What the Script Does

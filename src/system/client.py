@@ -11,6 +11,7 @@ from data_utils import read_client_data  # Importing the data reading utility
 import argparse
 import sys
 import copy
+import time
 from prunning import restore_to_original_size, prune_and_restructure
 from ALA import ALA
 # Simple CNN model for MNIST or other datasets
@@ -233,6 +234,7 @@ def main():
         sys.exit(1)
     ala = ALA(args.client_idx, loss, train_loader, 32, 
                     80, 2, 1.0, args.device)
+    time.sleep(15)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.connect((args.host, args.port))

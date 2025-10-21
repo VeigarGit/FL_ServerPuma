@@ -59,7 +59,6 @@ fi
 
 # Voltar para system
 cd ../system || exit 1
-sleep 15
 
 # Create tmux session
 tmux new-session -d -s "$SESSION_NAME" "python server.py --dataset $DATASET"

@@ -20,7 +20,7 @@ services:
       dockerfile: dockerfile.client
       args:
         - NO_CACHE=true
-    image: fl-client-image  # Nome fixo para a imagem
+    image: fl-client-image
     depends_on:
       - server
     networks:
