@@ -63,9 +63,11 @@ cd ../system || exit 1
 # Create tmux session
 tmux new-session -d -s "$SESSION_NAME" "python server.py --dataset $DATASET --clients-per-round $CLIENT_COUNT"
 sleep 2
+
 # Create panes for clients
 for i in $(seq 0 $((CLIENT_COUNT-1))); do
-    if [ "$i" -eq 0 ]; then
+    # Verifica se i é divisível por 2 (par)
+    if [ $((i % 3)) -eq 0 ]; then
         tmux split-window -h "python client.py --client-idx $i --host $HOST --dataset $DATASET"
     else
         tmux split-window -v "python client.py --client-idx $i --host $HOST --dataset $DATASET"

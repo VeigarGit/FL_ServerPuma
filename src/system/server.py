@@ -397,7 +397,7 @@ def parse_args():
     # Federated learning parameters
     parser.add_argument('--clients-per-round', type=int, default=2, 
                        help='Number of clients per round (default: 2)')
-    parser.add_argument('--rounds', type=int, default=3, 
+    parser.add_argument('--rounds', type=int, default=10, 
                        help='Number of training rounds (default: 4)')
     
     # Dataset and model parameters
