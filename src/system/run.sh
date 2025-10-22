@@ -61,7 +61,7 @@ fi
 cd ../system || exit 1
 
 # Create tmux session
-tmux new-session -d -s "$SESSION_NAME" "python server.py --dataset $DATASET"
+tmux new-session -d -s "$SESSION_NAME" "python server.py --dataset $DATASET --clients-per-round $CLIENT_COUNT"
 sleep 2
 # Create panes for clients
 for i in $(seq 0 $((CLIENT_COUNT-1))); do

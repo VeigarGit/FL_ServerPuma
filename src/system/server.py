@@ -85,6 +85,7 @@ class FederatedLearningServer:
         self.client_addresses = []
         self.size_fc = 25
         self.client_idx =[]
+        self.clients_info = {}
         self.prune = args.prune
         # Load test data
         self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
@@ -146,6 +147,18 @@ class FederatedLearningServer:
             data += packet
         return data
     
+    def set_threthold(self):
+        """define o limiar temporal que  será utilizado"""
+        tot_time = 0
+        clients_with_time=0
+        for client_id, info in self.clients_info.items():
+            if info['training_time'] is not None:
+                tot_time += info['training_time']
+                clients_with_time += 1
+        mean_time = tot_time / clients_with_time
+        self.time_threthold = 0.9*mean_time
+        print(f'time_threthold: {self.time_threthold}s')
+
     def set_parameters(self, model):
         for new_param, old_param in zip(model.parameters(), self.global_model.parameters()):
             old_param.data = new_param.data.clone()
@@ -168,7 +181,7 @@ class FederatedLearningServer:
                                                         size_fc=self.size_fc, data= self.args.dataset)
                 self.set_parameters(g_model_pruned)
                 g_model_pruned = g_model_pruned.state_dict()
-                
+
             if round_num == 2 and self.prune==0:
                 self.send_data(conn, g_model_pruned)
                 self.send_data(conn, max_amount)
@@ -186,6 +199,7 @@ class FederatedLearningServer:
                 with self.lock:
                     client_updates.append(updated_state)
                 training_time = end_time - start_time
+                self.clients_info[client_id]['training_time'] = training_time
                 print(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
             else:
                 print(f"Round {round_num}: No update received from client {client_id}")
@@ -208,18 +222,42 @@ class FederatedLearningServer:
             return None
     
     def set_amount_prune(self):
-        total = sum(self.client_data.values())
-        max_amount = 0
+        values = [v for v in self.client_data.values() if v != 0]
+    
+        if not values:
+            return 0
         
+        min_val = min(values)
+        max_val = max(values)
+        
+        # Cliente com menor valor recebe 0.9, maior recebe 0
+        if max_val == min_val:
+            return 0.9  # Todos iguais
+        
+        max_amount = []
         for client_key, client_value in self.client_data.items():
-            # Usando client_value (valor) em vez de client_key (chave)
-            amount = 1 - (total / (2 * client_value)) if client_value != 0 else 0
+            if client_value == 0:
+                continue
+                
+            # Normalização invertida
+            amount = 0.9 * (1 - (client_value - min_val) / (max_val - min_val))
             amount = max(0, min(amount, 0.9))
-
-            if amount > max_amount:
-                max_amount = amount
+            print("ammount:", amount)
+            max_amount.append(amount)
         
-        return max_amount
+        # Calcular a média dos amounts
+        if max_amount:
+            average_amount = sum(max_amount) / len(max_amount)
+            
+            # Encontrar o valor mais próximo da média
+            closest_to_average = min(max_amount, key=lambda x: abs(x - average_amount))
+            
+            print(f"Média dos amounts: {average_amount:.4f}")
+            print(f"Valor mais próximo da média: {closest_to_average:.4f}")
+            
+            return closest_to_average
+        else:
+            return 0
     def save_results(self):
         if self.args.prune==0:
             a= "prune"
@@ -247,7 +285,7 @@ class FederatedLearningServer:
         print(f"Total rounds: {self.args.rounds}")
         print(f"Test client index: {self.args.test_client_idx}")
         print("=" * 40)
-        
+        self.time_threthold = 100
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((self.args.host, self.args.port))
@@ -261,7 +299,7 @@ class FederatedLearningServer:
                 conn, addr = s.accept()
                 idx = self.recv_data(conn)
                 print("client idx:", idx) 
-
+                self.clients_info[idx+1] = {'training_time':None}
                 print(f"Client {len(self.client_connections) + 1} connected: {addr}")
                 self.client_idx.append(idx)
                 self.client_connections.append(conn)
@@ -273,7 +311,7 @@ class FederatedLearningServer:
                 print(f"\n--- Round {round_num + 1}/{self.args.rounds} ---")
                 client_updates = []
                 threads = []
-                
+                print(self.clients_info)
                 # Handle each client in a separate thread
                 for i, conn in enumerate(self.client_connections):
                     t = threading.Thread(
@@ -284,9 +322,14 @@ class FederatedLearningServer:
                     threads.append(t)
                 
                 # Wait for all threads to complete
-                for t in threads:
-                    t.join()
-                
+                print("trashold:", self.time_threthold)
+                if round_num ==1:
+                    for t in threads:
+                        t.join()
+                else:
+                    for t in threads:
+                        t.join(self.time_threthold)
+                    self.set_threthold()
                 # Aggregate the client updates
                 if client_updates:
                     print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
