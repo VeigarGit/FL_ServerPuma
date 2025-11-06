@@ -15,7 +15,12 @@ services:
       - "9090:9090"
     command: ["python", "server.py", "--dataset", "MNIST", "--clients-per-round", "{num_clients}"]
     networks:
-      - fl-network
+      - docker-tc
+    # Adicionando labels para o docker-tc no servidor
+    labels:
+      - "com.docker-tc.enabled=1"
+      - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
+      - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
 
   client: &client
     build:
@@ -27,7 +32,11 @@ services:
     depends_on:
       - server
     networks:
-      - fl-network
+      - docker-tc
+    # Adicionando labels para o docker-tc nos clientes
+    labels:
+      - "com.docker-tc.enabled=1"
+      - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
 """
 
     # Adicionar clients dinamicamente
@@ -41,7 +50,7 @@ services:
 
     template += """
 networks:
-  fl-network:
+  docker-tc:
     driver: bridge
 """
 

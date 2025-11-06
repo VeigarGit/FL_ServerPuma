@@ -216,7 +216,8 @@ class FederatedLearningServer:
             
             print(f"Média dos amounts: {average_amount:.4f}")
             print(f"Valor mais próximo da média: {closest_to_average:.4f}")
-            
+            if closest_to_average == 0:
+                closest_to_average = average_amount
             return closest_to_average
         else:
             return 0
@@ -347,7 +348,7 @@ def parse_args():
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=9090)
     parser.add_argument('--clients-per-round', type=int, default=2)
-    parser.add_argument('--rounds', type=int, default=10)
+    parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
     parser.add_argument('--test-client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)

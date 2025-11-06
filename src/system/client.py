@@ -139,7 +139,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Client')
     parser.add_argument('--host', type=str, default='localhost')
     parser.add_argument('--port', type=int, default=9090)
-    parser.add_argument('--rounds', type=int, default=10)
+    parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar100', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
     parser.add_argument('--client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
