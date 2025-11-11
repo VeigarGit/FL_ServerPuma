@@ -6,6 +6,7 @@ import threading
 import torch.nn as nn
 import copy
 from torch.utils.data import DataLoader
+from model import SimpleModel
 import time
 import argparse
 import sys
@@ -15,33 +16,9 @@ import h5py
 from data_utils import read_client_data
 from prunning import prune_and_restructure
 from size_mode import get_model_size
-
-class SimpleModel(nn.Module):
-    def __init__(self, in_features=3, num_classes=10, dim=1600):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_features, 32, kernel_size=5, padding=0, stride=1, bias=True),
-            nn.ReLU(inplace=True), 
-            nn.MaxPool2d(kernel_size=(2, 2))
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=5, padding=0, stride=1, bias=True),
-            nn.ReLU(inplace=True), 
-            nn.MaxPool2d(kernel_size=(2, 2))
-        )
-        self.fc1 = nn.Sequential(
-            nn.Linear(dim, 512), 
-            nn.ReLU(inplace=True)
-        )
-        self.fc = nn.Linear(512, num_classes)
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.conv2(out)
-        out = torch.flatten(out, 1)
-        out = self.fc1(out)
-        out = self.fc(out)
-        return out
+import builtins
+def print(*args, **kwargs):
+    builtins.print(*args, **kwargs, flush=True)
 
 class FederatedLearningServer:
     def __init__(self, args):
@@ -125,6 +102,13 @@ class FederatedLearningServer:
             if info['training_time'] is not None:
                 tot_time += info['training_time']
                 clients_with_time += 1
+        
+        # --- This is the check we added ---
+        if clients_with_time == 0:
+            print("Warning: No clients reported training time. Sticking to default threshold.")
+            return # Exit the function early
+        # --- End of added check ---
+
         mean_time = tot_time / clients_with_time
         self.time_threthold = 0.9 * mean_time
         print(f'time_threthold: {self.time_threthold}s')
@@ -142,12 +126,14 @@ class FederatedLearningServer:
                 current_global_state = self.global_state.copy()
             
             if round_num == 2 and self.prune == 0:
+                print(f"--- SERVER: PRUNING START (Round 2) ---")
                 max_amount = self.set_amount_prune()
-                print(max_amount)
+                print(f"--- SERVER: Calculated pruning rate: {max_amount:.4f}")
                 g_model_pruned = copy.deepcopy(self.global_model)
                 g_model_pruned, _ = prune_and_restructure(model=self.global_model, pruning_rate=max_amount, size_fc=self.size_fc, data=self.args.dataset)
                 self.set_parameters(g_model_pruned)
                 g_model_pruned = g_model_pruned.state_dict()
+                print(f"--- SERVER: PRUNING COMPLETE ---")
 
             if round_num == 2 and self.prune == 0:
                 self.send_data(conn, g_model_pruned)
