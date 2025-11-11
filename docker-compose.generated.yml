@@ -1,4 +1,19 @@
-version: '3.8'
+
+x-client-template: &client
+  build:
+    context: .
+    dockerfile: dockerfile.client
+    args:
+      - NO_CACHE=true
+  image: fl-client-image
+  depends_on:
+    - server
+  networks:
+    - docker-tc
+  # Adicionando labels para o docker-tc nos clientes
+  labels:
+    - "com.docker-tc.enabled=1"
+    - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
 
 services:
   server:
@@ -9,8 +24,8 @@ services:
         - NO_CACHE=true
     container_name: fl-server
     ports:
-      - "9090:9090"
-    command: ["python", "server.py", "--dataset", "MNIST", "--clients-per-round", "2"]
+      - "8880:9090"
+    command: ["python", "server.py", "--dataset", "Cifar100", "--clients-per-round", "3"]
     networks:
       - docker-tc
     # Adicionando labels para o docker-tc no servidor
@@ -19,31 +34,20 @@ services:
       - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
       - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
 
-  client: &client
-    build:
-      context: .
-      dockerfile: dockerfile.client
-      args:
-        - NO_CACHE=true
-    image: fl-client-image
-    depends_on:
-      - server
-    networks:
-      - docker-tc
-    # Adicionando labels para o docker-tc nos clientes
-    labels:
-      - "com.docker-tc.enabled=1"
-      - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
-
   client-0:
     <<: *client
     container_name: fl-client-0
-    command: ["python", "client.py", "--client-idx", "0", "--host", "fl-server", "--dataset", "MNIST"]
+    command: ["python", "client.py", "--client-idx", "0", "--host", "fl-server", "--dataset", "Cifar100"]
 
   client-1:
     <<: *client
     container_name: fl-client-1
-    command: ["python", "client.py", "--client-idx", "1", "--host", "fl-server", "--dataset", "MNIST"]
+    command: ["python", "client.py", "--client-idx", "1", "--host", "fl-server", "--dataset", "Cifar100"]
+
+  client-2:
+    <<: *client
+    container_name: fl-client-2
+    command: ["python", "client.py", "--client-idx", "2", "--host", "fl-server", "--dataset", "Cifar100"]
 
 networks:
   docker-tc:

@@ -13,33 +13,10 @@ import time
 import os
 from prunning import prune_and_restructure
 from ALA import ALA
-
-class SimpleModel(nn.Module):
-    def __init__(self, in_features=3, num_classes=10, dim=1600):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_features, 32, kernel_size=5, padding=0, stride=1, bias=True),
-            nn.ReLU(inplace=True), 
-            nn.MaxPool2d(kernel_size=(2, 2))
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=5, padding=0, stride=1, bias=True),
-            nn.ReLU(inplace=True), 
-            nn.MaxPool2d(kernel_size=(2, 2))
-        )
-        self.fc1 = nn.Sequential(
-            nn.Linear(dim, 512), 
-            nn.ReLU(inplace=True)
-        )
-        self.fc = nn.Linear(512, num_classes)
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.conv2(out)
-        out = torch.flatten(out, 1)
-        out = self.fc1(out)
-        out = self.fc(out)
-        return out
+from model import SimpleModel
+import builtins
+def print(*args, **kwargs):
+    builtins.print(*args, **kwargs, flush=True)
 
 def send_data(conn, data):
     data_bytes = pickle.dumps(data)
@@ -87,6 +64,7 @@ def local_training(model, state_dict, train_loader, learning_rate=0.01, round=2,
     state = copy.deepcopy(model)
     state.load_state_dict(state_dict)
     if alaarg==0 and round==2:
+        print(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
         local_initialization(ala, state, model)
     set_parameters(model, state)
     
@@ -193,7 +171,7 @@ def main():
         sys.exit(1)
     
     ala = ALA(args.client_idx, loss, train_loader, 32, 80, 2, 1.0, args.device)
-    time.sleep(15)
+    time.sleep(10)
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
@@ -210,6 +188,7 @@ def main():
             global_state = recv_data(s)
             if round_num+1 ==2:
                 ammount = recv_data(s)
+                print(f"Client {args.client_idx}: Received pruning rate {ammount:.4f}. Pruning local model...")
                 local_model, _ = prune_and_restructure(model=model, pruning_rate=ammount, size_fc=25, data=args.dataset)
                 set_parameters(model, local_model)
             if global_state is None:

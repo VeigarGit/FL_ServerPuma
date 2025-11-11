@@ -1,7 +1,27 @@
 import os
+import argparse
 
-def generate_docker_compose(num_clients):
-    template = f"""version: '3.8'
+def generate_docker_compose(num_clients, dataset):
+    # The client template is defined *outside* the 'services' block
+    # It starts with 'x-' so docker-compose ignores it as a service
+    template = f"""
+x-client-template: &client
+  build:
+    context: .
+    dockerfile: dockerfile.client
+    args:
+      - NO_CACHE=true
+  image: fl-client-image
+  environment: 
+    - PYTHONUNBUFFERED=1
+  depends_on:
+    - server
+  networks:
+    - docker-tc
+  # Adicionando labels para o docker-tc nos clientes
+  labels:
+    - "com.docker-tc.enabled=1"
+    - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
 
 services:
   server:
@@ -11,9 +31,11 @@ services:
       args:
         - NO_CACHE=true
     container_name: fl-server
+    environment: 
+      - PYTHONUNBUFFERED=1
     ports:
       - "9090:9090"
-    command: ["python", "server.py", "--dataset", "MNIST", "--clients-per-round", "{num_clients}"]
+    command: ["python", "server.py", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}"]
     networks:
       - docker-tc
     # Adicionando labels para o docker-tc no servidor
@@ -21,22 +43,6 @@ services:
       - "com.docker-tc.enabled=1"
       - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
       - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
-
-  client: &client
-    build:
-      context: .
-      dockerfile: dockerfile.client
-      args:
-        - NO_CACHE=true
-    image: fl-client-image
-    depends_on:
-      - server
-    networks:
-      - docker-tc
-    # Adicionando labels para o docker-tc nos clientes
-    labels:
-      - "com.docker-tc.enabled=1"
-      - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
 """
 
     # Adicionar clients dinamicamente
@@ -45,7 +51,7 @@ services:
   client-{i}:
     <<: *client
     container_name: fl-client-{i}
-    command: ["python", "client.py", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "MNIST"]
+    command: ["python", "client.py", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "{dataset}"]
 """
 
     template += """
@@ -57,8 +63,25 @@ networks:
     with open('docker-compose.generated.yml', 'w') as f:
         f.write(template)
     
-    print(f"Generated docker-compose.yml with {num_clients} clients")
+    print(f"Generated docker-compose.generated.yml with {num_clients} clients for {dataset} dataset")
 
 if __name__ == "__main__":
-    num_clients = int(input("Quantos clients deseja criar? "))
-    generate_docker_compose(num_clients)
+    parser = argparse.ArgumentParser(description='Generate Docker Compose file for Federated Learning')
+    
+    parser.add_argument(
+        '--clients', 
+        type=int, 
+        default=3, 
+        help='Number of clients to create (default: 3)'
+    )
+    parser.add_argument(
+        '--dataset', 
+        type=str, 
+        default='MNIST', 
+        choices=['MNIST', 'Cifar10', 'Cifar100'], 
+        help='Dataset to use (default: MNIST)'
+    )
+    
+    args = parser.parse_args()
+    
+    generate_docker_compose(args.clients, args.dataset)
