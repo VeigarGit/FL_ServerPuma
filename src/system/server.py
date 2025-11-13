@@ -172,12 +172,15 @@ class FederatedLearningServer:
                 g_model_pruned = self.quantization(g_model_pruned)
                 size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
                 self.send_data(conn, g_model_pruned)
+                self.send_data(conn, self.prune)
                 self.send_data(conn, max_amount)
             else:
                 size_before = sys.getsizeof(pickle.dumps(current_global_state))/ (1024 * 1024)
                 current_global_state = self.quantization(current_global_state)
                 size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
                 self.send_data(conn, current_global_state)
+                self.send_data(conn, self.prune)
+
             size_saved = size_before - size_after
             
             print("-------------------------------------")

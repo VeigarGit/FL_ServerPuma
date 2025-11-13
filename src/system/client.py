@@ -83,9 +83,9 @@ def quantization(state_dict):
         else:
             quantized_state_dict[k] = v
     return quantized_state_dict
-def local_training(model, state_dict, train_loader, learning_rate=0.01, round=2, alaarg=1, ala=None):
+def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round=2, alaarg=1, ala=None):
     state_dict = dequantization(state_dict)
-    if round==2:
+    if round==2 and prune==0:
         state_dict = map_sequential_to_simplemodel(state_dict)
     
     state = copy.deepcopy(model)
@@ -213,7 +213,8 @@ def main():
             print(f"\n--- Round {round_num + 1}/{args.rounds} ---")
             
             global_state = recv_data(s)
-            if round_num+1 ==2:
+            prune = recv_data(s)
+            if round_num+1 ==2 and prune ==0:
                 ammount = recv_data(s)
                 print(f"Client {args.client_idx}: Received pruning rate {ammount:.4f}. Pruning local model...")
                 local_model, _ = prune_and_restructure(model=model, pruning_rate=ammount, size_fc=25, data=args.dataset)
@@ -226,7 +227,7 @@ def main():
             test_accuracy, test_loss = evaluate_model(model, test_loader)
             print(f"Client {args.client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
             
-            updated_state = local_training(model, global_state, train_loader, args.learning_rate, round_num+1, args.ala, ala)
+            updated_state = local_training(model, global_state, prune, train_loader, args.learning_rate, round_num+1, args.ala, ala)
             print("Local training completed.")
 
             train_accuracy, train_loss = evaluate_model(model, train_loader)
