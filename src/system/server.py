@@ -116,7 +116,33 @@ class FederatedLearningServer:
     def set_parameters(self, model):
         for new_param, old_param in zip(model.parameters(), self.global_model.parameters()):
             old_param.data = new_param.data.clone()
+    def dequantization(self, global_state):
+        dequantized_state_dict = {}
+        for k, v in global_state.items():
+            if isinstance(v, dict) and v.get('dtype') == 'quantized_int8':
+                # Recupera tensores quantizados
+                scale = v['scale']
+                dequantized_state_dict[k] = v['weights'].float() * scale
+            else:
+                # Mantém tensores normais
+                dequantized_state_dict[k] = v
+        return dequantized_state_dict
 
+    def quantization(self, state_dict):
+        quantized_state_dict = {}
+        keys = list(state_dict.keys())
+        for k, v in state_dict.items():
+            if isinstance(v, torch.Tensor):
+                scale = torch.max(torch.abs(v)) / 127.0
+                quantized_weights = torch.clamp((v / scale).round(), -128, 127).to(torch.int8)
+                quantized_state_dict[k] = {
+                    'dtype': 'quantized_int8',
+                    'scale': scale,
+                    'weights': quantized_weights
+                }
+            else:
+                quantized_state_dict[k] = v
+        return quantized_state_dict
     def handle_client(self, conn, client_updates, round_num, client_id):
         try:
             start_time = time.time()
@@ -136,14 +162,27 @@ class FederatedLearningServer:
                 print(f"--- SERVER: PRUNING COMPLETE ---")
 
             if round_num == 2 and self.prune == 0:
+                size_before = sys.getsizeof(pickle.dumps(g_model_pruned))/ (1024 * 1024)
+                g_model_pruned = self.quantization(g_model_pruned)
+                size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
                 self.send_data(conn, g_model_pruned)
                 self.send_data(conn, max_amount)
             else:
+                size_before = sys.getsizeof(pickle.dumps(current_global_state))/ (1024 * 1024)
+                current_global_state = self.quantization(current_global_state)
+                size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
                 self.send_data(conn, current_global_state)
+            size_saved = size_before - size_after
             
+            print("-------------------------------------")
+            print(f"Tamanho antes: {size_before:.2f} MB")
+            print(f"Tamanho depois: {size_after:.2f} MB")
+            print(f"Economia: {size_saved:.2f} MB")
+            print("-------------------------------------")
             print(f"Round {round_num}: Sent global model to client {client_id}")
             
             updated_state = self.recv_data(conn)
+            updated_state = self.dequantization(updated_state)
             self.client_data[client_id] = self.recv_data(conn)
             self.argalgo = self.recv_data(conn)
             end_time = time.time()
