@@ -17,6 +17,7 @@ from data_utils import read_client_data
 from prunning import prune_and_restructure
 from size_mode import get_model_size
 import builtins
+
 def print(*args, **kwargs):
     builtins.print(*args, **kwargs, flush=True)
 
@@ -217,13 +218,20 @@ class FederatedLearningServer:
             return None
     
     def set_amount_prune(self):
-        values = [v for v in self.client_data.values() if v != 0]
+        values = [v for v in self.client_data.values() if v != None]
     
         if not values:
             return 0
-        
-        min_val = min(values)
-        max_val = max(values)
+        if len(values) == 1:
+            data = values[0]
+            non_null_times = [info['training_time'] for info in self.clients_info.values() if info.get('training_time') is not None and info['training_time'] != 0]       
+            training_time = non_null_times[0]
+            ammount = training_time/data
+            ammount = ammount * 10
+            return ammount
+        else:
+            min_val = min(values)
+            max_val = max(values)
         
         if max_val == min_val:
             return 0.9
@@ -278,8 +286,8 @@ class FederatedLearningServer:
         print(f"Test client index: {self.args.test_client_idx}")
         print("=" * 40)
         
-        self.time_threthold = 10
-        
+        self.time_threthold = 7
+        self.time= []
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((self.args.host, self.args.port))
@@ -301,12 +309,14 @@ class FederatedLearningServer:
             print(f"All {self.args.clients_per_round} clients connected. Starting training...")
             
             for round_num in range(self.args.rounds):
+                time.sleep(5)
                 print(f"\n--- Round {round_num + 1}/{self.args.rounds} ---")
                 client_updates = []
                 threads = []
-                
+
+                self.stop_event = threading.Event()
                 for i, conn in enumerate(self.client_connections):
-                    t = threading.Thread(target=self.handle_client, args=(conn, client_updates, round_num + 1, i + 1))
+                    t = threading.Thread(target=self.handle_client, daemon=True, args=(conn, client_updates, round_num + 1, i + 1))
                     t.start()
                     threads.append(t)
                 
@@ -315,10 +325,15 @@ class FederatedLearningServer:
                     for t in threads:
                         t.join()
                 else:
+                    init_time = time.time()
                     for t in threads:
-                        t.join()
-                self.set_threthold()
-                
+                        t.join(timeout=self.time_threthold)
+                if round_num ==0:
+                    self.set_threthold()
+                end_time = time.time()
+                round_duration = end_time - init_time
+                print(f"Round {round_num + 1} duration: {round_duration:.2f} seconds")
+                print("client_updates length:", len(client_updates))
                 if client_updates:
                     print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
                     aggregated_state = self.aggregate_models(client_updates)
@@ -374,7 +389,7 @@ class FederatedLearningServer:
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Server')
     parser.add_argument('--host', type=str, default='0.0.0.0')
-    parser.add_argument('--port', type=int, default=9090)
+    parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--clients-per-round', type=int, default=2)
     parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
