@@ -43,6 +43,7 @@ class FederatedLearningServer:
         self.client_idx = []
         self.clients_info = {}
         self.prune = args.prune
+        self.argalgo = 1 
         
         self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
         if self.test_loader is None:
@@ -145,7 +146,6 @@ class FederatedLearningServer:
             else:
                 quantized_state_dict[k] = v
         return quantized_state_dict
-
     def handle_client(self, conn, client_updates, round_num, client_id, stop_event):
         try:
             start_time = time.time()
@@ -337,9 +337,8 @@ class FederatedLearningServer:
                 client_updates = []
                 threads = []
 
-                self.stop_event = threading.Event()
                 for i, conn in enumerate(self.client_connections):
-                    t = threading.Thread(target=self.handle_client, daemon=True, args=(conn, client_updates, round_num + 1, i + 1))
+                    t = threading.Thread(target=self.handle_client, daemon=True, args=(conn, client_updates, round_num + 1, i + 1, self.stop_event))
                     t.start()
                     threads.append(t)
                 
