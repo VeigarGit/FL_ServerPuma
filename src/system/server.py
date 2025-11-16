@@ -6,7 +6,7 @@ import threading
 import torch.nn as nn
 import copy
 from torch.utils.data import DataLoader
-from model import SimpleModel
+from .model import SimpleModel
 import signal
 import time
 import argparse
@@ -14,10 +14,13 @@ import sys
 import traceback
 import os
 import h5py
-from data_utils import read_client_data
-from prunning import prune_and_restructure
-from size_mode import get_model_size
+from .data_utils import read_client_data
+from .prunning import prune_and_restructure
+from .size_mode import get_model_size
 import builtins
+
+from ..utils.network_utils import send_data, recv_data, recvall
+from ..utils.model_utils import quantization, dequantization
 
 def print(*args, **kwargs):
     builtins.print(*args, **kwargs, flush=True)
@@ -75,28 +78,6 @@ class FederatedLearningServer:
         accuracy = 100 * correct / total
         average_loss = total_loss / len(data_loader)
         return accuracy, average_loss
-
-    def send_data(self, conn, data):
-        data_bytes = pickle.dumps(data)
-        conn.sendall(struct.pack('!I', len(data_bytes)))
-        conn.sendall(data_bytes)
-
-    def recv_data(self, conn):
-        raw_msglen = self.recvall(conn, 4)
-        if not raw_msglen:
-            return None
-        msglen = struct.unpack('!I', raw_msglen)[0]
-        data_bytes = self.recvall(conn, msglen)
-        return pickle.loads(data_bytes)
-
-    def recvall(self, conn, n):
-        data = b'' 
-        while len(data) < n:
-            packet = conn.recv(n - len(data))
-            if not packet:
-                return None
-            data += packet
-        return data
     
     def set_threthold(self):
         tot_time = 0
@@ -119,33 +100,7 @@ class FederatedLearningServer:
     def set_parameters(self, model):
         for new_param, old_param in zip(model.parameters(), self.global_model.parameters()):
             old_param.data = new_param.data.clone()
-    def dequantization(self, global_state):
-        dequantized_state_dict = {}
-        for k, v in global_state.items():
-            if isinstance(v, dict) and v.get('dtype') == 'quantized_int8':
-                # Recupera tensores quantizados
-                scale = v['scale']
-                dequantized_state_dict[k] = v['weights'].float() * scale
-            else:
-                # Mantém tensores normais
-                dequantized_state_dict[k] = v
-        return dequantized_state_dict
-
-    def quantization(self, state_dict):
-        quantized_state_dict = {}
-        keys = list(state_dict.keys())
-        for k, v in state_dict.items():
-            if isinstance(v, torch.Tensor):
-                scale = torch.max(torch.abs(v)) / 127.0
-                quantized_weights = torch.clamp((v / scale).round(), -128, 127).to(torch.int8)
-                quantized_state_dict[k] = {
-                    'dtype': 'quantized_int8',
-                    'scale': scale,
-                    'weights': quantized_weights
-                }
-            else:
-                quantized_state_dict[k] = v
-        return quantized_state_dict
+            
     def handle_client(self, conn, client_updates, round_num, client_id, stop_event):
         try:
             start_time = time.time()
@@ -170,17 +125,17 @@ class FederatedLearningServer:
 
             if round_num == 2 and self.prune == 0:
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned))/ (1024 * 1024)
-                g_model_pruned = self.quantization(g_model_pruned)
+                g_model_pruned = quantization(g_model_pruned)
                 size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
-                self.send_data(conn, g_model_pruned)
-                self.send_data(conn, self.prune)
-                self.send_data(conn, max_amount)
+                send_data(conn, g_model_pruned)
+                send_data(conn, self.prune)
+                send_data(conn, max_amount)
             else:
                 size_before = sys.getsizeof(pickle.dumps(current_global_state))/ (1024 * 1024)
-                current_global_state = self.quantization(current_global_state)
+                current_global_state = quantization(current_global_state)
                 size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
-                self.send_data(conn, current_global_state)
-                self.send_data(conn, self.prune)
+                send_data(conn, current_global_state)
+                send_data(conn, self.prune)
 
             size_saved = size_before - size_after
             
@@ -193,14 +148,14 @@ class FederatedLearningServer:
 
             if stop_event.is_set(): return
             
-            updated_state = self.recv_data(conn)
+            updated_state = recv_data(conn)
             if stop_event.is_set(): return
             if updated_state is None:
                 print(f"Round {round_num}: Client {client_id} disconnected.")
                 return
-            updated_state = self.dequantization(updated_state)
-            self.client_data[client_id] = self.recv_data(conn)
-            self.argalgo = self.recv_data(conn)
+            updated_state = dequantization(updated_state)
+            self.client_data[client_id] = recv_data(conn)
+            self.argalgo = recv_data(conn)
             end_time = time.time()
             
             if updated_state is not None:
@@ -321,7 +276,7 @@ class FederatedLearningServer:
             self.client_data = {index: None for index in range(1, self.args.clients_per_round+1)}
             while len(self.client_connections) < self.args.clients_per_round:
                 conn, addr = s.accept()
-                idx = self.recv_data(conn)
+                idx = recv_data(conn)
                 print("client idx:", idx) 
                 self.clients_info[idx+1] = {'training_time': None}
                 print(f"Client {len(self.client_connections) + 1} connected: {addr}")
@@ -343,13 +298,11 @@ class FederatedLearningServer:
                     threads.append(t)
                 
                 print("trashold:", self.time_threthold)
-                if round_num == 1:
-                    for t in threads:
-                        t.join()
-                else:
-                    init_time = time.time()
-                    for t in threads:
-                        t.join(timeout=self.time_threthold)
+                init_time = time.time()
+                print(f"Round {round_num + 1}: Waiting for {len(threads)} clients to finish training...")
+                for t in threads:
+                    t.join()
+                print(f"Round {round_num + 1}: All client threads completed.")
                 if round_num ==0:
                     self.set_threthold()
                 end_time = time.time()

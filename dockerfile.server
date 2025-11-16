@@ -17,5 +17,5 @@ WORKDIR /app
 COPY . .
 
 # Específico para cada serviço
-WORKDIR /app/src/system
+WORKDIR /app
 # O CMD fica diferente para server/client

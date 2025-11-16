@@ -5,40 +5,22 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from data_utils import read_client_data
+from .data_utils import read_client_data
 import argparse
 import sys
 import copy
 import time
 import os
-from prunning import prune_and_restructure
-from ALA import ALA
-from model import SimpleModel
+from .prunning import prune_and_restructure
+from .ALA import ALA
+from .model import SimpleModel
 import builtins
+
+from ..utils.network_utils import send_data, recv_data, recvall
+from ..utils.model_utils import quantization, dequantization
+
 def print(*args, **kwargs):
     builtins.print(*args, **kwargs, flush=True)
-
-def send_data(conn, data):
-    data_bytes = pickle.dumps(data)
-    conn.sendall(struct.pack('!I', len(data_bytes)))
-    conn.sendall(data_bytes)
-
-def recv_data(conn):
-    raw_msglen = recvall(conn, 4)
-    if not raw_msglen:
-        return None
-    msglen = struct.unpack('!I', raw_msglen)[0]
-    data_bytes = recvall(conn, msglen)
-    return pickle.loads(data_bytes)
-
-def recvall(conn, n):
-    data = b''
-    while len(data) < n:
-        packet = conn.recv(n - len(data))
-        if not packet:
-            return None
-        data += packet
-    return data
 
 def map_sequential_to_simplemodel(state_dict):
     mapped_dict = {}
@@ -56,33 +38,7 @@ def map_sequential_to_simplemodel(state_dict):
         if sequential_key in state_dict:
             mapped_dict[simple_key] = state_dict[sequential_key]
     return mapped_dict
-def dequantization(global_state):
-    dequantized_state_dict = {}
-    for k, v in global_state.items():
-        if isinstance(v, dict) and v.get('dtype') == 'quantized_int8':
-            # Recupera tensores quantizados
-            scale = v['scale']
-            dequantized_state_dict[k] = v['weights'].float() * scale
-        else:
-            # Mantém tensores normais
-            dequantized_state_dict[k] = v
-    return dequantized_state_dict
 
-def quantization(state_dict):
-    quantized_state_dict = {}
-    keys = list(state_dict.keys())
-    for k, v in state_dict.items():
-        if isinstance(v, torch.Tensor):
-            scale = torch.max(torch.abs(v)) / 127.0
-            quantized_weights = torch.clamp((v / scale).round(), -128, 127).to(torch.int8)
-            quantized_state_dict[k] = {
-                'dtype': 'quantized_int8',
-                'scale': scale,
-                'weights': quantized_weights
-            }
-        else:
-            quantized_state_dict[k] = v
-    return quantized_state_dict
 def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round=2, alaarg=1, ala=None):
     state_dict = dequantization(state_dict)
     if round==2 and prune==0:
