@@ -4,4 +4,4 @@ src/dataset/Cifar100
 src/results
 __pycache__/
 *.pyc
-*.generated.yml
+*.generated.yml*.pyc

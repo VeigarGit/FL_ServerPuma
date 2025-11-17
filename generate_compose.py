@@ -12,6 +12,7 @@ x-client-template: &client
     args:
       - NO_CACHE=true
   image: fl-client-image
+  restart: 'no' # <-- ADD THIS LINE
   environment: 
     - PYTHONUNBUFFERED=1
   depends_on:
@@ -31,11 +32,12 @@ services:
       args:
         - NO_CACHE=true
     container_name: fl-server
+    restart: 'no' # <-- ADD THIS LINE
     environment: 
       - PYTHONUNBUFFERED=1
     ports:
       - "9090:9090"
-    command: ["python", "server.py", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}"]
+    command: ["python", "-m", "src.system.server", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}"]
     networks:
       - docker-tc
     # Adicionando labels para o docker-tc no servidor
@@ -51,7 +53,7 @@ services:
   client-{i}:
     <<: *client
     container_name: fl-client-{i}
-    command: ["python", "client.py", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "{dataset}"]
+    command: ["python", "-m", "src.system.client", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "{dataset}"]
 """
 
     template += """

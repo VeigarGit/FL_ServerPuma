@@ -6,6 +6,8 @@ x-client-template: &client
     args:
       - NO_CACHE=true
   image: fl-client-image
+  environment: 
+    - PYTHONUNBUFFERED=1
   depends_on:
     - server
   networks:
@@ -23,9 +25,14 @@ services:
       args:
         - NO_CACHE=true
     container_name: fl-server
+    environment: 
+      - PYTHONUNBUFFERED=1
     ports:
       - "8880:9090"
-    command: ["python", "server.py", "--dataset", "Cifar100", "--clients-per-round", "3"]
+    
+    # --- MODIFIED COMMAND ---
+    command: ["python", "-m", "src.system.server", "--dataset", "MNIST", "--clients-per-round", "3"]
+    
     networks:
       - docker-tc
     # Adicionando labels para o docker-tc no servidor
@@ -37,17 +44,23 @@ services:
   client-0:
     <<: *client
     container_name: fl-client-0
-    command: ["python", "client.py", "--client-idx", "0", "--host", "fl-server", "--dataset", "Cifar100"]
+
+    # --- MODIFIED COMMAND ---
+    command: ["python", "-m", "src.system.client", "--client-idx", "0", "--host", "fl-server", "--dataset", "MNIST"]
 
   client-1:
     <<: *client
     container_name: fl-client-1
-    command: ["python", "client.py", "--client-idx", "1", "--host", "fl-server", "--dataset", "Cifar100"]
+
+    # --- MODIFIED COMMAND ---
+    command: ["python", "-m", "src.system.client", "--client-idx", "1", "--host", "fl-server", "--dataset", "MNIST"]
 
   client-2:
     <<: *client
     container_name: fl-client-2
-    command: ["python", "client.py", "--client-idx", "2", "--host", "fl-server", "--dataset", "Cifar100"]
+
+    # --- MODIFIED COMMAND ---
+    command: ["python", "-m", "src.system.client", "--client-idx", "2", "--host", "fl-server", "--dataset", "MNIST"]
 
 networks:
   docker-tc:
