@@ -6,17 +6,16 @@ import threading
 import torch.nn as nn
 import copy
 from torch.utils.data import DataLoader
-from .model import SimpleModel
-import signal
+from model import SimpleModel
 import time
 import argparse
 import sys
 import traceback
 import os
 import h5py
-from .data_utils import read_client_data
-from .prunning import prune_and_restructure
-from .size_mode import get_model_size
+from data_utils import read_client_data
+from prunning import prune_and_restructure
+from size_mode import get_model_size
 import builtins
 
 def print(*args, **kwargs):
@@ -43,7 +42,6 @@ class FederatedLearningServer:
         self.client_idx = []
         self.clients_info = {}
         self.prune = args.prune
-        self.argalgo = 1 
         
         self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
         if self.test_loader is None:
@@ -75,6 +73,28 @@ class FederatedLearningServer:
         accuracy = 100 * correct / total
         average_loss = total_loss / len(data_loader)
         return accuracy, average_loss
+
+    def send_data(self, conn, data):
+        data_bytes = pickle.dumps(data)
+        conn.sendall(struct.pack('!I', len(data_bytes)))
+        conn.sendall(data_bytes)
+
+    def recv_data(self, conn):
+        raw_msglen = self.recvall(conn, 4)
+        if not raw_msglen:
+            return None
+        msglen = struct.unpack('!I', raw_msglen)[0]
+        data_bytes = self.recvall(conn, msglen)
+        return pickle.loads(data_bytes)
+
+    def recvall(self, conn, n):
+        data = b'' 
+        while len(data) < n:
+            packet = conn.recv(n - len(data))
+            if not packet:
+                return None
+            data += packet
+        return data
     
     def set_threthold(self):
         tot_time = 0
@@ -128,10 +148,6 @@ class FederatedLearningServer:
         try:
             start_time = time.time()
             print(f"Round {round_num}: Handling client {client_id}")
-
-            if stop_event.is_set():
-                print(f"Client {client_id} thread: Shutdown detected. Exiting.")
-                return
             
             with self.lock:
                 current_global_state = self.global_state.copy()
@@ -168,8 +184,6 @@ class FederatedLearningServer:
             print(f"Economia: {size_saved:.2f} MB")
             print("-------------------------------------")
             print(f"Round {round_num}: Sent global model to client {client_id}")
-
-            if stop_event.is_set(): return
             
             updated_state = self.recv_data(conn)
             updated_state = self.dequantization(updated_state)
@@ -271,14 +285,6 @@ class FederatedLearningServer:
         print(f"Total rounds: {self.args.rounds}")
         print(f"Test client index: {self.args.test_client_idx}")
         print("=" * 40)
-
-        # 1. Create the stop event here, so it's shared by all
-        self.stop_event = threading.Event()
-
-        # 2. Define the signal handler
-        def signal_handler(sig, frame):
-            print("\n[!] Ctrl+C detected! Signaling all threads to stop...")
-            self.stop_event.set() # This "raises the stop sign"
         
         self.time_threthold = 7
         self.time= []
@@ -292,7 +298,7 @@ class FederatedLearningServer:
             self.client_data = {index: None for index in range(1, self.args.clients_per_round+1)}
             while len(self.client_connections) < self.args.clients_per_round:
                 conn, addr = s.accept()
-                idx = recv_data(conn)
+                idx = self.recv_data(conn)
                 print("client idx:", idx) 
                 self.clients_info[idx+1] = {'training_time': None}
                 print(f"Client {len(self.client_connections) + 1} connected: {addr}")
@@ -372,122 +378,13 @@ class FederatedLearningServer:
             
             print(f"\nTraining completed after {self.args.rounds} rounds!")
             
-        self.time_threthold = 10
-        
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind((self.args.host, self.args.port))
-                s.listen(self.args.max_clients)
-                print(f"Server listening on {self.args.host}:{self.args.port}")
-                print(f"Waiting for {self.args.clients_per_round} clients to connect...")
-                
-                self.client_data = {index: None for index in range(1, self.args.clients_per_round+1)}
-                while len(self.client_connections) < self.args.clients_per_round:
-                    if self.stop_event.is_set():
-                        print("Shutdown detected before all clients connected. Exiting.")
-                        return # Exit the run_server function
-                    
-                    # Add a timeout to s.accept() so the loop can re-check the stop_event
-                    s.settimeout(1.0) # 1-second timeout
-                    try:
-                        conn, addr = s.accept()
-                        idx = self.recv_data(conn)
-                        print("client idx:", idx) 
-                        self.clients_info[idx+1] = {'training_time': None}
-                        print(f"Client {len(self.client_connections) + 1} connected: {addr}")
-                        self.client_idx.append(idx)
-                        self.client_connections.append(conn)
-                        self.client_addresses.append(addr)
-                    except socket.timeout:
-                        continue # Timeout occurred, loop back to check stop_event
-                
-                print(f"All {self.args.clients_per_round} clients connected. Starting training...")
-                
-                for round_num in range(self.args.rounds):
-                    if self.stop_event.is_set():
-                        print("Shutdown detected. Stopping training loop.")
-                        break
-                    print(f"\n--- Round {round_num + 1}/{self.args.rounds} ---")
-                    client_updates = []
-                    threads = []
-                    
-                    for i, conn in enumerate(self.client_connections):
-                        t = threading.Thread(target=self.handle_client, args=(conn, client_updates, round_num + 1, i + 1, self.stop_event))
-                        t.start()
-                        threads.append(t)
-                    
-                    print("trashold:", self.time_threthold)
-                    if round_num == 1:
-                        for t in threads:
-                            t.join()
-                    else:
-                        for t in threads:
-                            t.join()
-                    self.set_threthold()
-
-                    if self.stop_event.is_set():
-                        print("Shutdown detected. Skipping aggregation.")
-                        break
-                    
-                    if client_updates:
-                        print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
-                        aggregated_state = self.aggregate_models(client_updates)
-                        
-                        with self.lock:
-                            self.global_state = aggregated_state
-                            self.global_model.load_state_dict(self.global_state)
-                        
-                        if self.test_loader is not None:
-                            acc = []
-                            loss = []
-                            for i in self.client_idx:
-                                self.test_loader = self.load_test_data(self.args.dataset, i, self.args.batch_size)
-                                accuracy, avg_loss = self.evaluate_model(self.global_model, self.test_loader)
-                                acc.append(accuracy)
-                                loss.append(avg_loss)
-                            print('acc: ', acc)
-                            print('len acc', len(acc))
-                            accuracy = sum(acc)/len(acc)
-                            print('avg acc: ', accuracy)
-                            avg_loss = sum(loss)/len(loss)
-                            self.rs_test_acc.append(accuracy)
-                            self.rs_test_loss.append(avg_loss)
-                            print(f"Round {round_num + 1}: Test Accuracy: {accuracy:.2f}% | Test Loss: {avg_loss:.4f}")
-                        else:
-                            print(f"Round {round_num + 1}: Model aggregated (no test data for evaluation)")
-                        
-                        size_global_model = get_model_size(self.global_model)
-                        print(f'Size Global Model: {size_global_model:.2f}MB')
-                        
-                        successful_notifications = 0
-                        for conn in self.client_connections:
-                            try:
-                                conn.send('end'.encode('utf-8'))
-                                successful_notifications += 1
-                            except Exception as e:
-                                print(f"Error notifying client: {e}")
-                        
-                        print(f"Round {round_num + 1}: Global model updated. Notified {successful_notifications} clients.")
-                    else:
-                        print(f"Round {round_num + 1}: No client updates received this round.")
-                
-                print(f"\nTraining completed after {self.args.rounds} rounds!")
-        except KeyboardInterrupt:
-            # This will catch the signal if it happens outside the main loop
-            print("\nGracefully shutting down...")
-            self.stop_event.set()   
-        finally:
-            # 9. This cleanup block will now run on a clean exit *or* a Ctrl+C
-            print("\n--- Shutdown Sequence ---")
-            print("Closing all client connections...")
             for conn in self.client_connections:
                 try:
                     conn.close()
                 except:
                     pass
             print("All client connections closed.")
-            self.save_results()
+        self.save_results()
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Server')

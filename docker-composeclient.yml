@@ -1,0 +1,26 @@
+
+x-client-template: &client
+  build:
+    context: .
+    dockerfile: dockerfile.client
+    args:
+      - NO_CACHE=true
+  image: fl-client-image
+  environment: 
+    - PYTHONUNBUFFERED=1
+  networks:
+    - docker-tc
+  # Adicionando labels para o docker-tc nos clientes
+  labels:
+    - "com.docker-tc.enabled=1"
+    - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
+services:
+  client-0:
+    <<: *client
+    container_name: fl-client-0
+
+    # --- MODIFIED COMMAND ---
+    command: ["python", "-m", "src.system.client", "--client-idx", "0", "--host", "10.0.23.189", "--dataset", "MNIST"]
+networks:
+  docker-tc:
+    driver: bridge
