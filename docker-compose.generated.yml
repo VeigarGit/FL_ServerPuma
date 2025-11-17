@@ -6,6 +6,23 @@ x-client-template: &client
     args:
       - NO_CACHE=true
   image: fl-client-image
+  restart: 'no'
+  
+  # --- Enable GPU Access ---
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1           # Number of GPUs to use
+            capabilities: [gpu]
+  # -----------------------------
+
+  # --- Persist Logs ---
+  volumes:
+    - ./logs:/app/logs
+  # -------------------------
+
   environment: 
     - PYTHONUNBUFFERED=1
   depends_on:
@@ -25,14 +42,28 @@ services:
       args:
         - NO_CACHE=true
     container_name: fl-server
+    restart: 'no'
+    
+    # --- Enable GPU Access ---
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # -----------------------------
+
+    # --- Persist Logs ---
+    volumes:
+      - ./logs:/app/logs
+    # -------------------------
+
     environment: 
       - PYTHONUNBUFFERED=1
     ports:
       - "8880:9090"
-    
-    # --- MODIFIED COMMAND ---
     command: ["python", "-m", "src.system.server", "--dataset", "MNIST", "--clients-per-round", "3"]
-    
     networks:
       - docker-tc
     # Adicionando labels para o docker-tc no servidor
@@ -44,22 +75,16 @@ services:
   client-0:
     <<: *client
     container_name: fl-client-0
-
-    # --- MODIFIED COMMAND ---
     command: ["python", "-m", "src.system.client", "--client-idx", "0", "--host", "fl-server", "--dataset", "MNIST"]
 
   client-1:
     <<: *client
     container_name: fl-client-1
-
-    # --- MODIFIED COMMAND ---
     command: ["python", "-m", "src.system.client", "--client-idx", "1", "--host", "fl-server", "--dataset", "MNIST"]
 
   client-2:
     <<: *client
     container_name: fl-client-2
-
-    # --- MODIFIED COMMAND ---
     command: ["python", "-m", "src.system.client", "--client-idx", "2", "--host", "fl-server", "--dataset", "MNIST"]
 
 networks:

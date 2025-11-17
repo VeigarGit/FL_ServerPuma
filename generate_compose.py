@@ -12,7 +12,23 @@ x-client-template: &client
     args:
       - NO_CACHE=true
   image: fl-client-image
-  restart: 'no' # <-- ADD THIS LINE
+  restart: 'no'
+  
+  # --- Enable GPU Access ---
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1           # Number of GPUs to use
+            capabilities: [gpu]
+  # -----------------------------
+
+  # --- Persist Logs ---
+  volumes:
+    - ./logs:/app/logs
+  # -------------------------
+
   environment: 
     - PYTHONUNBUFFERED=1
   depends_on:
@@ -32,11 +48,27 @@ services:
       args:
         - NO_CACHE=true
     container_name: fl-server
-    restart: 'no' # <-- ADD THIS LINE
+    restart: 'no'
+    
+    # --- Enable GPU Access ---
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # -----------------------------
+
+    # --- Persist Logs ---
+    volumes:
+      - ./logs:/app/logs
+    # -------------------------
+
     environment: 
       - PYTHONUNBUFFERED=1
     ports:
-      - "9090:9090"
+      - "8880:9090"
     command: ["python", "-m", "src.system.server", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}"]
     networks:
       - docker-tc

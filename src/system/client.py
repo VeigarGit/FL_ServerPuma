@@ -15,47 +15,34 @@ from .prunning import prune_and_restructure
 from .ALA import ALA
 from .model import SimpleModel
 import builtins
-
 from ..utils.network_utils import send_data, recv_data, recvall
 from ..utils.model_utils import quantization, dequantization
+import logging
 
-def print(*args, **kwargs):
-    builtins.print(*args, **kwargs, flush=True)
-
-def map_sequential_to_simplemodel(state_dict):
-    mapped_dict = {}
-    mapping = {
-        '0.weight': 'conv1.0.weight',
-        '0.bias': 'conv1.0.bias',
-        '3.weight': 'conv2.0.weight', 
-        '3.bias': 'conv2.0.bias',
-        '7.weight': 'fc1.0.weight',
-        '7.bias': 'fc1.0.bias',
-        '9.weight': 'fc.weight',
-        '9.bias': 'fc.bias'
-    }
-    for sequential_key, simple_key in mapping.items():
-        if sequential_key in state_dict:
-            mapped_dict[simple_key] = state_dict[sequential_key]
-    return mapped_dict
+# Define Logger Globally
+logger = logging.getLogger("Client")
 
 def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round=2, alaarg=1, ala=None):
     state_dict = dequantization(state_dict)
-    if round==2 and prune==0:
-        state_dict = map_sequential_to_simplemodel(state_dict)
     
     state = copy.deepcopy(model)
     state.load_state_dict(state_dict)
+    
     if alaarg==0 and round==2:
-        print(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
+        logger.info(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
         local_initialization(ala, state, model)
+    
     set_parameters(model, state)
     
     model.train()
     optimizer = optim.SGD(model.parameters(), lr=learning_rate)
     loss_fn = nn.CrossEntropyLoss()
     
+    device = next(model.parameters()).device
+
     for x, y in train_loader:
+        x, y = x.to(device), y.to(device)
+        
         optimizer.zero_grad()
         output = model(x)
         loss = loss_fn(output, y)
@@ -70,9 +57,13 @@ def evaluate_model(model, data_loader):
     total = 0
     loss_fn = nn.CrossEntropyLoss()
     total_loss = 0.0
+    
+    device = next(model.parameters()).device
 
     with torch.no_grad():
         for x, y in data_loader:
+            x, y = x.to(device), y.to(device)
+            
             output = model(x)
             loss = loss_fn(output, y)
             total_loss += loss.item()
@@ -119,22 +110,31 @@ def local_initialization(ala, received_global_model, model, mask=None):
 
 def main():
     args = parse_args()
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(f"logs/client_{args.client_idx}.log"),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger.name = f"Client-{args.client_idx}"
+
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     if args.device == "cuda" and not torch.cuda.is_available():
-        print("\ncuda is not avaiable.\n")
+        logger.warning("\ncuda is not avaiable.\n")
         args.device = "cpu"
     device = torch.device(args.device)
-    #if args.random_client:
-        #args.client_idx = random.randint(0, 5)
     
-    print("=== Federated Learning Client ===")
-    print(f"Host: {args.host}:{args.port}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Client: {args.client_idx}")
-    print(f"Rounds: {args.rounds}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Learning rate: {args.learning_rate}")
-    print("=" * 40)
+    logger.info("=== Federated Learning Client ===")
+    logger.info(f"Host: {args.host}:{args.port}")
+    logger.info(f"Dataset: {args.dataset}")
+    logger.info(f"Client: {args.client_idx}")
+    logger.info(f"Rounds: {args.rounds}")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Learning rate: {args.learning_rate}")
+    logger.info("=" * 40)
     
     if args.dataset =='MNIST':
         model = SimpleModel(in_features=1, num_classes=10, dim=1024)
@@ -143,14 +143,16 @@ def main():
     if args.dataset =='Cifar100':
         model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
     
+    model.to(device)
+    
     loss = nn.CrossEntropyLoss()
     
     try:
         train_loader = load_data(args.dataset, args.client_idx, is_train=True, batch_size=args.batch_size)
         test_loader = load_data(args.dataset, args.client_idx, is_train=False, batch_size=args.batch_size)
-        print(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
+        logger.info(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
     except Exception as e:
-        print(f"Error loading data: {e}")
+        logger.error(f"Error loading data: {e}")
         sys.exit(1)
     
     ala = ALA(args.client_idx, loss, train_loader, 32, 80, 2, 1.0, args.device)
@@ -160,48 +162,52 @@ def main():
         try:
             s.connect((args.host, args.port))
             send_data(s, args.client_idx)
-            print(f"Connected to server {args.host}:{args.port}")
+            logger.info(f"Connected to server {args.host}:{args.port}")
         except Exception as e:
-            print(f"Connection failed: {e}")
+            logger.error(f"Connection failed: {e}")
             sys.exit(1)
         
         for round_num in range(args.rounds):
-            print(f"\n--- Round {round_num + 1}/{args.rounds} ---")
+            logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
             
             global_state = recv_data(s)
             prune = recv_data(s)
-            if round_num+1 ==2 and prune ==0:
+            
+            if round_num+1 == 2 and prune == 0:
                 ammount = recv_data(s)
-                print(f"Client {args.client_idx}: Received pruning rate {ammount:.4f}. Pruning local model...")
+                logger.info(f"Client {args.client_idx}: Received pruning rate {ammount:.4f}. Pruning local model...")
                 local_model, _ = prune_and_restructure(model=model, pruning_rate=ammount, size_fc=25, data=args.dataset)
-                set_parameters(model, local_model)
+                
+                model = local_model
+                model.to(device) 
+                
             if global_state is None:
-                print("Failed to receive global model. Connection may be closed.")
+                logger.info("Failed to receive global model. Connection may be closed.")
                 break
-            print("Received global model.")
+            logger.info("Received global model.")
             
             test_accuracy, test_loss = evaluate_model(model, test_loader)
-            print(f"Client {args.client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
+            logger.info(f"Client {args.client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
             
             updated_state = local_training(model, global_state, prune, train_loader, args.learning_rate, round_num+1, args.ala, ala)
-            print("Local training completed.")
+            logger.info("Local training completed.")
 
             train_accuracy, train_loss = evaluate_model(model, train_loader)
-            print(f"Client {args.client_idx}: Training Accuracy: {train_accuracy:.2f}% | Training Loss: {train_loss:.4f}")
+            logger.info(f"Client {args.client_idx}: Training Accuracy: {train_accuracy:.2f}% | Training Loss: {train_loss:.4f}")
             updated_state  = quantization(updated_state)
             send_data(s, updated_state)
             send_data(s, len(train_loader))
             send_data(s, args.ala)
-            print("Client update sent.")
+            logger.info("Client update sent.")
             
             try:
                 s.recv(3)
-                print("Ready for next round...")
+                logger.info("Ready for next round...")
             except Exception as e:
-                print(f"Error waiting for server: {e}")
+                logger.error(f"Error waiting for server: {e}")
                 break
 
-    print("\nTraining completed!")
+    logger.info("\nTraining completed!")
 
 if __name__ == '__main__':
     main()
