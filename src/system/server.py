@@ -19,9 +19,6 @@ from .prunning import prune_and_restructure
 from .size_mode import get_model_size
 import builtins
 
-from ..utils.network_utils import send_data, recv_data, recvall
-from ..utils.model_utils import quantization, dequantization
-
 def print(*args, **kwargs):
     builtins.print(*args, **kwargs, flush=True)
 
@@ -100,8 +97,34 @@ class FederatedLearningServer:
     def set_parameters(self, model):
         for new_param, old_param in zip(model.parameters(), self.global_model.parameters()):
             old_param.data = new_param.data.clone()
-            
-    def handle_client(self, conn, client_updates, round_num, client_id, stop_event):
+    def dequantization(self, global_state):
+        dequantized_state_dict = {}
+        for k, v in global_state.items():
+            if isinstance(v, dict) and v.get('dtype') == 'quantized_int8':
+                # Recupera tensores quantizados
+                scale = v['scale']
+                dequantized_state_dict[k] = v['weights'].float() * scale
+            else:
+                # Mantém tensores normais
+                dequantized_state_dict[k] = v
+        return dequantized_state_dict
+
+    def quantization(self, state_dict):
+        quantized_state_dict = {}
+        keys = list(state_dict.keys())
+        for k, v in state_dict.items():
+            if isinstance(v, torch.Tensor):
+                scale = torch.max(torch.abs(v)) / 127.0
+                quantized_weights = torch.clamp((v / scale).round(), -128, 127).to(torch.int8)
+                quantized_state_dict[k] = {
+                    'dtype': 'quantized_int8',
+                    'scale': scale,
+                    'weights': quantized_weights
+                }
+            else:
+                quantized_state_dict[k] = v
+        return quantized_state_dict
+    def handle_client(self, conn, client_updates, round_num, client_id):
         try:
             start_time = time.time()
             print(f"Round {round_num}: Handling client {client_id}")
@@ -125,17 +148,17 @@ class FederatedLearningServer:
 
             if round_num == 2 and self.prune == 0:
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned))/ (1024 * 1024)
-                g_model_pruned = quantization(g_model_pruned)
+                g_model_pruned = self.quantization(g_model_pruned)
                 size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
-                send_data(conn, g_model_pruned)
-                send_data(conn, self.prune)
-                send_data(conn, max_amount)
+                self.send_data(conn, g_model_pruned)
+                self.send_data(conn, self.prune)
+                self.send_data(conn, max_amount)
             else:
                 size_before = sys.getsizeof(pickle.dumps(current_global_state))/ (1024 * 1024)
-                current_global_state = quantization(current_global_state)
+                current_global_state = self.quantization(current_global_state)
                 size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
-                send_data(conn, current_global_state)
-                send_data(conn, self.prune)
+                self.send_data(conn, current_global_state)
+                self.send_data(conn, self.prune)
 
             size_saved = size_before - size_after
             
@@ -148,14 +171,10 @@ class FederatedLearningServer:
 
             if stop_event.is_set(): return
             
-            updated_state = recv_data(conn)
-            if stop_event.is_set(): return
-            if updated_state is None:
-                print(f"Round {round_num}: Client {client_id} disconnected.")
-                return
-            updated_state = dequantization(updated_state)
-            self.client_data[client_id] = recv_data(conn)
-            self.argalgo = recv_data(conn)
+            updated_state = self.recv_data(conn)
+            updated_state = self.dequantization(updated_state)
+            self.client_data[client_id] = self.recv_data(conn)
+            self.argalgo = self.recv_data(conn)
             end_time = time.time()
             
             if updated_state is not None:
@@ -261,9 +280,6 @@ class FederatedLearningServer:
             print("\n[!] Ctrl+C detected! Signaling all threads to stop...")
             self.stop_event.set() # This "raises the stop sign"
         
-        # 3. Register the handler to catch Ctrl+C (SIGINT)
-        signal.signal(signal.SIGINT, signal_handler)
-        
         self.time_threthold = 7
         self.time= []
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -292,17 +308,20 @@ class FederatedLearningServer:
                 client_updates = []
                 threads = []
 
+                self.stop_event = threading.Event()
                 for i, conn in enumerate(self.client_connections):
-                    t = threading.Thread(target=self.handle_client, daemon=True, args=(conn, client_updates, round_num + 1, i + 1, self.stop_event))
+                    t = threading.Thread(target=self.handle_client, daemon=True, args=(conn, client_updates, round_num + 1, i + 1))
                     t.start()
                     threads.append(t)
                 
                 print("trashold:", self.time_threthold)
-                init_time = time.time()
-                print(f"Round {round_num + 1}: Waiting for {len(threads)} clients to finish training...")
-                for t in threads:
-                    t.join()
-                print(f"Round {round_num + 1}: All client threads completed.")
+                if round_num == 1:
+                    for t in threads:
+                        t.join()
+                else:
+                    init_time = time.time()
+                    for t in threads:
+                        t.join(timeout=self.time_threthold)
                 if round_num ==0:
                     self.set_threthold()
                 end_time = time.time()
