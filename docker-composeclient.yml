@@ -14,6 +14,9 @@ x-client-template: &client
   labels:
     - "com.docker-tc.enabled=1"
     - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
+    - "com.docker-tc.enabled=1"
+    - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
+    - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
 services:
   client-0:
     <<: *client
