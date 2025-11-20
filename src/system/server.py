@@ -42,7 +42,10 @@ class FederatedLearningServer:
         self.client_idx = []
         self.clients_info = {}
         self.prune = args.prune
-        
+        self.sended_ammount=[0]
+        self.sended_withouquant=[0]
+        self.aggregated_clients=[]
+
         self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
         if self.test_loader is None:
             print("Warning: Could not load test data. Evaluation will be skipped.")
@@ -164,15 +167,23 @@ class FederatedLearningServer:
 
             if round_num == 2 and self.prune == 0:
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned))/ (1024 * 1024)
+                novo_val = self.sended_withouquant[-1] + size_before
+                self.sended_withouquant.append(novo_val)
                 g_model_pruned = self.quantization(g_model_pruned)
                 size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
+                novo_val = self.sended_ammount[-1] + size_after
+                self.sended_ammount.append(novo_val)
                 self.send_data(conn, g_model_pruned)
                 self.send_data(conn, self.prune)
                 self.send_data(conn, max_amount)
             else:
                 size_before = sys.getsizeof(pickle.dumps(current_global_state))/ (1024 * 1024)
+                novo_val = self.sended_withouquant[-1] + size_before
+                self.sended_withouquant.append(novo_val)
                 current_global_state = self.quantization(current_global_state)
                 size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
+                novo_val = self.sended_ammount[-1] + size_after
+                self.sended_ammount.append(novo_val)
                 self.send_data(conn, current_global_state)
                 self.send_data(conn, self.prune)
 
@@ -230,6 +241,33 @@ class FederatedLearningServer:
             ammount = ammount * 10
             return ammount
         else:
+            non_null_times = [info['training_time'] for info in self.clients_info.values() if info.get('training_time') is not None and info['training_time'] != 0]       
+            sorted_values = sorted(values, reverse=True)
+            maior_valor = sorted_values[0]
+            penultimo_maior = sorted_values[1]
+            
+            # Diferentes formas de calcular a distância:
+            
+            # 1. Diferença absoluta
+            distancia_absoluta = maior_valor - penultimo_maior
+            
+            # 2. Diferença relativa (percentual)
+            distancia_relativa = (maior_valor - penultimo_maior) / penultimo_maior if penultimo_maior != 0 else float('inf')
+            
+            # 3. Razão entre os valores
+            razao = maior_valor / penultimo_maior if penultimo_maior != 0 else float('inf')
+            
+            # 4. Distância normalizada (entre 0 e 1)
+            if maior_valor != 0:
+                distancia_normalizada = (maior_valor - penultimo_maior) / maior_valor
+                distancia_normalizada = 1 - distancia_normalizada
+            else:
+                distancia_normalizada = 0
+            ammount = distancia_normalizada
+            if ammount>0.9:
+                ammount = 0.85
+            return ammount
+            '''
             min_val = min(values)
             max_val = max(values)
         
@@ -254,10 +292,10 @@ class FederatedLearningServer:
             print(f"Valor mais próximo da média: {closest_to_average:.4f}")
             if closest_to_average == 0:
                 closest_to_average = average_amount
-            return closest_to_average
+            return 0.9
         else:
             return 0
-
+        '''
     def save_results(self):
         if self.args.prune == 0:
             a = "prune"
@@ -276,6 +314,9 @@ class FederatedLearningServer:
         with h5py.File(file_path, 'w') as hf:
             hf.create_dataset('rs_test_acc', data=self.rs_test_acc)
             hf.create_dataset('rs_train_loss', data=self.rs_test_loss)
+            hf.create_dataset('sended model Mb', data=self.sended_ammount)
+            hf.create_dataset('Sended_without_quant', data=self.sended_withouquant)
+            hf.create_dataset('Aggregated clients', data=self.aggregated_clients)
 
     def run_server(self):
         print("=== Federated Learning Server ===")
@@ -286,7 +327,7 @@ class FederatedLearningServer:
         print(f"Test client index: {self.args.test_client_idx}")
         print("=" * 40)
         
-        self.time_threthold = 7
+        self.time_threthold = 500
         self.time= []
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -336,6 +377,7 @@ class FederatedLearningServer:
                 print("client_updates length:", len(client_updates))
                 if client_updates:
                     print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
+                    self.aggregated_clients.append(len(client_updates))
                     aggregated_state = self.aggregate_models(client_updates)
                     
                     with self.lock:
@@ -390,7 +432,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Server')
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=9000)
-    parser.add_argument('--clients-per-round', type=int, default=2)
+    parser.add_argument('--clients-per-round', type=int, default=4)
     parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
     parser.add_argument('--test-client-idx', type=int, default=0)
