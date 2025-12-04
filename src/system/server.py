@@ -45,6 +45,8 @@ class FederatedLearningServer:
         self.sended_ammount=[0]
         self.sended_withouquant=[0]
         self.aggregated_clients=[]
+        self.round_time=[]
+        self.bit=[]
 
         self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
         if self.test_loader is None:
@@ -81,7 +83,7 @@ class FederatedLearningServer:
         data_bytes = pickle.dumps(data)
         conn.sendall(struct.pack('!I', len(data_bytes)))
         conn.sendall(data_bytes)
-
+    '''
     def recv_data(self, conn):
         raw_msglen = self.recvall(conn, 4)
         if not raw_msglen:
@@ -89,7 +91,42 @@ class FederatedLearningServer:
         msglen = struct.unpack('!I', raw_msglen)[0]
         data_bytes = self.recvall(conn, msglen)
         return pickle.loads(data_bytes)
-
+    '''
+    def recv_data(self, conn):
+        # Record start time
+        start_time = time.time()
+        
+        # Receive the data length (4 bytes)
+        raw_msglen = self.recvall(conn, 4)
+        if not raw_msglen:
+            return None, 0
+        
+        msglen = struct.unpack('!I', raw_msglen)[0]
+        
+        # Record time after receiving length header
+        header_time = time.time()
+        
+        # Receive the actual data
+        data_bytes = self.recvall(conn, msglen)
+        
+        # Record end time
+        end_time = time.time()
+        
+        if not data_bytes:
+            return None, 0
+        
+        # Calculate bit rate
+        total_bits = (msglen + 4) * 8  # +4 for the length header
+        total_time = end_time - start_time
+        
+        # Avoid division by zero
+        if total_time > 0:
+            bit_rate = total_bits / total_time  # bits per second
+        else:
+            bit_rate = 0
+        
+        return pickle.loads(data_bytes), bit_rate
+    
     def recvall(self, conn, n):
         data = b'' 
         while len(data) < n:
@@ -99,7 +136,7 @@ class FederatedLearningServer:
             data += packet
         return data
     
-    def set_threthold(self):
+    def set_trashold(self):
         tot_time = 0
         clients_with_time = 0
         for client_id, info in self.clients_info.items():
@@ -114,8 +151,8 @@ class FederatedLearningServer:
         # --- End of added check ---
 
         mean_time = tot_time / clients_with_time
-        self.time_threthold = 0.9 * mean_time
-        print(f'time_threthold: {self.time_threthold}s')
+        self.time_trashold = 0.9 * mean_time
+        print(f'time_trashold: {self.time_trashold}s')
 
     def set_parameters(self, model):
         for new_param, old_param in zip(model.parameters(), self.global_model.parameters()):
@@ -148,6 +185,7 @@ class FederatedLearningServer:
                 quantized_state_dict[k] = v
         return quantized_state_dict
     def handle_client(self, conn, client_updates, round_num, client_id):
+        bit_rate =[]
         try:
             start_time = time.time()
             print(f"Round {round_num}: Handling client {client_id}")
@@ -158,6 +196,8 @@ class FederatedLearningServer:
             if round_num == 2 and self.prune == 0:
                 print(f"--- SERVER: PRUNING START (Round 2) ---")
                 max_amount = self.set_amount_prune()
+                if max_amount ==0:
+                    max_amount = 0.8
                 print(f"--- SERVER: Calculated pruning rate: {max_amount:.4f}")
                 g_model_pruned = copy.deepcopy(self.global_model)
                 g_model_pruned, _ = prune_and_restructure(model=self.global_model, pruning_rate=max_amount, size_fc=self.size_fc, data=self.args.dataset)
@@ -196,20 +236,29 @@ class FederatedLearningServer:
             print("-------------------------------------")
             print(f"Round {round_num}: Sent global model to client {client_id}")
             
-            updated_state = self.recv_data(conn)
+            updated_state, rate = self.recv_data(conn)
+            bit_rate.append(rate)
             updated_state = self.dequantization(updated_state)
-            self.client_data[client_id] = self.recv_data(conn)
-            self.argalgo = self.recv_data(conn)
+            data ,rate = self.recv_data(conn)
+            self.client_data[client_id] = data
+            print("client_data:", self.client_data[client_id])
+            #bit_rate.append(rate)
+            self.argalgo, rate = self.recv_data(conn)
+            #bit_rate.append(rate)
+            media_rate = sum(bit_rate)/ len(bit_rate)
+            media_rate = str(media_rate) + '.' + str(client_id) + "." + str(self.client_data[client_id])
+            self.bit.append(media_rate)
             end_time = time.time()
-            
+            training_time = end_time - start_time
             if updated_state is not None:
                 with self.lock:
                     client_updates.append(updated_state)
-                training_time = end_time - start_time
+                
                 self.clients_info[client_id]['training_time'] = training_time
                 print(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
             else:
                 print(f"Round {round_num}: No update received from client {client_id}")
+                self.clients_info[client_id]['training_time'] = training_time
                 
         except Exception as e:
             print(f"Round {round_num}: Error handling client {client_id}: {e}")
@@ -238,7 +287,7 @@ class FederatedLearningServer:
             non_null_times = [info['training_time'] for info in self.clients_info.values() if info.get('training_time') is not None and info['training_time'] != 0]       
             training_time = non_null_times[0]
             ammount = training_time/data
-            ammount = ammount * 10
+            ammount = ammount 
             return ammount
         else:
             non_null_times = [info['training_time'] for info in self.clients_info.values() if info.get('training_time') is not None and info['training_time'] != 0]       
@@ -314,9 +363,10 @@ class FederatedLearningServer:
         with h5py.File(file_path, 'w') as hf:
             hf.create_dataset('rs_test_acc', data=self.rs_test_acc)
             hf.create_dataset('rs_train_loss', data=self.rs_test_loss)
-            hf.create_dataset('sended model Mb', data=self.sended_ammount)
+            hf.create_dataset('sended_model_Mb', data=self.sended_ammount)
             hf.create_dataset('Sended_without_quant', data=self.sended_withouquant)
-            hf.create_dataset('Aggregated clients', data=self.aggregated_clients)
+            hf.create_dataset('Aggregated_clients', data=self.aggregated_clients)
+            hf.create_dataset('Round_time', data=self.round_time)
 
     def run_server(self):
         print("=== Federated Learning Server ===")
@@ -327,7 +377,7 @@ class FederatedLearningServer:
         print(f"Test client index: {self.args.test_client_idx}")
         print("=" * 40)
         
-        self.time_threthold = 500
+        self.time_trashold = 100
         self.time= []
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -339,9 +389,9 @@ class FederatedLearningServer:
             self.client_data = {index: None for index in range(1, self.args.clients_per_round+1)}
             while len(self.client_connections) < self.args.clients_per_round:
                 conn, addr = s.accept()
-                idx = self.recv_data(conn)
+                idx, rate = self.recv_data(conn)
                 print("client idx:", idx) 
-                self.clients_info[idx+1] = {'training_time': None}
+                self.clients_info[idx] = {'training_time': None}
                 print(f"Client {len(self.client_connections) + 1} connected: {addr}")
                 self.client_idx.append(idx)
                 self.client_connections.append(conn)
@@ -351,6 +401,8 @@ class FederatedLearningServer:
             
             for round_num in range(self.args.rounds):
                 time.sleep(5)
+                print("bit_rate medio:", self.bit)
+                self.bit=[]
                 print(f"\n--- Round {round_num + 1}/{self.args.rounds} ---")
                 client_updates = []
                 threads = []
@@ -361,19 +413,20 @@ class FederatedLearningServer:
                     t.start()
                     threads.append(t)
                 
-                print("trashold:", self.time_threthold)
+                print("trashold:", self.time_trashold)
                 if round_num == 1:
                     for t in threads:
                         t.join()
                 else:
                     init_time = time.time()
                     for t in threads:
-                        t.join(timeout=self.time_threthold)
+                        t.join(timeout=self.time_trashold)
                 if round_num ==0:
-                    self.set_threthold()
+                    self.set_trashold()
                 end_time = time.time()
                 round_duration = end_time - init_time
                 print(f"Round {round_num + 1} duration: {round_duration:.2f} seconds")
+                self.round_time.append(round_duration)
                 print("client_updates length:", len(client_updates))
                 if client_updates:
                     print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
@@ -432,7 +485,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Server')
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=9000)
-    parser.add_argument('--clients-per-round', type=int, default=4)
+    parser.add_argument('--clients-per-round', type=int, default=3)
     parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
     parser.add_argument('--test-client-idx', type=int, default=0)
