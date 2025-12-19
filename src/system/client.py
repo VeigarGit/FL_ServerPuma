@@ -67,7 +67,7 @@ def quantization(state_dict):
     return quantized_state_dict
 def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round=2, alaarg=1, ala=None):
     state_dict = dequantization(state_dict)
-    if round==2 and prune==0:
+    if round>=2 and prune==0:
         state_dict = map_sequential_to_simplemodel(state_dict)
     
     state = copy.deepcopy(model)

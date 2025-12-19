@@ -17,7 +17,8 @@ from data_utils import read_client_data
 from prunning import prune_and_restructure
 from size_mode import get_model_size
 import builtins
-
+from synexp import LayerComplexityCalculator
+import numpy as np
 def print(*args, **kwargs):
     builtins.print(*args, **kwargs, flush=True)
 
@@ -26,11 +27,15 @@ class FederatedLearningServer:
         self.args = args
         if args.dataset =='MNIST':
             self.global_model = SimpleModel(in_features=1, num_classes=10, dim=1024)
+            self.input_size = (1, 1, 28, 28)
         if args.dataset =='Cifar10':
             self.global_model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
+            self.input_size = (1, 3, 32, 32)
         if args.dataset =='Cifar100':
             self.global_model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
+            self.input_size = (1, 3, 32, 32)
         
+
         self.rs_test_acc = []
         self.rs_test_loss = []
         self.global_state = self.global_model.state_dict()
@@ -47,18 +52,68 @@ class FederatedLearningServer:
         self.aggregated_clients=[]
         self.round_time=[]
         self.bit=[]
-
+        self.complexity_calculated = False
+        self.alpha_list = None
+        self.beta_list = None
+        self.densities = None
+        calculator = LayerComplexityCalculator(self.global_model, self.input_size)
+        
+        # Calcular
+        alpha_list, beta_list = calculator.calculate_alpha_beta()
+        
+        self.alpha_list = alpha_list
+        self.beta_list = beta_list
+        #self.layer_names = layer_names
+        self.complexity_calculated = True
+        print(f"Calculado: {len(alpha_list)} camadas")
+        print(f"Total α: {sum(alpha_list):,} parâmetros")
+        print(f"Total β: {sum(beta_list):,} FLOPs")
+        
         self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
         if self.test_loader is None:
             print("Warning: Could not load test data. Evaluation will be skipped.")
             self.test_loader = None
 
-    def aggregate_models(self, model_list):
-        agg_state = {}
-        for key in model_list[0].keys():
-            agg_state[key] = sum([m[key] for m in model_list]) / len(model_list)
+    def aggregate_models(self, model_list, global_model):
+        agg_state = global_model.copy()  # Começa com uma cópia do modelo global
+    
+        for key in global_model.keys():
+            # Coleta apenas valores de modelos que têm esta chave COM O MESMO TAMANHO
+            compatible_values = []
+            
+            for model in model_list:
+                if key in model:
+                    local_val = model[key]
+                    global_val = global_model[key]
+                    
+                    # Verifica compatibilidade de tamanho
+                    if self._are_compatible(local_val, global_val):
+                        compatible_values.append(local_val)
+            
+            # Se encontrou valores compatíveis, calcula a média
+            if compatible_values:
+                # Para numpy arrays ou tensores
+                if hasattr(compatible_values[0], 'shape'):
+                    agg_state[key] = sum(compatible_values) / len(compatible_values)
+                else:
+                    # Para escalares
+                    agg_state[key] = np.mean(compatible_values)
+            # Se não encontrou, mantém o valor original do global_model
+        
         return agg_state
-
+    def _are_compatible(self, local_val, global_val):
+        """Verifica se dois valores são compatíveis para agregação."""
+        # Se ambos são arrays/tensores
+        if hasattr(local_val, 'shape') and hasattr(global_val, 'shape'):
+            return local_val.shape == global_val.shape
+        
+        # Se ambos são escalares ou listas do mesmo comprimento
+        try:
+            len_local = len(local_val) if hasattr(local_val, '__len__') else 1
+            len_global = len(global_val) if hasattr(global_val, '__len__') else 1
+            return len_local == len_global
+        except:
+            return True
     def evaluate_model(self, model, data_loader):
         model.eval()
         correct = 0
@@ -185,7 +240,8 @@ class FederatedLearningServer:
                 quantized_state_dict[k] = v
         return quantized_state_dict
     def handle_client(self, conn, client_updates, round_num, client_id):
-        bit_rate =[]
+        bit_rate = []
+        self.masks = []
         try:
             start_time = time.time()
             print(f"Round {round_num}: Handling client {client_id}")
@@ -193,19 +249,22 @@ class FederatedLearningServer:
             with self.lock:
                 current_global_state = self.global_state.copy()
             
-            if round_num == 2 and self.prune == 0:
+            if round_num >= 2 and self.prune == 0:
                 print(f"--- SERVER: PRUNING START (Round 2) ---")
                 max_amount = self.set_amount_prune()
+                #max_amount = self.calculate_adaptive_densities(client_id, t_target=30)
+                print(f"max_amount before check: {max_amount}")
                 if max_amount ==0:
                     max_amount = 0.8
                 print(f"--- SERVER: Calculated pruning rate: {max_amount:.4f}")
                 g_model_pruned = copy.deepcopy(self.global_model)
-                g_model_pruned, _ = prune_and_restructure(model=self.global_model, pruning_rate=max_amount, size_fc=self.size_fc, data=self.args.dataset)
-                self.set_parameters(g_model_pruned)
+                g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=max_amount, size_fc=self.size_fc, data=self.args.dataset)
+                self.masks.append(mask)
+                #self.set_parameters(g_model_pruned)
                 g_model_pruned = g_model_pruned.state_dict()
                 print(f"--- SERVER: PRUNING COMPLETE ---")
 
-            if round_num == 2 and self.prune == 0:
+            if round_num >= 2 and self.prune == 0:
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned))/ (1024 * 1024)
                 novo_val = self.sended_withouquant[-1] + size_before
                 self.sended_withouquant.append(novo_val)
@@ -246,7 +305,10 @@ class FederatedLearningServer:
             self.argalgo, rate = self.recv_data(conn)
             #bit_rate.append(rate)
             media_rate = sum(bit_rate)/ len(bit_rate)
-            media_rate = str(media_rate) + '.' + str(client_id) + "." + str(self.client_data[client_id])
+            media_rate = media_rate / 8 / (1024 * 1024)
+            #media_rate = str(media_rate) + '.' + str(client_id) + "." + str(self.client_data[client_id])
+            self.clients_info[client_id]['bandwidth'] = media_rate / 8 / (1024 * 1024)  # Convert to MB/s
+            self.clients_info[client_id]['data_size'] = self.client_data[client_id]
             self.bit.append(media_rate)
             end_time = time.time()
             training_time = end_time - start_time
@@ -313,6 +375,7 @@ class FederatedLearningServer:
             else:
                 distancia_normalizada = 0
             ammount = distancia_normalizada
+            
             if ammount>0.9:
                 ammount = 0.85
             return ammount
@@ -367,7 +430,8 @@ class FederatedLearningServer:
             hf.create_dataset('Sended_without_quant', data=self.sended_withouquant)
             hf.create_dataset('Aggregated_clients', data=self.aggregated_clients)
             hf.create_dataset('Round_time', data=self.round_time)
-
+    
+    
     def run_server(self):
         print("=== Federated Learning Server ===")
         print(f"Host: {self.args.host}:{self.args.port}")
@@ -391,7 +455,11 @@ class FederatedLearningServer:
                 conn, addr = s.accept()
                 idx, rate = self.recv_data(conn)
                 print("client idx:", idx) 
-                self.clients_info[idx] = {'training_time': None}
+                self.clients_info[idx] = {'training_time': None, 'bandwidth': None,
+            'data_size': None,  # default
+            'last_flops': None,  # Para armazenar FLOPs do submodelo
+            'last_params': None  # Para armazenar parâmetros do submodelo
+        }
                 print(f"Client {len(self.client_connections) + 1} connected: {addr}")
                 self.client_idx.append(idx)
                 self.client_connections.append(conn)
@@ -431,11 +499,12 @@ class FederatedLearningServer:
                 if client_updates:
                     print(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
                     self.aggregated_clients.append(len(client_updates))
-                    aggregated_state = self.aggregate_models(client_updates)
+                    #client_updates.append(self.global_state)
+                    aggregated_state = self.aggregate_models(client_updates, self.global_state)
                     
                     with self.lock:
                         self.global_state = aggregated_state
-                        self.global_model.load_state_dict(self.global_state)
+                        self.global_model.load_state_dict(self.global_state, strict=False)
                     
                     if self.test_loader is not None:
                         acc = []
