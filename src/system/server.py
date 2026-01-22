@@ -239,6 +239,7 @@ class FederatedLearningServer:
             else:
                 quantized_state_dict[k] = v
         return quantized_state_dict
+    
     def handle_client(self, conn, client_updates, round_num, client_id):
         bit_rate = []
         self.masks = []
@@ -308,7 +309,7 @@ class FederatedLearningServer:
             media_rate = media_rate / 8 / (1024 * 1024)
             #media_rate = str(media_rate) + '.' + str(client_id) + "." + str(self.client_data[client_id])
             self.clients_info[client_id]['bandwidth'] = media_rate / 8 / (1024 * 1024)  # Convert to MB/s
-            self.clients_info[client_id]['data_size'] = self.client_data[client_id]
+            self.clients_info[client_id][''] = self.client_data[client_id]
             self.bit.append(media_rate)
             end_time = time.time()
             training_time = end_time - start_time
@@ -449,12 +450,13 @@ class FederatedLearningServer:
             s.listen(self.args.max_clients)
             print(f"Server listening on {self.args.host}:{self.args.port}")
             print(f"Waiting for {self.args.clients_per_round} clients to connect...")
-            
+            clientsid =[]
             self.client_data = {index: None for index in range(1, self.args.clients_per_round+1)}
             while len(self.client_connections) < self.args.clients_per_round:
                 conn, addr = s.accept()
                 idx, rate = self.recv_data(conn)
                 print("client idx:", idx) 
+                clientsid.append(idx)
                 self.clients_info[idx] = {'training_time': None, 'bandwidth': None,
             'data_size': None,  # default
             'last_flops': None,  # Para armazenar FLOPs do submodelo
@@ -477,7 +479,7 @@ class FederatedLearningServer:
 
                 self.stop_event = threading.Event()
                 for i, conn in enumerate(self.client_connections):
-                    t = threading.Thread(target=self.handle_client, daemon=True, args=(conn, client_updates, round_num + 1, i + 1))
+                    t = threading.Thread(target=self.handle_client, daemon=True, args=(conn, client_updates, round_num + 1, clientsid[i]))
                     t.start()
                     threads.append(t)
                 
