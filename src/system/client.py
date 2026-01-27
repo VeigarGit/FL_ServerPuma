@@ -65,18 +65,25 @@ def quantization(state_dict):
         else:
             quantized_state_dict[k] = v
     return quantized_state_dict
+
 def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round=2, alaarg=1, ala=None):
     state_dict = dequantization(state_dict)
     if round>=2 and prune==0:
         state_dict = map_sequential_to_simplemodel(state_dict)
-    
-    state = copy.deepcopy(model)
-    state.load_state_dict(state_dict)
+    local_model = SimpleModel(in_features=1, num_classes=10, dim=1024)
+
+    mapped_state_dict = map_sequential_to_simplemodel(state_dict)
+    local_model.load_state_dict(mapped_state_dict, strict=False)
+
+    state = copy.deepcopy(local_model)
+    #state.load_state_dict(state_dict)
     if alaarg==0 and round==2:
         print(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
         local_initialization(ala, state, model)
     set_parameters(model, state)
-    
+    print("oi")
+    size_before = sys.getsizeof(pickle.dumps(model))/ (1024 * 1024)    
+    print(f"Tamanho antes: {size_before:.2f} MB")    
     model.train()
     optimizer = optim.SGD(model.parameters(), lr=learning_rate)
     loss_fn = nn.CrossEntropyLoss()
@@ -196,11 +203,12 @@ def main():
             
             global_state = recv_data(s)
             prune = recv_data(s)
-            if round_num+1 ==2 and prune ==0:
+            if round_num+1 >=2 and prune ==0 :
                 ammount = recv_data(s)
-                print(f"Client {args.client_idx}: Received pruning rate {ammount:.4f}. Pruning local model...")
-                local_model, _ = prune_and_restructure(model=model, pruning_rate=ammount, size_fc=25, data=args.dataset)
-                set_parameters(model, local_model)
+            #    print(f"Client {args.client_idx}: Received pruning rate {ammount:.4f}. Pruning local model...")
+            #    local_model, _ = prune_and_restructure(model=model, pruning_rate=ammount, size_fc=25, data=args.dataset)
+            #    
+            #    set_parameters(model, local_model)
             if global_state is None:
                 print("Failed to receive global model. Connection may be closed.")
                 break
