@@ -70,18 +70,20 @@ def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, r
     state_dict = dequantization(state_dict)
     if round>=2 and prune==0:
         state_dict = map_sequential_to_simplemodel(state_dict)
-    local_model = SimpleModel(in_features=1, num_classes=10, dim=1024)
+    #local_model = SimpleModel(in_features=1, num_classes=10, dim=1024)
 
-    mapped_state_dict = map_sequential_to_simplemodel(state_dict)
-    local_model.load_state_dict(mapped_state_dict, strict=False)
-
+    #mapped_state_dict = map_sequential_to_simplemodel(state_dict)
+    #model.load_state_dict(state_dict, strict=False)
+    local_model = resize_model_to_pruned(model, state_dict)
     state = copy.deepcopy(local_model)
+    
     #state.load_state_dict(state_dict)
+
     if alaarg==0 and round==2:
         print(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
         local_initialization(ala, state, model)
     set_parameters(model, state)
-    print("oi")
+    
     size_before = sys.getsizeof(pickle.dumps(model))/ (1024 * 1024)    
     print(f"Tamanho antes: {size_before:.2f} MB")    
     model.train()
@@ -150,6 +152,39 @@ def parse_args():
 def local_initialization(ala, received_global_model, model, mask=None):
     ala.adaptive_local_aggregation(received_global_model, model, mask=mask)
 
+def resize_model_to_pruned(model, pruned_dict):
+    """
+    Redimensiona o modelo existente para as dimensões podadas
+    """
+    with torch.no_grad():
+        # Para cada camada, redimensiona os pesos
+        for name, param in model.named_parameters():
+            if name in pruned_dict:
+                # Cria um novo tensor com as dimensões podadas
+                pruned_weight = pruned_dict[name]
+                
+                # Se as dimensões forem diferentes, redimensiona
+                if param.shape != pruned_weight.shape:
+                    print(f"🔧 Redimensionando {name}: {param.shape} → {pruned_weight.shape}")
+                    
+                    # Cria um novo parâmetro com as dimensões podadas
+                    new_param = nn.Parameter(pruned_weight)
+                    
+                    # Substitui o parâmetro no modelo
+                    if '.' in name:
+                        # Para camadas em Sequential: 'conv1.0.weight'
+                        parts = name.split('.')
+                        module = model
+                        for part in parts[:-1]:
+                            module = getattr(module, part)
+                        setattr(module, parts[-1], new_param)
+                    else:
+                        # Para camadas diretas
+                        setattr(model, name, new_param)
+                else:
+                    param.data.copy_(pruned_weight)
+    
+    return model
 def main():
     args = parse_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
