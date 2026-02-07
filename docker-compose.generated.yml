@@ -1,92 +1,44 @@
+version: '3.8'
 
-x-client-template: &client
-  build:
-    context: .
-    dockerfile: dockerfile.client
-    args:
-      - NO_CACHE=true
-  image: fl-client-image
-  restart: 'no'
-  
-  # --- Enable GPU Access ---
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: 1           # Number of GPUs to use
-            capabilities: [gpu]
-  # -----------------------------
-
-  # --- Persist Logs ---
-  volumes:
-    - ./logs:/app/logs
-  # -------------------------
-
-  environment: 
-    - PYTHONUNBUFFERED=1
-  depends_on:
-    - server
-  networks:
-    - docker-tc
-  # Adicionando labels para o docker-tc nos clientes
-  labels:
-    - "com.docker-tc.enabled=1"
-    - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
+networks:
+  puma_default:
+    driver: bridge
 
 services:
   server:
-    build:
-      context: .
-      dockerfile: dockerfile.server
-      args:
-        - NO_CACHE=true
-    container_name: fl-server
-    restart: 'no'
-    
-    # --- Enable GPU Access ---
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    # -----------------------------
-
-    # --- Persist Logs ---
-    volumes:
-      - ./logs:/app/logs
-    # -------------------------
-
-    environment: 
-      - PYTHONUNBUFFERED=1
+    image: fl_server:latest
+    container_name: puma-server
+    hostname: server
     ports:
-      - "8880:9090"
-    command: ["python", "-m", "src.system.server", "--dataset", "MNIST", "--clients-per-round", "3"]
+      - "9000:9000"
+    # Mount logs so you can see them on your host machine
+    volumes:
+      - ./fl_logs:/app/fl_logs
+    command: python -m src.system.server --port 9000 --clients-per-round 3 --dataset MNIST
     networks:
-      - docker-tc
-    # Adicionando labels para o docker-tc no servidor
-    labels:
-      - "com.docker-tc.enabled=1"
-      - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
-      - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
+      - puma_default
 
-  client-0:
-    <<: *client
-    container_name: fl-client-0
-    command: ["python", "-m", "src.system.client", "--client-idx", "0", "--host", "fl-server", "--dataset", "MNIST"]
-
-  client-1:
-    <<: *client
-    container_name: fl-client-1
-    command: ["python", "-m", "src.system.client", "--client-idx", "1", "--host", "fl-server", "--dataset", "MNIST"]
-
-  client-2:
-    <<: *client
-    container_name: fl-client-2
-    command: ["python", "-m", "src.system.client", "--client-idx", "2", "--host", "fl-server", "--dataset", "MNIST"]
-
-networks:
-  docker-tc:
-    driver: bridge
+  client_0:
+    image: fl_client:latest
+    container_name: puma-client_000
+    depends_on:
+      - server
+    command: python -m src.system.client --host server --port 9000 --client-idx 0 --dataset MNIST
+    networks:
+      - puma_default
+  client_1:
+    image: fl_client:latest
+    container_name: puma-client_001
+    depends_on:
+      - server
+    command: python -m src.system.client --host server --port 9000 --client-idx 1 --dataset MNIST
+    networks:
+      - puma_default
+  client_2:
+    image: fl_client:latest
+    container_name: puma-client_002
+    depends_on:
+      - server
+    command: python -m src.system.client --host server --port 9000 --client-idx 2 --dataset MNIST
+    networks:
+      - puma_default

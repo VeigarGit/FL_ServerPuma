@@ -1,396 +1,217 @@
 import socket
-import pickle
-import struct
-import torch
 import threading
-import torch.nn as nn
-import copy
-from torch.utils.data import DataLoader
-from .model import SimpleModel
-import time
 import argparse
 import sys
-import traceback
-import os
-import h5py
-from .data_utils import read_client_data
-from .prunning import prune_and_restructure
-from .size_mode import get_model_size
-import logging
+import time
+import signal
+import numpy as np
 
-# Import utilities
-from ..utils.network_utils import send_data, recv_data, recvall
-from ..utils.model_utils import quantization, dequantization
+# Import internal modules
+from ..utils.network_utils import send_data, recv_data
+from ..utils.logger import setup_logger
+from ..utils.model_utils import dequantization
+from .strategy import PUMAStrategy
 
-# Define Logger Globally
-logger = logging.getLogger("Server")
-
-# --- FIX: MAPPING FUNCTION ---
-def map_simplemodel_to_sequential(state_dict):
-    """
-    Maps keys from SimpleModel (named) to nn.Sequential (indexed).
-    This is required because the server converts the model to Sequential 
-    after pruning, but clients still send back SimpleModel keys.
-    """
-    mapped_dict = {}
-    mapping = {
-        'conv1.0.weight': '0.weight',
-        'conv1.0.bias': '0.bias',
-        'conv2.0.weight': '3.weight', 
-        'conv2.0.bias': '3.bias',
-        'fc1.0.weight': '7.weight',
-        'fc1.0.bias': '7.bias',
-        'fc.weight': '9.weight',
-        'fc.bias': '9.bias'
-    }
-    for simple_key, sequential_key in mapping.items():
-        if simple_key in state_dict:
-            mapped_dict[sequential_key] = state_dict[simple_key]
-    return mapped_dict
+# Initialize logger
+logger = setup_logger("server.main")
 
 class FederatedLearningServer:
     def __init__(self, args):
         self.args = args
-        if args.dataset =='MNIST':
-            self.global_model = SimpleModel(in_features=1, num_classes=10, dim=1024)
-        if args.dataset =='Cifar10':
-            self.global_model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
-        if args.dataset =='Cifar100':
-            self.global_model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
+        self.strategy = PUMAStrategy(args)
         
-        self.rs_test_acc = []
-        self.rs_test_loss = []
-        self.global_state = self.global_model.state_dict()
-        self.lock = threading.Lock()
-        self.client_data = {}
+        # State Management
+        self.stop_event = threading.Event()
         self.client_connections = []
         self.client_addresses = []
-        self.size_fc = 25
-        self.client_idx = []
-        self.clients_info = {}
-        self.prune = args.prune
-        self.pruning_rate = 0.0 
+        self.client_ids = []
+        self.lock = threading.Lock()
         
-        self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
-        if self.test_loader is None:
-            logger.warning("Warning: Could not load test data. Evaluation will be skipped.")
-            self.test_loader = None
-
-    def aggregate_models(self, model_list):
+        # Round Data Holders
+        self.current_round_updates = []
+        self.current_round_metrics = [] # Stores {client_id: metrics_dict}
         
-        if isinstance(self.global_model, nn.Sequential):
-             new_list = []
-             for m in model_list:
-                 # Check if the update has 'conv1.0.weight' (SimpleModel key)
-                 if 'conv1.0.weight' in m:
-                     new_list.append(map_simplemodel_to_sequential(m))
-                 else:
-                     new_list.append(m)
-             model_list = new_list
+        # Synchronization Barriers
+        self.start_round_barrier = threading.Barrier(args.clients_per_round + 1)
+        self.end_round_barrier = threading.Barrier(args.clients_per_round + 1)
 
-        agg_state = {}
-        # Use the first model in the list to determine keys
-        for key in model_list[0].keys():
-            agg_state[key] = sum([m[key] for m in model_list]) / len(model_list)
-        return agg_state
-
-    def evaluate_model(self, model, data_loader):
-        model.eval()
-        correct = 0
-        total = 0
-        loss_fn = nn.CrossEntropyLoss()
-        total_loss = 0.0
+    def _profiling(self, metrics_list):
+        """
+        Analyzes client metrics to determine system heterogeneity.
+        """
+        client_times = {}
+        client_volumes = {}
         
-        device = next(model.parameters()).device
-
-        with torch.no_grad():
-            for x, y in data_loader:
-                x, y = x.to(device), y.to(device)
-                output = model(x)
-                loss = loss_fn(output, y)
-                total_loss += loss.item()
-                _, predicted = torch.max(output, 1)
-                total += y.size(0)
-                correct += (predicted == y).sum().item()
-
-        accuracy = 100 * correct / total
-        average_loss = total_loss / len(data_loader)
-        return accuracy, average_loss
-
-    def set_threthold(self):
-        tot_time = 0
-        clients_with_time = 0
-        for client_id, info in self.clients_info.items():
-            if info['training_time'] is not None:
-                tot_time += info['training_time']
-                clients_with_time += 1
+        logger.info(f"--- Profiling Round Data ({len(metrics_list)} clients) ---")
         
-        if clients_with_time == 0:
-            logger.warning("Warning: No clients reported training time. Sticking to default threshold.")
-            return
+        for m in metrics_list:
+            cid = m['client_id']
+            train_time = m['training_time']
+            comm_time = m['download_time']
+            samples = m['samples']
+            
+            # Estimating bandwidth based on model size (approx 12MB) / download time
+            estimated_payload_mb = 12.4 
+            bw = estimated_payload_mb / comm_time if comm_time > 0 else 0
+            
+            logger.info(f"Profiled Client {cid}: bandwidth={bw:.2f} MB/s, train={train_time:.2f}s, samples={samples}")
+            
+            client_times[cid] = train_time
+            client_volumes[cid] = samples
 
-        mean_time = tot_time / clients_with_time
-        self.time_threthold = 0.9 * mean_time
-        logger.info(f'time_threthold: {self.time_threthold}s')
+        return client_times, client_volumes
 
-    def set_parameters(self, model):
-        for new_param, old_param in zip(model.parameters(), self.global_model.parameters()):
-            old_param.data = new_param.data.clone()
-
-    def handle_client(self, conn, client_updates, round_num, client_id):
+    def handle_client(self, conn, addr, idx):
+        """
+        Thread function to handle a single client's lifecycle.
+        """
+        client_id = None
         try:
-            start_time = time.time()
-            logger.info(f"Round {round_num}: Handling client {client_id}")
-            
+            # 1. Handshake
+            client_id = recv_data(conn)
             with self.lock:
-                current_state_to_send = self.global_state.copy()
+                self.client_ids.append(client_id)
+            logger.info(f"Client {client_id} registered from {addr}")
             
-            size_before = sys.getsizeof(pickle.dumps(current_state_to_send))/ (1024 * 1024)
-            current_state_to_send = quantization(current_state_to_send)
-            size_after = sys.getsizeof(pickle.dumps(current_state_to_send)) / (1024 * 1024)
-            size_saved = size_before - size_after
-
-            logger.info(f"Round {round_num}: Sending model to client {client_id} | Size: {size_after:.2f} MB | Saved: {size_saved:.2f} MB")
-
-            send_data(conn, current_state_to_send)
-            send_data(conn, self.prune)
+            # 2. Confirm Registration
+            send_data(conn, "WAITING")
             
-            if round_num == 2 and self.prune == 0:
-                send_data(conn, self.pruning_rate)
-
-            updated_state = recv_data(conn)
-            
-            if updated_state is None:
-                logger.warning(f"Round {round_num}: Client {client_id} disconnected unexpectedly.")
-                return
+            # 3. Main Training Loop
+            for round_num in range(self.args.rounds):
+                # Wait for server signal to start round
+                self.start_round_barrier.wait()
                 
-            updated_state = dequantization(updated_state)
-            
-            client_data = recv_data(conn)
-            if client_data is not None:
-                self.client_data[client_id] = client_data
-            
-            algo_arg = recv_data(conn)
-            if algo_arg is not None:
-                self.argalgo = algo_arg
-            
-            end_time = time.time()
-            
-            with self.lock:
-                client_updates.append(updated_state)
-            
-            training_time = end_time - start_time
-            self.clients_info[client_id]['training_time'] = training_time
-            logger.info(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
-
-        except Exception as e:
-            logger.error(f"Round {round_num}: Error handling client {client_id}: {e}", exc_info=True)
-
-    def load_test_data(self, dataset, client_idx, batch_size=32):
-        try:
-            test_data = read_client_data(dataset, client_idx, is_train=False)
-            X, y = zip(*test_data)
-            X = torch.stack(X)
-            y = torch.tensor(y)
-            dataset = torch.utils.data.TensorDataset(X, y)
-            return DataLoader(dataset, batch_size=batch_size)
-        except Exception as e:
-            logger.error(f"Error loading test data: {e}")
-            return None
-    
-    def set_amount_prune(self):
-        values = [v for v in self.client_data.values() if v != None]
-    
-        if not values:
-            return 0
-        if len(values) == 1:
-            data = values[0]
-            non_null_times = [info['training_time'] for info in self.clients_info.values() if info.get('training_time') is not None and info['training_time'] != 0]       
-            training_time = non_null_times[0]
-            ammount = training_time/data
-            ammount = ammount * 10
-            return ammount
-        else:
-            min_val = min(values)
-            max_val = max(values)
-        
-        if max_val == min_val:
-            return 0.9
-        
-        max_amount = []
-        for client_key, client_value in self.client_data.items():
-            if client_value == 0:
-                continue
+                if self.stop_event.is_set():
+                    break
                 
-            amount = 0.9 * (1 - (client_value - min_val) / (max_val - min_val))
-            amount = max(0, min(amount, 0.9))
-            max_amount.append(amount)
-        
-        if max_amount:
-            average_amount = sum(max_amount) / len(max_amount)
-            closest_to_average = min(max_amount, key=lambda x: abs(x - average_amount))
-            
-            logger.info(f"Média dos amounts: {average_amount:.4f}")
-            logger.info(f"Valor mais próximo da média: {closest_to_average:.4f}")
-            if closest_to_average == 0:
-                closest_to_average = average_amount
-            return closest_to_average
-        else:
-            return 0
-
-    def save_results(self):
-        if self.args.prune == 0:
-            a = "prune"
-        else:
-            a = "withou_Prune"
-        b = self.argalgo
-        if b == 0:
-            b = "FedALA"
-        else:
-            b = "FedAVG"
-        algo = self.args.dataset + "_" + a + "_" + b
-        result_path = "../results/"
-        if not os.path.exists(result_path):
-            os.makedirs(result_path)
-        file_path = result_path + "{}.h5".format(algo)
-        with h5py.File(file_path, 'w') as hf:
-            hf.create_dataset('rs_test_acc', data=self.rs_test_acc)
-            hf.create_dataset('rs_train_loss', data=self.rs_test_loss)
+                # A. Get Model & Prune Rate from Strategy
+                payload = self.strategy.get_model_package(client_id)
+                
+                # B. Send (Model, PruneRate)
+                send_data(conn, payload)
+                
+                # C. Receive (Update, Metrics)
+                response = recv_data(conn)
+                if response is None:
+                    logger.error(f"Client {client_id} disconnected unexpectedly.")
+                    break
+                    
+                client_update_quantized, client_metrics = response
+                
+                # Convert the compressed dictionary back to float tensors
+                # so the strategy can average them mathematically.
+                client_update = dequantization(client_update_quantized)
+                
+                with self.lock:
+                    self.current_round_updates.append(client_update)
+                    self.current_round_metrics.append(client_metrics)
+                    logger.info(f"Received update from Client {client_id} (Round {round_num})")
+                
+                # Wait for other clients to finish
+                self.end_round_barrier.wait()
+                
+        except Exception as e:
+            logger.error(f"Error handling client {client_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        finally:
+            conn.close()
 
     def run_server(self):
-        logger.info("=== Federated Learning Server ===")
+        logger.info("--- FL Server starting... ---")
+        logger.info(f"Strategy: PUMA+FedALA")
         logger.info(f"Host: {self.args.host}:{self.args.port}")
-        logger.info(f"Dataset: {self.args.dataset}")
-        logger.info(f"Clients per round: {self.args.clients_per_round}")
-        logger.info(f"Total rounds: {self.args.rounds}")
-        logger.info(f"Test client index: {self.args.test_client_idx}")
-        logger.info("=" * 40)
         
-        self.time_threthold = 7
-        self.time= []
+        # Setup Signal Handler for graceful shutdown
+        def signal_handler(sig, frame):
+            logger.info("Shutdown signal received.")
+            self.stop_event.set()
+            try:
+                self.start_round_barrier.reset()
+                self.end_round_barrier.reset()
+            except:
+                pass
+        
+        signal.signal(signal.SIGINT, signal_handler)
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((self.args.host, self.args.port))
-            s.listen(self.args.max_clients)
-            logger.info(f"Server listening on {self.args.host}:{self.args.port}")
+            s.listen(self.args.clients_per_round)
+            
             logger.info(f"Waiting for {self.args.clients_per_round} clients to connect...")
             
-            self.client_data = {index: None for index in range(1, self.args.clients_per_round+1)}
+            # 1. Connection Phase
+            threads = []
             while len(self.client_connections) < self.args.clients_per_round:
-                conn, addr = s.accept()
-                idx = recv_data(conn)
-                logger.info(f"client idx: {idx}") 
-                self.clients_info[idx+1] = {'training_time': None}
-                logger.info(f"Client {len(self.client_connections) + 1} connected: {addr}")
-                self.client_idx.append(idx)
-                self.client_connections.append(conn)
-                self.client_addresses.append(addr)
-            
-            logger.info(f"All {self.args.clients_per_round} clients connected. Starting training...")
-            
-            for round_num in range(self.args.rounds):
-                time.sleep(5)
-                logger.info(f"\n--- Round {round_num + 1}/{self.args.rounds} ---")
-
-                if round_num == 1 and self.prune == 0: # Round 2
-                    logger.info("--- SERVER: INITIATING GLOBAL PRUNING ---")
-                    self.pruning_rate = self.set_amount_prune()
-                    logger.info(f"--- SERVER: Calculated pruning rate: {self.pruning_rate:.4f}")
+                if self.stop_event.is_set(): break
+                try:
+                    s.settimeout(1.0)
+                    conn, addr = s.accept()
+                    self.client_connections.append(conn)
+                    self.client_addresses.append(addr)
                     
-                    self.global_model, _ = prune_and_restructure(
-                        model=self.global_model, 
-                        pruning_rate=self.pruning_rate, 
-                        size_fc=self.size_fc, 
-                        data=self.args.dataset
-                    )
-                    
-                    device = next(self.global_model.parameters()).device
-                    self.global_model.to(device)
-                    
-                    self.global_state = self.global_model.state_dict()
-                    logger.info("--- SERVER: GLOBAL MODEL PRUNED SUCCESSFULLY ---")
-
-                client_updates = []
-                threads = []
-
-                self.stop_event = threading.Event()
-                for i, conn in enumerate(self.client_connections):
-                    t = threading.Thread(target=self.handle_client, daemon=True, args=(conn, client_updates, round_num + 1, i + 1))
+                    # Start Client Thread
+                    t = threading.Thread(target=self.handle_client, args=(conn, addr, len(self.client_connections)))
                     t.start()
                     threads.append(t)
-                
-                logger.info(f"threshold: {self.time_threthold}")
-                
-                init_time = time.time()
-                logger.info(f"Round {round_num + 1}: Waiting for {len(threads)} clients to finish training...")
-                for t in threads:
-                    t.join()
-                logger.info(f"Round {round_num + 1}: All client threads completed.")
+                    
+                    logger.info(f"Connected: {len(self.client_connections)}/{self.args.clients_per_round}")
+                except socket.timeout:
+                    continue
+            
+            if self.stop_event.is_set(): return
 
-                if round_num == 0:
-                    self.set_threthold()
+            # 2. Training Phase
+            for round_num in range(self.args.rounds):
+                logger.info(f"--- Starting Round {round_num} ---")
                 
-                end_time = time.time()
-                round_duration = end_time - init_time
-                logger.info(f"Round {round_num + 1} duration: {round_duration:.2f} seconds")
-                logger.info(f"client_updates length: {len(client_updates)}")
+                # Reset round storage
+                self.current_round_updates = []
+                self.current_round_metrics = []
                 
-                if client_updates:
-                    logger.info(f"Round {round_num + 1}: Aggregating {len(client_updates)} client updates")
+                # Release Clients to start training
+                start_time = time.time()
+                self.start_round_barrier.wait()
+                
+                # Wait for Clients to finish (Synchronization)
+                self.end_round_barrier.wait()
+                round_duration = time.time() - start_time
+                
+                logger.info(f"--- Round {round_num} Aggregation Phase ---")
+                logger.info(f"Round duration: {round_duration:.2f}s")
+                
+                # 3. Aggregation & Strategy
+                if self.current_round_updates:
+                    # A. Profile Clients
+                    client_times, client_volumes = self._profiling(self.current_round_metrics)
                     
-                    # Call aggregate (now with auto-mapping)
-                    aggregated_state = self.aggregate_models(client_updates)
+                    # B. Aggregate
+                    self.strategy.aggregate_updates(self.current_round_updates)
                     
-                    with self.lock:
-                        self.global_state = aggregated_state
-                        # This load should now work because keys match
-                        self.global_model.load_state_dict(self.global_state)
-                        device = next(self.global_model.parameters()).device
-                        self.global_model.to(device)
+                    # C. Evaluate
+                    acc, loss = self.strategy.evaluate_global_model(round_num)
                     
-                    if self.test_loader is not None:
-                        acc = []
-                        loss = []
-                        for i in self.client_idx:
-                            self.test_loader = self.load_test_data(self.args.dataset, i, self.args.batch_size)
-                            accuracy, avg_loss = self.evaluate_model(self.global_model, self.test_loader)
-                            acc.append(accuracy)
-                            loss.append(avg_loss)
-                        logger.info(f'acc: {acc}')
-                        logger.info(f'len acc {len(acc)}')
-                        accuracy = sum(acc)/len(acc)
-                        logger.info(f'avg acc: {accuracy}')
-                        avg_loss = sum(loss)/len(loss)
-                        self.rs_test_acc.append(accuracy)
-                        self.rs_test_loss.append(avg_loss)
-                        logger.info(f"Round {round_num + 1}: Test Accuracy: {accuracy:.2f}% | Test Loss: {avg_loss:.4f}")
-                    else:
-                        logger.info(f"Round {round_num + 1}: Model aggregated (no test data for evaluation)")
-                    
-                    size_global_model = get_model_size(self.global_model)
-                    logger.info(f'Size Global Model: {size_global_model:.2f}MB')
-                    
-                    successful_notifications = 0
-                    for conn in self.client_connections:
-                        try:
-                            conn.send(b'end') 
-                            successful_notifications += 1
-                        except Exception as e:
-                            logger.error(f"Error notifying client: {e}")
-                    
-                    logger.info(f"Round {round_num + 1}: Global model updated. Notified {successful_notifications} clients.")
+                    # D. PUMA Pruning Trigger (Round 1 -> 2 transition)
+                    if round_num == 1 and not self.strategy.prune_triggered:
+                        logger.info("Triggering PUMA Adaptive Pruning...")
+                        self.strategy.attempt_pruning(client_times, client_volumes)
+                
                 else:
-                    logger.info(f"Round {round_num + 1}: No client updates received this round.")
+                    logger.warning(f"Round {round_num}: No updates received.")
+
+            logger.info("--- Training Complete. Sending shutdown signal... ---")
             
-            logger.info(f"\nTraining completed after {self.args.rounds} rounds!")
-            
+            # Notify clients to shutdown
             for conn in self.client_connections:
                 try:
-                    conn.close()
+                    send_data(conn, "shutdown")
                 except:
                     pass
-            logger.info("All client connections closed.")
-        self.save_results()
+            
+            # Wait for threads
+            for t in threads:
+                t.join()
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Server')
@@ -398,35 +219,17 @@ def parse_args():
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--clients-per-round', type=int, default=2)
     parser.add_argument('--rounds', type=int, default=5)
-    parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
+    parser.add_argument('--dataset', type=str, default='Cifar100', choices=['Cifar10', 'MNIST', 'Cifar100'])
     parser.add_argument('--test-client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
     parser.add_argument('--num-classes', type=int, default=100)
     parser.add_argument('--dim', type=int, default=1600)
     parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--max-clients', type=int, default=10)
-    parser.add_argument('--prune', type=int, default=0)
-    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
-    parser.add_argument('-did', "--device_id", type=str, default="0")
+    parser.add_argument("--device", type=str, default="cuda")
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler("logs/server.log"),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
-    if args.device == "cuda" and not torch.cuda.is_available():
-        logger.warning("\ncuda is not avaiable.\n")
-        args.device = "cpu"
-    device = torch.device(args.device)
     server = FederatedLearningServer(args)
     server.run_server()
 

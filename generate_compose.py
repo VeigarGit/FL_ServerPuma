@@ -1,121 +1,49 @@
-import os
 import argparse
 
-def generate_docker_compose(num_clients, dataset):
-    # The client template is defined *outside* the 'services' block
-    # It starts with 'x-' so docker-compose ignores it as a service
-    template = f"""
-x-client-template: &client
-  build:
-    context: .
-    dockerfile: dockerfile.client
-    args:
-      - NO_CACHE=true
-  image: fl-client-image
-  restart: 'no'
-  
-  # --- Enable GPU Access ---
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: 1           # Number of GPUs to use
-            capabilities: [gpu]
-  # -----------------------------
+def generate_compose_yaml(args):
+    # We construct the YAML manually to avoid dependency errors (no pyyaml needed)
+    yaml_content = f"""version: '3.8'
 
-  # --- Persist Logs ---
-  volumes:
-    - ./logs:/app/logs
-  # -------------------------
-
-  environment: 
-    - PYTHONUNBUFFERED=1
-  depends_on:
-    - server
-  networks:
-    - docker-tc
-  # Adicionando labels para o docker-tc nos clientes
-  labels:
-    - "com.docker-tc.enabled=1"
-    - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
+networks:
+  puma_default:
+    driver: bridge
 
 services:
   server:
-    build:
-      context: .
-      dockerfile: dockerfile.server
-      args:
-        - NO_CACHE=true
-    container_name: fl-server
-    restart: 'no'
-    
-    # --- Enable GPU Access ---
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    # -----------------------------
-
-    # --- Persist Logs ---
-    volumes:
-      - ./logs:/app/logs
-    # -------------------------
-
-    environment: 
-      - PYTHONUNBUFFERED=1
+    image: fl_server:latest
+    container_name: puma-server
+    hostname: server
     ports:
-      - "8880:9090"
-    command: ["python", "-m", "src.system.server", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}"]
+      - "{args.port}:{args.port}"
+    # Mount logs so you can see them on your host machine
+    volumes:
+      - ./fl_logs:/app/fl_logs
+    command: python -m src.system.server --port {args.port} --clients-per-round {args.clients} --dataset {args.dataset}
     networks:
-      - docker-tc
-    # Adicionando labels para o docker-tc no servidor
-    labels:
-      - "com.docker-tc.enabled=1"
-      - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
-      - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
+      - puma_default
+
 """
 
-    # Adicionar clients dinamicamente
-    for i in range(0, num_clients):
-        template += f"""
-  client-{i}:
-    <<: *client
-    container_name: fl-client-{i}
-    command: ["python", "-m", "src.system.client", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "{dataset}"]
-"""
-
-    template += """
-networks:
-  docker-tc:
-    driver: bridge
+    for i in range(args.clients):
+        yaml_content += f"""  client_{i}:
+    image: fl_client:latest
+    container_name: puma-client_{i:03d}
+    depends_on:
+      - server
+    command: python -m src.system.client --host server --port {args.port} --client-idx {i} --dataset {args.dataset}
+    networks:
+      - puma_default
 """
 
     with open('docker-compose.generated.yml', 'w') as f:
-        f.write(template)
+        f.write(yaml_content)
     
-    print(f"Generated docker-compose.generated.yml with {num_clients} clients for {dataset} dataset")
+    print(f"Generated docker-compose.generated.yml with {args.clients} clients for {args.dataset} dataset")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Generate Docker Compose file for Federated Learning')
-    
-    parser.add_argument(
-        '--clients', 
-        type=int, 
-        default=3, 
-        help='Number of clients to create (default: 3)'
-    )
-    parser.add_argument(
-        '--dataset', 
-        type=str, 
-        default='MNIST', 
-        choices=['MNIST', 'Cifar10', 'Cifar100'], 
-        help='Dataset to use (default: MNIST)'
-    )
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--clients', type=int, default=3, help='Number of clients')
+    parser.add_argument('--dataset', type=str, default='MNIST', help='Dataset name')
+    parser.add_argument('--port', type=int, default=9000, help='Server port')
     args = parser.parse_args()
-    
-    generate_docker_compose(args.clients, args.dataset)
+    generate_compose_yaml(args)

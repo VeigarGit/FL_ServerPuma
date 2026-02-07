@@ -1,97 +1,25 @@
 import socket
-import pickle
-import struct
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from .data_utils import read_client_data
+import time
 import argparse
 import sys
-import copy
-import time
+import torch
 import os
-from .prunning import prune_and_restructure
-from .ALA import ALA
-from .model import SimpleModel
-import builtins
-from ..utils.network_utils import send_data, recv_data, recvall
+import struct
+import pickle
+
+# Import internal modules
+from ..utils.network_utils import send_data, recv_data
+from ..utils.logger import setup_logger
 from ..utils.model_utils import quantization, dequantization
-import logging
+from .trainer import Trainer
 
-# Define Logger Globally
-logger = logging.getLogger("Client")
-
-def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round=2, alaarg=1, ala=None):
-    state_dict = dequantization(state_dict)
-    
-    state = copy.deepcopy(model)
-    state.load_state_dict(state_dict)
-    
-    if alaarg==0 and round==2:
-        logger.info(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
-        local_initialization(ala, state, model)
-    
-    set_parameters(model, state)
-    
-    model.train()
-    optimizer = optim.SGD(model.parameters(), lr=learning_rate)
-    loss_fn = nn.CrossEntropyLoss()
-    
-    device = next(model.parameters()).device
-
-    for x, y in train_loader:
-        x, y = x.to(device), y.to(device)
-        
-        optimizer.zero_grad()
-        output = model(x)
-        loss = loss_fn(output, y)
-        loss.backward()
-        optimizer.step()
-    
-    return model.state_dict()
-
-def evaluate_model(model, data_loader):
-    model.eval()
-    correct = 0
-    total = 0
-    loss_fn = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    
-    device = next(model.parameters()).device
-
-    with torch.no_grad():
-        for x, y in data_loader:
-            x, y = x.to(device), y.to(device)
-            
-            output = model(x)
-            loss = loss_fn(output, y)
-            total_loss += loss.item()
-            _, predicted = torch.max(output, 1)
-            total += y.size(0)
-            correct += (predicted == y).sum().item()
-
-    accuracy = 100 * correct / total
-    average_loss = total_loss / len(data_loader)
-    return accuracy, average_loss
-
-def load_data(dataset, client_idx, is_train=True, batch_size=32):
-    train_data = read_client_data(dataset, client_idx, is_train)
-    X, y = zip(*train_data)
-    X = torch.stack(X)
-    y = torch.tensor(y)
-    dataset = torch.utils.data.TensorDataset(X, y)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-def set_parameters(model, state_new):
-    for new_param, old_param in zip(state_new.parameters(), model.parameters()):
-        old_param.data = new_param.data.clone()
+# Initialize logger
+logger = setup_logger("client.main")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Client')
     parser.add_argument('--host', type=str, default='localhost')
     parser.add_argument('--port', type=int, default=9000)
-    parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar100', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
     parser.add_argument('--client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
@@ -99,115 +27,140 @@ def parse_args():
     parser.add_argument('--dim', type=int, default=1600)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--learning-rate', type=float, default=0.01)
-    parser.add_argument('--random-client', action='store_true')
-    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument('-did', "--device_id", type=str, default="0")
-    parser.add_argument("--ala", type=int, default=0)
+    parser.add_argument("--ala", type=int, default=1, help="1 to enable FedALA, 0 to disable")
     return parser.parse_args()
-
-def local_initialization(ala, received_global_model, model, mask=None):
-    ala.adaptive_local_aggregation(received_global_model, model, mask=mask)
 
 def main():
     args = parse_args()
     
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(f"logs/client_{args.client_idx}.log"),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    logger.name = f"Client-{args.client_idx}"
-
+    # Setup Device
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     if args.device == "cuda" and not torch.cuda.is_available():
-        logger.warning("\ncuda is not avaiable.\n")
+        logger.warning("CUDA requested but not available. Falling back to CPU.")
         args.device = "cpu"
-    device = torch.device(args.device)
-    
-    logger.info("=== Federated Learning Client ===")
-    logger.info(f"Host: {args.host}:{args.port}")
-    logger.info(f"Dataset: {args.dataset}")
-    logger.info(f"Client: {args.client_idx}")
-    logger.info(f"Rounds: {args.rounds}")
-    logger.info(f"Batch size: {args.batch_size}")
-    logger.info(f"Learning rate: {args.learning_rate}")
-    logger.info("=" * 40)
-    
-    if args.dataset =='MNIST':
-        model = SimpleModel(in_features=1, num_classes=10, dim=1024)
-    if args.dataset =='Cifar10':
-        model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
-    if args.dataset =='Cifar100':
-        model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
-    
-    model.to(device)
-    
-    loss = nn.CrossEntropyLoss()
-    
+
+    logger.info(f"--- Starting FL Client {args.client_idx} ---")
+    logger.info(f"Target Server: {args.host}:{args.port}")
+
+    # 1. Initialize Trainer (The Logic Layer)
     try:
-        train_loader = load_data(args.dataset, args.client_idx, is_train=True, batch_size=args.batch_size)
-        test_loader = load_data(args.dataset, args.client_idx, is_train=False, batch_size=args.batch_size)
-        logger.info(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
+        trainer = Trainer(args, args.client_idx)
+        logger.info(f"Algorithm PUMA+FedALA initialized.")
     except Exception as e:
-        logger.error(f"Error loading data: {e}")
+        logger.error(f"Failed to initialize trainer: {e}")
         sys.exit(1)
-    
-    ala = ALA(args.client_idx, loss, train_loader, 32, 80, 2, 1.0, args.device)
-    time.sleep(10)
-    
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+
+    # 2. Connection Loop (Retry Logic)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    connected = False
+    while not connected:
         try:
-            s.connect((args.host, args.port))
-            send_data(s, args.client_idx)
+            sock.connect((args.host, args.port))
+            connected = True
             logger.info(f"Connected to server {args.host}:{args.port}")
+            
+            # Handshake: Send Client ID
+            send_data(sock, args.client_idx)
+            
+            # Receive Server Status (Handshake confirmation)
+            server_status = recv_data(sock)
+            logger.info(f"Successfully registered. Server status: {server_status}")
+            
+        except ConnectionRefusedError:
+            logger.warning("Connection refused. Retrying in 5s...")
+            time.sleep(5)
         except Exception as e:
             logger.error(f"Connection failed: {e}")
             sys.exit(1)
-        
-        for round_num in range(args.rounds):
-            logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
-            
-            global_state = recv_data(s)
-            prune = recv_data(s)
-            
-            if round_num+1 == 2 and prune == 0:
-                ammount = recv_data(s)
-                logger.info(f"Client {args.client_idx}: Received pruning rate {ammount:.4f}. Pruning local model...")
-                local_model, _ = prune_and_restructure(model=model, pruning_rate=ammount, size_fc=25, data=args.dataset)
-                
-                model = local_model
-                model.to(device) 
-                
-            if global_state is None:
-                logger.info("Failed to receive global model. Connection may be closed.")
-                break
-            logger.info("Received global model.")
-            
-            test_accuracy, test_loss = evaluate_model(model, test_loader)
-            logger.info(f"Client {args.client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
-            
-            updated_state = local_training(model, global_state, prune, train_loader, args.learning_rate, round_num+1, args.ala, ala)
-            logger.info("Local training completed.")
 
-            train_accuracy, train_loss = evaluate_model(model, train_loader)
-            logger.info(f"Client {args.client_idx}: Training Accuracy: {train_accuracy:.2f}% | Training Loss: {train_loss:.4f}")
-            updated_state  = quantization(updated_state)
-            send_data(s, updated_state)
-            send_data(s, len(train_loader))
-            send_data(s, args.ala)
-            logger.info("Client update sent.")
+    # 3. Main Communication Loop
+    try:
+        round_num = 0
+        while True:
+            logger.info(f"Waiting for model (Round {round_num})...")
             
-            try:
-                s.recv(3)
-                logger.info("Ready for next round...")
-            except Exception as e:
-                logger.error(f"Error waiting for server: {e}")
+            # --- RECEIVE PHASE ---
+            start_download = time.time()
+            
+            # Protocol: Receive (Quantized Model, Prune Rate)
+            # Expect the server to send a tuple or list: [state_dict, prune_rate]
+            payload = recv_data(sock)
+            
+            if payload == 'shutdown':
+                logger.info("Server sent shutdown signal. Exiting.")
+                break
+            
+            if payload is None:
+                logger.error("Received None payload. Server might have closed connection.")
                 break
 
-    logger.info("\nTraining completed!")
+            global_model_quant, prune_rate = payload
+            
+            download_time = time.time() - start_download
+            payload_size_kb = sys.getsizeof(pickle.dumps(payload)) / 1024
+            speed = payload_size_kb / download_time if download_time > 0 else 0
+            
+            logger.info(f"Downloaded model for round {round_num}: {payload_size_kb:.1f}KB in {download_time:.2f}s ({speed:.1f} KB/s)")
+            logger.info(f"--- Starting Round {round_num} ---")
+            
+            if prune_rate > 0:
+                logger.info(f"Received PRUNED model (ratio={prune_rate:.2f})")
+
+            # Dequantize before using
+            global_model_state = dequantization(global_model_quant)
+
+            # --- TRAINING PHASE ---
+            logger.info("Starting local training...")
+            
+            # Measure strictly training time
+            train_start = time.time()
+            
+            local_state, num_samples = trainer.train(
+                global_state_dict=global_model_state,
+                prune_rate=prune_rate,
+                round_num=round_num,
+                use_ala=(args.ala == 1)
+            )
+            
+            train_time = time.time() - train_start
+            logger.info(f"Local training complete in {train_time:.2f}s.")
+
+            # --- SEND PHASE ---
+            logger.info(f"Submitting trained model update from {num_samples} samples...")
+            
+            # Quantize
+            quantized_local_state = quantization(local_state)
+            
+            # Prepare Metrics Payload (Profiling)
+            metrics = {
+                'samples': num_samples,
+                'training_time': train_time,
+                'download_time': download_time,
+                'client_id': args.client_idx
+            }
+            
+            upload_start = time.time()
+            
+            # Protocol: Send (Quantized Model, Metrics)
+            send_data(sock, (quantized_local_state, metrics))
+            
+            upload_time = time.time() - upload_start
+            logger.info(f"Successfully submitted update in {upload_time + train_time + download_time:.2f}s")
+            logger.info("Update submitted. Waiting for next round...")
+            
+            round_num += 1
+
+    except KeyboardInterrupt:
+        logger.info("Client stopping...")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        sock.close()
+        logger.info("Connection closed.")
 
 if __name__ == '__main__':
     main()
