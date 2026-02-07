@@ -1,0 +1,339 @@
+time="2026-02-07T13:43:21-03:00" level=warning msg="/home/john/Downloads/NextConference/FL_ServerPuma/docker-compose.generated.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+ Network fl_serverpuma_puma_default Creating 
+ Network fl_serverpuma_puma_default Created 
+ Container puma-server Creating 
+ Container puma-server Created 
+ Container puma-client_001 Creating 
+ Container puma-client_000 Creating 
+ Container puma-client_002 Creating 
+ Container puma-client_002 Created 
+ Container puma-client_001 Created 
+ Container puma-client_000 Created 
+Attaching to puma-client_000, puma-client_001, puma-client_002, puma-server
+ Container puma-server Starting 
+ Container puma-server Started 
+ Container puma-client_002 Starting 
+ Container puma-client_000 Starting 
+ Container puma-client_001 Starting 
+ Container puma-client_000 Started 
+ Container puma-client_002 Started 
+ Container puma-client_001 Started 
+puma-client_002  | 2026-02-07T16:43:23 | INFO | client.main: --- Applying Network Limit: 5mbit (Low Speed) ---
+puma-client_000  | 2026-02-07T16:43:23 | INFO | client.main: --- Applying Network Limit: 1mbit (Straggler) ---
+puma-client_002  | 2026-02-07T16:43:23 | INFO | client.main: Successfully limited outgoing bandwidth to 5mbit
+puma-client_002  | 2026-02-07T16:43:23 | WARNING | client.main: CUDA requested but not available. Falling back to CPU.
+puma-client_002  | 2026-02-07T16:43:23 | INFO | client.main: --- Starting FL Client 2 ---
+puma-client_002  | 2026-02-07T16:43:23 | INFO | client.main: Target Server: server:9000
+puma-client_000  | 2026-02-07T16:43:23 | INFO | client.main: Successfully limited outgoing bandwidth to 1mbit
+puma-client_000  | 2026-02-07T16:43:23 | WARNING | client.main: CUDA requested but not available. Falling back to CPU.
+puma-client_000  | 2026-02-07T16:43:23 | INFO | client.main: --- Starting FL Client 0 ---
+puma-client_000  | 2026-02-07T16:43:23 | INFO | client.main: Target Server: server:9000
+puma-client_001  | 2026-02-07T16:43:23 | INFO | client.main: --- Applying Network Limit: 5mbit (Low Speed) ---
+puma-client_001  | 2026-02-07T16:43:23 | INFO | client.main: Successfully limited outgoing bandwidth to 5mbit
+puma-client_001  | 2026-02-07T16:43:23 | WARNING | client.main: CUDA requested but not available. Falling back to CPU.
+puma-client_001  | 2026-02-07T16:43:23 | INFO | client.main: --- Starting FL Client 1 ---
+puma-client_001  | 2026-02-07T16:43:23 | INFO | client.main: Target Server: server:9000
+puma-client_001  | 2026-02-07T16:43:23 | INFO | client.trainer: Trainer initialized for Client 1
+puma-client_001  | 2026-02-07T16:43:23 | INFO | client.main: Algorithm PUMA+FedALA initialized.
+puma-client_001  | 2026-02-07T16:43:23 | WARNING | client.main: Connection refused. Retrying in 5s...
+puma-client_002  | 2026-02-07T16:43:23 | INFO | client.trainer: Trainer initialized for Client 2
+puma-client_002  | 2026-02-07T16:43:23 | INFO | client.main: Algorithm PUMA+FedALA initialized.
+puma-client_002  | 2026-02-07T16:43:23 | WARNING | client.main: Connection refused. Retrying in 5s...
+puma-client_000  | 2026-02-07T16:43:24 | INFO | client.trainer: Trainer initialized for Client 0
+puma-client_000  | 2026-02-07T16:43:24 | INFO | client.main: Algorithm PUMA+FedALA initialized.
+puma-client_000  | 2026-02-07T16:43:24 | WARNING | client.main: Connection refused. Retrying in 5s...
+puma-server      | 2026-02-07T16:43:25 | INFO | server.strategies.puma: Initializing model for dataset: MNIST
+puma-server      | 2026-02-07T16:43:25 | INFO | server.strategies.puma: Loading MNIST test dataset...
+puma-server      | 2026-02-07T16:43:25 | INFO | server.strategies.puma: Test dataset loaded.
+puma-server      | 2026-02-07T16:43:25 | INFO | server.strategies.puma: PUMA Strategy initialized. Model size: 2.22 MB
+puma-server      | 2026-02-07T16:43:25 | INFO | server.main: --- FL Server starting... ---
+puma-server      | 2026-02-07T16:43:25 | INFO | server.main: Strategy: PUMA+FedALA
+puma-server      | 2026-02-07T16:43:25 | INFO | server.main: Host: 0.0.0.0:9000
+puma-server      | 2026-02-07T16:43:25 | INFO | server.main: Waiting for 3 clients to connect...
+puma-client_001  | 2026-02-07T16:43:28 | INFO | client.main: Connected to server server:9000
+puma-server      | 2026-02-07T16:43:28 | INFO | server.main: Client 1 registered from ('172.18.0.5', 42506)
+puma-server      | 2026-02-07T16:43:28 | INFO | server.main: Connected: 1/3
+puma-client_001  | 2026-02-07T16:43:28 | INFO | client.main: Successfully registered. Server status: WAITING
+puma-client_001  | 2026-02-07T16:43:28 | INFO | client.main: Waiting for model (Round 0)...
+puma-client_002  | 2026-02-07T16:43:28 | INFO | client.main: Connected to server server:9000
+puma-server      | 2026-02-07T16:43:28 | INFO | server.main: Client 2 registered from ('172.18.0.4', 33406)
+puma-server      | 2026-02-07T16:43:28 | INFO | server.main: Connected: 2/3
+puma-client_002  | 2026-02-07T16:43:28 | INFO | client.main: Successfully registered. Server status: WAITING
+puma-client_002  | 2026-02-07T16:43:28 | INFO | client.main: Waiting for model (Round 0)...
+puma-client_000  | 2026-02-07T16:43:29 | INFO | client.main: Connected to server server:9000
+puma-server      | 2026-02-07T16:43:29 | INFO | server.main: Client 0 registered from ('172.18.0.3', 35496)
+puma-server      | 2026-02-07T16:43:29 | INFO | server.main: Connected: 3/3
+puma-server      | 2026-02-07T16:43:29 | INFO | server.main: --- Starting Round 0 ---
+puma-client_000  | 2026-02-07T16:43:29 | INFO | client.main: Successfully registered. Server status: WAITING
+puma-client_000  | 2026-02-07T16:43:29 | INFO | client.main: Waiting for model (Round 0)...
+puma-client_001  | 2026-02-07T16:43:29 | INFO | client.main: Downloaded model for round 0: 573.3KB in 0.20s (2852.8 KB/s)
+puma-client_001  | 2026-02-07T16:43:29 | INFO | client.main: --- Starting Round 0 ---
+puma-client_001  | 2026-02-07T16:43:29 | INFO | client.main: Starting local training...
+puma-client_001  | 2026-02-07T16:43:29 | INFO | client.trainer: Training FULL model with PUMA+FedALA on cpu
+puma-client_000  | 2026-02-07T16:43:29 | INFO | client.main: Downloaded model for round 0: 573.3KB in 0.01s (42956.3 KB/s)
+puma-client_000  | 2026-02-07T16:43:29 | INFO | client.main: --- Starting Round 0 ---
+puma-client_002  | 2026-02-07T16:43:29 | INFO | client.main: Downloaded model for round 0: 573.3KB in 0.12s (4965.7 KB/s)
+puma-client_002  | 2026-02-07T16:43:29 | INFO | client.main: --- Starting Round 0 ---
+puma-client_002  | 2026-02-07T16:43:29 | INFO | client.main: Starting local training...
+puma-client_002  | 2026-02-07T16:43:29 | INFO | client.trainer: Training FULL model with PUMA+FedALA on cpu
+puma-client_000  | 2026-02-07T16:43:29 | INFO | client.main: Starting local training...
+puma-client_000  | 2026-02-07T16:43:29 | INFO | client.trainer: Training FULL model with PUMA+FedALA on cpu
+puma-client_001  | 2026-02-07T16:43:44 | INFO | client.trainer: Training completed: 6711 samples in 15.83s
+puma-client_001  | 2026-02-07T16:43:44 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 408.46MB
+puma-client_001  | 2026-02-07T16:43:44 | INFO | client.main: Local training complete in 15.83s.
+puma-client_001  | 2026-02-07T16:43:44 | INFO | client.main: Submitting trained model update from 6711 samples...
+puma-client_001  | 2026-02-07T16:43:45 | INFO | client.main: Successfully submitted update in 16.27s
+puma-client_001  | 2026-02-07T16:43:45 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_001  | 2026-02-07T16:43:45 | INFO | client.main: Waiting for model (Round 1)...
+puma-client_002  | 2026-02-07T16:43:45 | INFO | client.trainer: Training completed: 11033 samples in 16.37s
+puma-client_002  | 2026-02-07T16:43:45 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 424.63MB
+puma-client_002  | 2026-02-07T16:43:45 | INFO | client.main: Local training complete in 16.37s.
+puma-client_002  | 2026-02-07T16:43:45 | INFO | client.main: Submitting trained model update from 11033 samples...
+puma-client_000  | 2026-02-07T16:43:45 | INFO | client.trainer: Training completed: 14469 samples in 16.36s
+puma-client_000  | 2026-02-07T16:43:45 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 446.24MB
+puma-client_000  | 2026-02-07T16:43:45 | INFO | client.main: Local training complete in 16.36s.
+puma-client_000  | 2026-02-07T16:43:45 | INFO | client.main: Submitting trained model update from 14469 samples...
+puma-client_002  | 2026-02-07T16:43:45 | INFO | client.main: Successfully submitted update in 16.72s
+puma-client_002  | 2026-02-07T16:43:45 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_002  | 2026-02-07T16:43:45 | INFO | client.main: Waiting for model (Round 1)...
+puma-server      | 2026-02-07T16:43:45 | INFO | server.main: Received update from Client 1 (Round 0)
+puma-server      | 2026-02-07T16:43:46 | INFO | server.main: Received update from Client 2 (Round 0)
+puma-client_000  | 2026-02-07T16:43:46 | INFO | client.main: Successfully submitted update in 17.84s
+puma-client_000  | 2026-02-07T16:43:46 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_000  | 2026-02-07T16:43:46 | INFO | client.main: Waiting for model (Round 1)...
+puma-server      | 2026-02-07T16:43:50 | INFO | server.main: Received update from Client 0 (Round 0)
+puma-server      | 2026-02-07T16:43:50 | INFO | server.main: --- Round 0 Aggregation Phase ---
+puma-server      | 2026-02-07T16:43:50 | INFO | server.main: Round duration: 21.29s
+puma-server      | 2026-02-07T16:43:50 | INFO | server.main: --- Profiling Round Data (3 clients) ---
+puma-server      | 2026-02-07T16:43:50 | INFO | server.main: Profiled Client 1: bandwidth=61.71 MB/s, train=15.83s, samples=6711
+puma-server      | 2026-02-07T16:43:50 | INFO | server.main: Profiled Client 2: bandwidth=107.40 MB/s, train=16.37s, samples=11033
+puma-server      | 2026-02-07T16:43:50 | INFO | server.main: Profiled Client 0: bandwidth=929.19 MB/s, train=16.36s, samples=14469
+puma-server      | 2026-02-07T16:43:50 | INFO | server.strategies.puma: Aggregating 3 client updates...
+puma-server      | 2026-02-07T16:43:50 | INFO | server.strategies.puma: --- Round 0 Complete. Accuracy: 21.31%, Loss: 1.9155 ---
+puma-server      | 2026-02-07T16:43:50 | INFO | server.main: --- Starting Round 1 ---
+puma-client_002  | 2026-02-07T16:43:50 | INFO | client.main: Downloaded model for round 1: 573.3KB in 5.12s (112.1 KB/s)
+puma-client_002  | 2026-02-07T16:43:50 | INFO | client.main: --- Starting Round 1 ---
+puma-client_000  | 2026-02-07T16:43:50 | INFO | client.main: Downloaded model for round 1: 573.3KB in 3.88s (147.6 KB/s)
+puma-client_000  | 2026-02-07T16:43:50 | INFO | client.main: --- Starting Round 1 ---
+puma-client_001  | 2026-02-07T16:43:50 | INFO | client.main: Downloaded model for round 1: 573.3KB in 5.60s (102.3 KB/s)
+puma-client_001  | 2026-02-07T16:43:50 | INFO | client.main: --- Starting Round 1 ---
+puma-client_001  | 2026-02-07T16:43:50 | INFO | client.main: Starting local training...
+puma-client_001  | 2026-02-07T16:43:50 | INFO | client.trainer: Training FULL model with PUMA+FedALA on cpu
+puma-client_002  | 2026-02-07T16:43:50 | INFO | client.main: Starting local training...
+puma-client_002  | 2026-02-07T16:43:50 | INFO | client.trainer: Training FULL model with PUMA+FedALA on cpu
+puma-client_000  | 2026-02-07T16:43:50 | INFO | client.main: Starting local training...
+puma-client_000  | 2026-02-07T16:43:50 | INFO | client.trainer: Training FULL model with PUMA+FedALA on cpu
+puma-client_001  | 2026-02-07T16:44:07 | INFO | client.trainer: Training completed: 6711 samples in 16.31s
+puma-client_001  | 2026-02-07T16:44:07 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 409.47MB
+puma-client_001  | 2026-02-07T16:44:07 | INFO | client.main: Local training complete in 16.31s.
+puma-client_001  | 2026-02-07T16:44:07 | INFO | client.main: Submitting trained model update from 6711 samples...
+puma-client_001  | 2026-02-07T16:44:07 | INFO | client.main: Successfully submitted update in 22.22s
+puma-client_001  | 2026-02-07T16:44:07 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_001  | 2026-02-07T16:44:07 | INFO | client.main: Waiting for model (Round 2)...
+puma-client_002  | 2026-02-07T16:44:07 | INFO | client.trainer: Training completed: 11033 samples in 16.89s
+puma-client_002  | 2026-02-07T16:44:07 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 427.66MB
+puma-client_002  | 2026-02-07T16:44:07 | INFO | client.main: Local training complete in 16.89s.
+puma-client_002  | 2026-02-07T16:44:07 | INFO | client.main: Submitting trained model update from 11033 samples...
+puma-client_000  | 2026-02-07T16:44:07 | INFO | client.trainer: Training completed: 14469 samples in 16.92s
+puma-client_000  | 2026-02-07T16:44:07 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 451.75MB
+puma-client_000  | 2026-02-07T16:44:07 | INFO | client.main: Local training complete in 16.92s.
+puma-client_000  | 2026-02-07T16:44:07 | INFO | client.main: Submitting trained model update from 14469 samples...
+puma-client_002  | 2026-02-07T16:44:08 | INFO | client.main: Successfully submitted update in 22.31s
+puma-client_002  | 2026-02-07T16:44:08 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_002  | 2026-02-07T16:44:08 | INFO | client.main: Waiting for model (Round 2)...
+puma-server      | 2026-02-07T16:44:08 | INFO | server.main: Received update from Client 1 (Round 1)
+puma-server      | 2026-02-07T16:44:08 | INFO | server.main: Received update from Client 2 (Round 1)
+puma-client_000  | 2026-02-07T16:44:09 | INFO | client.main: Successfully submitted update in 22.38s
+puma-client_000  | 2026-02-07T16:44:09 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_000  | 2026-02-07T16:44:09 | INFO | client.main: Waiting for model (Round 2)...
+puma-server      | 2026-02-07T16:44:12 | INFO | server.main: Received update from Client 0 (Round 1)
+puma-server      | 2026-02-07T16:44:12 | INFO | server.main: --- Round 1 Aggregation Phase ---
+puma-server      | 2026-02-07T16:44:12 | INFO | server.main: Round duration: 21.85s
+puma-server      | 2026-02-07T16:44:12 | INFO | server.main: --- Profiling Round Data (3 clients) ---
+puma-server      | 2026-02-07T16:44:12 | INFO | server.main: Profiled Client 1: bandwidth=2.21 MB/s, train=16.31s, samples=6711
+puma-server      | 2026-02-07T16:44:12 | INFO | server.main: Profiled Client 2: bandwidth=2.42 MB/s, train=16.89s, samples=11033
+puma-server      | 2026-02-07T16:44:12 | INFO | server.main: Profiled Client 0: bandwidth=3.19 MB/s, train=16.92s, samples=14469
+puma-server      | 2026-02-07T16:44:12 | INFO | server.strategies.puma: Aggregating 3 client updates...
+puma-server      | 2026-02-07T16:44:13 | INFO | server.strategies.puma: --- Round 1 Complete. Accuracy: 62.78%, Loss: 1.0362 ---
+puma-server      | 2026-02-07T16:44:13 | INFO | server.main: Triggering PUMA Adaptive Pruning...
+puma-server      | 2026-02-07T16:44:13 | INFO | server.strategies.puma: Client times - min: 16.31s, max: 16.92s
+puma-server      | 2026-02-07T16:44:13 | INFO | server.strategies.puma: Calculated pruning rate: 0.4329
+puma-server      | 2026-02-07T16:44:13 | INFO | server.strategies.puma: --- PRUNING START ---
+puma-server      | xau
+puma-server      | 2026-02-07T16:44:13 | INFO | server.strategies.puma: --- PRUNING COMPLETE. New model size: 0.71 MB ---
+puma-server      | 2026-02-07T16:44:13 | INFO | server.main: --- Starting Round 2 ---
+puma-client_002  | 2026-02-07T16:44:13 | INFO | client.main: Downloaded model for round 2: 187.5KB in 5.07s (37.0 KB/s)
+puma-client_002  | 2026-02-07T16:44:13 | INFO | client.main: --- Starting Round 2 ---
+puma-client_002  | 2026-02-07T16:44:13 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_002  | 2026-02-07T16:44:13 | INFO | client.main: Starting local training...
+puma-client_002  | 2026-02-07T16:44:13 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_000  | 2026-02-07T16:44:13 | INFO | client.main: Downloaded model for round 2: 187.4KB in 3.76s (49.9 KB/s)
+puma-client_000  | 2026-02-07T16:44:13 | INFO | client.main: --- Starting Round 2 ---
+puma-client_000  | 2026-02-07T16:44:13 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_001  | 2026-02-07T16:44:13 | INFO | client.main: Downloaded model for round 2: 187.4KB in 5.67s (33.0 KB/s)
+puma-client_001  | 2026-02-07T16:44:13 | INFO | client.main: --- Starting Round 2 ---
+puma-client_001  | 2026-02-07T16:44:13 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_002  | 2026-02-07T16:44:13 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_001  | 2026-02-07T16:44:13 | INFO | client.main: Starting local training...
+puma-client_001  | 2026-02-07T16:44:13 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_001  | 2026-02-07T16:44:13 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_000  | 2026-02-07T16:44:13 | INFO | client.main: Starting local training...
+puma-client_000  | 2026-02-07T16:44:13 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_000  | 2026-02-07T16:44:13 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_001  | Client: 1 	Std: 0.09710415226315457 	ALA epochs: 17
+puma-client_001  | 2026-02-07T16:44:27 | INFO | client.trainer: Training completed: 6711 samples in 14.23s
+puma-client_001  | 2026-02-07T16:44:27 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 410.61MB
+puma-client_001  | 2026-02-07T16:44:27 | INFO | client.main: Local training complete in 14.23s.
+puma-client_001  | 2026-02-07T16:44:27 | INFO | client.main: Submitting trained model update from 6711 samples...
+puma-client_001  | 2026-02-07T16:44:27 | INFO | client.main: Successfully submitted update in 19.91s
+puma-client_001  | 2026-02-07T16:44:27 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_001  | 2026-02-07T16:44:27 | INFO | client.main: Waiting for model (Round 3)...
+puma-server      | 2026-02-07T16:44:27 | INFO | server.main: Received update from Client 1 (Round 2)
+puma-client_002  | Client: 2 	Std: 0.08525639111074419 	ALA epochs: 14
+puma-client_002  | 2026-02-07T16:44:27 | INFO | client.trainer: Training completed: 11033 samples in 14.64s
+puma-client_002  | 2026-02-07T16:44:27 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 428.79MB
+puma-client_002  | 2026-02-07T16:44:27 | INFO | client.main: Local training complete in 14.64s.
+puma-client_002  | 2026-02-07T16:44:27 | INFO | client.main: Submitting trained model update from 11033 samples...
+puma-client_002  | 2026-02-07T16:44:27 | INFO | client.main: Successfully submitted update in 19.71s
+puma-client_002  | 2026-02-07T16:44:27 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_002  | 2026-02-07T16:44:27 | INFO | client.main: Waiting for model (Round 3)...
+puma-client_000  | Client: 0 	Std: 0.08900064737338226 	ALA epochs: 12
+puma-client_000  | 2026-02-07T16:44:27 | INFO | client.trainer: Training completed: 14469 samples in 14.78s
+puma-client_000  | 2026-02-07T16:44:27 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 452.89MB
+puma-client_000  | 2026-02-07T16:44:27 | INFO | client.main: Local training complete in 14.78s.
+puma-client_000  | 2026-02-07T16:44:27 | INFO | client.main: Submitting trained model update from 14469 samples...
+puma-client_000  | 2026-02-07T16:44:27 | INFO | client.main: Successfully submitted update in 18.54s
+puma-client_000  | 2026-02-07T16:44:27 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_000  | 2026-02-07T16:44:27 | INFO | client.main: Waiting for model (Round 3)...
+puma-server      | 2026-02-07T16:44:28 | INFO | server.main: Received update from Client 2 (Round 2)
+puma-server      | 2026-02-07T16:44:29 | INFO | server.main: Received update from Client 0 (Round 2)
+puma-server      | 2026-02-07T16:44:29 | INFO | server.main: --- Round 2 Aggregation Phase ---
+puma-server      | 2026-02-07T16:44:29 | INFO | server.main: Round duration: 16.39s
+puma-server      | 2026-02-07T16:44:29 | INFO | server.main: --- Profiling Round Data (3 clients) ---
+puma-server      | 2026-02-07T16:44:29 | INFO | server.main: Profiled Client 1: bandwidth=2.19 MB/s, train=14.23s, samples=6711
+puma-server      | 2026-02-07T16:44:29 | INFO | server.main: Profiled Client 2: bandwidth=2.44 MB/s, train=14.64s, samples=11033
+puma-server      | 2026-02-07T16:44:29 | INFO | server.main: Profiled Client 0: bandwidth=3.30 MB/s, train=14.78s, samples=14469
+puma-server      | 2026-02-07T16:44:29 | INFO | server.strategies.puma: Aggregating 3 client updates...
+puma-server      | 2026-02-07T16:44:29 | INFO | server.strategies.puma: --- Round 2 Complete. Accuracy: 44.87%, Loss: 1.5365 ---
+puma-server      | 2026-02-07T16:44:29 | INFO | server.main: --- Starting Round 3 ---
+puma-client_002  | 2026-02-07T16:44:29 | INFO | client.main: Downloaded model for round 3: 187.5KB in 2.12s (88.5 KB/s)
+puma-client_002  | 2026-02-07T16:44:29 | INFO | client.main: --- Starting Round 3 ---
+puma-client_002  | 2026-02-07T16:44:29 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_000  | 2026-02-07T16:44:29 | INFO | client.main: Downloaded model for round 3: 187.4KB in 1.95s (96.0 KB/s)
+puma-client_000  | 2026-02-07T16:44:29 | INFO | client.main: --- Starting Round 3 ---
+puma-client_000  | 2026-02-07T16:44:29 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_002  | 2026-02-07T16:44:29 | INFO | client.main: Starting local training...
+puma-client_002  | 2026-02-07T16:44:29 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_001  | 2026-02-07T16:44:29 | INFO | client.main: Downloaded model for round 3: 187.4KB in 2.47s (75.9 KB/s)
+puma-client_001  | 2026-02-07T16:44:29 | INFO | client.main: --- Starting Round 3 ---
+puma-client_001  | 2026-02-07T16:44:29 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_002  | 2026-02-07T16:44:29 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_001  | 2026-02-07T16:44:29 | INFO | client.main: Starting local training...
+puma-client_001  | 2026-02-07T16:44:29 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_001  | 2026-02-07T16:44:29 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_000  | 2026-02-07T16:44:29 | INFO | client.main: Starting local training...
+puma-client_000  | 2026-02-07T16:44:29 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_000  | 2026-02-07T16:44:29 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_001  | 2026-02-07T16:44:38 | INFO | client.trainer: Training completed: 6711 samples in 8.29s
+puma-client_001  | 2026-02-07T16:44:38 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 410.66MB
+puma-client_001  | 2026-02-07T16:44:38 | INFO | client.main: Local training complete in 8.29s.
+puma-client_001  | 2026-02-07T16:44:38 | INFO | client.main: Submitting trained model update from 6711 samples...
+puma-client_001  | 2026-02-07T16:44:38 | INFO | client.main: Successfully submitted update in 10.76s
+puma-client_001  | 2026-02-07T16:44:38 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_001  | 2026-02-07T16:44:38 | INFO | client.main: Waiting for model (Round 4)...
+puma-client_002  | 2026-02-07T16:44:38 | INFO | client.trainer: Training completed: 11033 samples in 8.56s
+puma-client_002  | 2026-02-07T16:44:38 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 428.86MB
+puma-client_002  | 2026-02-07T16:44:38 | INFO | client.main: Local training complete in 8.56s.
+puma-client_002  | 2026-02-07T16:44:38 | INFO | client.main: Submitting trained model update from 11033 samples...
+puma-client_002  | 2026-02-07T16:44:38 | INFO | client.main: Successfully submitted update in 10.67s
+puma-client_002  | 2026-02-07T16:44:38 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_002  | 2026-02-07T16:44:38 | INFO | client.main: Waiting for model (Round 4)...
+puma-client_000  | 2026-02-07T16:44:38 | INFO | client.trainer: Training completed: 14469 samples in 8.64s
+puma-client_000  | 2026-02-07T16:44:38 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 452.95MB
+puma-client_000  | 2026-02-07T16:44:38 | INFO | client.main: Local training complete in 8.64s.
+puma-client_000  | 2026-02-07T16:44:38 | INFO | client.main: Submitting trained model update from 14469 samples...
+puma-client_000  | 2026-02-07T16:44:38 | INFO | client.main: Successfully submitted update in 10.59s
+puma-client_000  | 2026-02-07T16:44:38 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_000  | 2026-02-07T16:44:38 | INFO | client.main: Waiting for model (Round 4)...
+puma-server      | 2026-02-07T16:44:38 | INFO | server.main: Received update from Client 1 (Round 3)
+puma-server      | 2026-02-07T16:44:38 | INFO | server.main: Received update from Client 2 (Round 3)
+puma-server      | 2026-02-07T16:44:40 | INFO | server.main: Received update from Client 0 (Round 3)
+puma-server      | 2026-02-07T16:44:40 | INFO | server.main: --- Round 3 Aggregation Phase ---
+puma-server      | 2026-02-07T16:44:40 | INFO | server.main: Round duration: 10.25s
+puma-server      | 2026-02-07T16:44:40 | INFO | server.main: --- Profiling Round Data (3 clients) ---
+puma-server      | 2026-02-07T16:44:40 | INFO | server.main: Profiled Client 1: bandwidth=5.02 MB/s, train=8.29s, samples=6711
+puma-server      | 2026-02-07T16:44:40 | INFO | server.main: Profiled Client 2: bandwidth=5.86 MB/s, train=8.56s, samples=11033
+puma-server      | 2026-02-07T16:44:40 | INFO | server.main: Profiled Client 0: bandwidth=6.35 MB/s, train=8.64s, samples=14469
+puma-server      | 2026-02-07T16:44:40 | INFO | server.strategies.puma: Aggregating 3 client updates...
+puma-server      | 2026-02-07T16:44:40 | INFO | server.strategies.puma: --- Round 3 Complete. Accuracy: 74.01%, Loss: 0.7981 ---
+puma-server      | 2026-02-07T16:44:40 | INFO | server.main: --- Starting Round 4 ---
+puma-client_000  | 2026-02-07T16:44:40 | INFO | client.main: Downloaded model for round 4: 187.4KB in 1.95s (95.9 KB/s)
+puma-client_000  | 2026-02-07T16:44:40 | INFO | client.main: --- Starting Round 4 ---
+puma-client_000  | 2026-02-07T16:44:40 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_002  | 2026-02-07T16:44:40 | INFO | client.main: Downloaded model for round 4: 187.5KB in 2.07s (90.7 KB/s)
+puma-client_002  | 2026-02-07T16:44:40 | INFO | client.main: --- Starting Round 4 ---
+puma-client_002  | 2026-02-07T16:44:40 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_001  | 2026-02-07T16:44:40 | INFO | client.main: Downloaded model for round 4: 187.4KB in 2.27s (82.7 KB/s)
+puma-client_001  | 2026-02-07T16:44:40 | INFO | client.main: --- Starting Round 4 ---
+puma-client_001  | 2026-02-07T16:44:40 | INFO | client.main: Received PRUNED model (ratio=0.43)
+puma-client_000  | 2026-02-07T16:44:40 | INFO | client.main: Starting local training...
+puma-client_000  | 2026-02-07T16:44:40 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_000  | 2026-02-07T16:44:40 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_002  | 2026-02-07T16:44:40 | INFO | client.main: Starting local training...
+puma-client_002  | 2026-02-07T16:44:40 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_002  | 2026-02-07T16:44:40 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_001  | 2026-02-07T16:44:40 | INFO | client.main: Starting local training...
+puma-client_001  | 2026-02-07T16:44:40 | INFO | client.trainer: Adapting local model architecture to match Global Pruned Model...
+puma-client_001  | 2026-02-07T16:44:40 | INFO | client.trainer: Training PRUNED model with PUMA+FedALA on cpu
+puma-client_001  | 2026-02-07T16:44:54 | INFO | client.trainer: Training completed: 6711 samples in 13.64s
+puma-client_001  | 2026-02-07T16:44:54 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 410.67MB
+puma-client_001  | 2026-02-07T16:44:54 | INFO | client.main: Local training complete in 13.64s.
+puma-client_001  | 2026-02-07T16:44:54 | INFO | client.main: Submitting trained model update from 6711 samples...
+puma-client_001  | 2026-02-07T16:44:54 | INFO | client.main: Successfully submitted update in 15.91s
+puma-client_001  | 2026-02-07T16:44:54 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_001  | 2026-02-07T16:44:54 | INFO | client.main: Waiting for model (Round 5)...
+puma-server      | 2026-02-07T16:44:54 | INFO | server.main: Received update from Client 1 (Round 4)
+puma-client_002  | 2026-02-07T16:44:54 | INFO | client.trainer: Training completed: 11033 samples in 14.07s
+puma-client_002  | 2026-02-07T16:44:54 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 428.87MB
+puma-client_002  | 2026-02-07T16:44:54 | INFO | client.main: Local training complete in 14.08s.
+puma-client_002  | 2026-02-07T16:44:54 | INFO | client.main: Submitting trained model update from 11033 samples...
+puma-client_002  | 2026-02-07T16:44:54 | INFO | client.main: Successfully submitted update in 16.14s
+puma-client_002  | 2026-02-07T16:44:54 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_002  | 2026-02-07T16:44:54 | INFO | client.main: Waiting for model (Round 5)...
+puma-client_000  | 2026-02-07T16:44:54 | INFO | client.trainer: Training completed: 14469 samples in 14.16s
+puma-client_000  | 2026-02-07T16:44:54 | INFO | client.trainer: Resource usage - GPU: 0.00MB, RAM: 452.95MB
+puma-client_000  | 2026-02-07T16:44:54 | INFO | client.main: Local training complete in 14.16s.
+puma-client_000  | 2026-02-07T16:44:54 | INFO | client.main: Submitting trained model update from 14469 samples...
+puma-client_000  | 2026-02-07T16:44:54 | INFO | client.main: Successfully submitted update in 16.11s
+puma-client_000  | 2026-02-07T16:44:54 | INFO | client.main: Update submitted. Waiting for next round...
+puma-client_000  | 2026-02-07T16:44:54 | INFO | client.main: Waiting for model (Round 5)...
+puma-server      | 2026-02-07T16:44:54 | INFO | server.main: Received update from Client 2 (Round 4)
+puma-server      | 2026-02-07T16:44:56 | INFO | server.main: Received update from Client 0 (Round 4)
+puma-server      | 2026-02-07T16:44:56 | INFO | server.main: --- Round 4 Aggregation Phase ---
+puma-server      | 2026-02-07T16:44:56 | INFO | server.main: Round duration: 15.74s
+puma-server      | 2026-02-07T16:44:56 | INFO | server.main: --- Profiling Round Data (3 clients) ---
+puma-client_002  | 2026-02-07T16:44:56 | ERROR | client.main: Received None payload. Server might have closed connection.
+puma-server      | 2026-02-07T16:44:56 | INFO | server.main: Profiled Client 1: bandwidth=5.47 MB/s, train=13.64s, samples=6711
+puma-server      | 2026-02-07T16:44:56 | INFO | server.main: Profiled Client 2: bandwidth=6.00 MB/s, train=14.08s, samples=11033
+puma-server      | 2026-02-07T16:44:56 | INFO | server.main: Profiled Client 0: bandwidth=6.35 MB/s, train=14.16s, samples=14469
+puma-client_001  | 2026-02-07T16:44:56 | ERROR | client.main: Received None payload. Server might have closed connection.
+puma-client_002  | 2026-02-07T16:44:56 | INFO | client.main: Connection closed.
+puma-server      | 2026-02-07T16:44:56 | INFO | server.strategies.puma: Aggregating 3 client updates...
+puma-client_000  | 2026-02-07T16:44:56 | ERROR | client.main: Received None payload. Server might have closed connection.
+puma-client_000  | 2026-02-07T16:44:56 | INFO | client.main: Connection closed.
+puma-client_001  | 2026-02-07T16:44:56 | INFO | client.main: Connection closed.
+[Kpuma-client_001 exited with code 0
+ Compose Stopping Aborting on container exit...
+ Container puma-client_001 Stopping 
+ Container puma-client_000 Stopping 
+ Container puma-client_002 Stopping 
+ Container puma-client_001 Stopped 
+puma-server      | 2026-02-07T16:44:56 | INFO | server.strategies.puma: --- Round 4 Complete. Accuracy: 80.02%, Loss: 0.6490 ---
+puma-server      | 2026-02-07T16:44:56 | INFO | server.main: --- Training Complete. Sending shutdown signal... ---
+ Container puma-client_000 Stopped 
+[Kpuma-client_000 exited with code 0
+ Container puma-client_002 Stopped 
+ Container puma-server Stopping 
+[Kpuma-client_002 exited with code 0
+ Container puma-server Stopped 
+[Kpuma-server exited with code 0

@@ -11,7 +11,6 @@ services:
     hostname: server
     ports:
       - "9000:9000"
-    # Mount logs so you can see them on your host machine
     volumes:
       - ./fl_logs:/app/fl_logs
     command: python -m src.system.server --port 9000 --clients-per-round 3 --dataset MNIST
@@ -23,6 +22,13 @@ services:
     container_name: puma-client_000
     depends_on:
       - server
+    # --- NEW: Grant Network Administration capabilities ---
+    cap_add:
+      - NET_ADMIN
+    # --- NEW: Pass Bandwidth Limit as Environment Variable ---
+    environment:
+      - BANDWIDTH=1mbit
+      - NETWORK_LABEL=Straggler 
     command: python -m src.system.client --host server --port 9000 --client-idx 0 --dataset MNIST
     networks:
       - puma_default
@@ -31,6 +37,13 @@ services:
     container_name: puma-client_001
     depends_on:
       - server
+    # --- NEW: Grant Network Administration capabilities ---
+    cap_add:
+      - NET_ADMIN
+    # --- NEW: Pass Bandwidth Limit as Environment Variable ---
+    environment:
+      - BANDWIDTH=5mbit
+      - NETWORK_LABEL=Low Speed 
     command: python -m src.system.client --host server --port 9000 --client-idx 1 --dataset MNIST
     networks:
       - puma_default
@@ -39,6 +52,13 @@ services:
     container_name: puma-client_002
     depends_on:
       - server
+    # --- NEW: Grant Network Administration capabilities ---
+    cap_add:
+      - NET_ADMIN
+    # --- NEW: Pass Bandwidth Limit as Environment Variable ---
+    environment:
+      - BANDWIDTH=5mbit
+      - NETWORK_LABEL=Low Speed 
     command: python -m src.system.client --host server --port 9000 --client-idx 2 --dataset MNIST
     networks:
       - puma_default

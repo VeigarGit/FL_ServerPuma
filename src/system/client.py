@@ -6,6 +6,7 @@ import torch
 import os
 import struct
 import pickle
+import subprocess 
 
 # Import internal modules
 from ..utils.network_utils import send_data, recv_data
@@ -15,6 +16,37 @@ from .trainer import Trainer
 
 # Initialize logger
 logger = setup_logger("client.main")
+
+def apply_network_rules():
+    """
+    Applies Linux Traffic Control (tc) rules to limit bandwidth
+    based on environment variables.
+    """
+    bw = os.environ.get('BANDWIDTH')
+    label = os.environ.get('NETWORK_LABEL', 'Custom')
+    
+    if bw:
+        try:
+            logger.info(f"--- Applying Network Limit: {bw} ({label}) ---")
+            # Clear existing rules (ignore error if none exist)
+            subprocess.run("tc qdisc del dev eth0 root", shell=True, stderr=subprocess.DEVNULL)
+            
+            # Apply TBF (Token Bucket Filter)
+            # rate: bandwidth
+            # burst: buffer size (crucial for TCP, usually 10-32k for low speeds)
+            # latency: max queue time before drop (400ms is generous for cellular)
+            cmd = f"tc qdisc add dev eth0 root tbf rate {bw} burst 32kbit latency 400ms"
+            
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                logger.info(f"Successfully limited outgoing bandwidth to {bw}")
+            else:
+                logger.error(f"Failed to apply network rule: {result.stderr}")
+        except Exception as e:
+            logger.error(f"Error applying network rules: {e}")
+    else:
+        logger.info("No bandwidth limit set (running at full speed).")
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Client')
@@ -35,6 +67,8 @@ def parse_args():
 def main():
     args = parse_args()
     
+    apply_network_rules()
+    
     # Setup Device
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -44,15 +78,15 @@ def main():
     logger.info(f"--- Starting FL Client {args.client_idx} ---")
     logger.info(f"Target Server: {args.host}:{args.port}")
 
-    # 1. Initialize Trainer (The Logic Layer)
+    # 1. Initialize Trainer
     try:
         trainer = Trainer(args, args.client_idx)
         logger.info(f"Algorithm PUMA+FedALA initialized.")
     except Exception as e:
         logger.error(f"Failed to initialize trainer: {e}")
         sys.exit(1)
-
-    # 2. Connection Loop (Retry Logic)
+        
+    # Connection Loop
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     connected = False
     while not connected:
@@ -60,14 +94,9 @@ def main():
             sock.connect((args.host, args.port))
             connected = True
             logger.info(f"Connected to server {args.host}:{args.port}")
-            
-            # Handshake: Send Client ID
             send_data(sock, args.client_idx)
-            
-            # Receive Server Status (Handshake confirmation)
             server_status = recv_data(sock)
             logger.info(f"Successfully registered. Server status: {server_status}")
-            
         except ConnectionRefusedError:
             logger.warning("Connection refused. Retrying in 5s...")
             time.sleep(5)
@@ -75,7 +104,7 @@ def main():
             logger.error(f"Connection failed: {e}")
             sys.exit(1)
 
-    # 3. Main Communication Loop
+    # Main Communication Loop
     try:
         round_num = 0
         while True:
@@ -83,9 +112,6 @@ def main():
             
             # --- RECEIVE PHASE ---
             start_download = time.time()
-            
-            # Protocol: Receive (Quantized Model, Prune Rate)
-            # Expect the server to send a tuple or list: [state_dict, prune_rate]
             payload = recv_data(sock)
             
             if payload == 'shutdown':
@@ -108,13 +134,11 @@ def main():
             if prune_rate > 0:
                 logger.info(f"Received PRUNED model (ratio={prune_rate:.2f})")
 
-            # Dequantize before using
+            # Dequantize
             global_model_state = dequantization(global_model_quant)
 
             # --- TRAINING PHASE ---
             logger.info("Starting local training...")
-            
-            # Measure strictly training time
             train_start = time.time()
             
             local_state, num_samples = trainer.train(
@@ -129,11 +153,8 @@ def main():
 
             # --- SEND PHASE ---
             logger.info(f"Submitting trained model update from {num_samples} samples...")
-            
-            # Quantize
             quantized_local_state = quantization(local_state)
             
-            # Prepare Metrics Payload (Profiling)
             metrics = {
                 'samples': num_samples,
                 'training_time': train_time,
@@ -142,11 +163,9 @@ def main():
             }
             
             upload_start = time.time()
-            
-            # Protocol: Send (Quantized Model, Metrics)
             send_data(sock, (quantized_local_state, metrics))
-            
             upload_time = time.time() - upload_start
+            
             logger.info(f"Successfully submitted update in {upload_time + train_time + download_time:.2f}s")
             logger.info("Update submitted. Waiting for next round...")
             
