@@ -21,9 +21,12 @@ services:
   client-0:
     <<: *client
     container_name: fl-client-0
+    volumes:
+      # Mapeia um diretório do host para dentro do container
+      - ./dados_compartilhados:/app/dados_compartilhados
 
     # --- MODIFIED COMMAND ---
-    command: ["python", "-m", "src.system.client", "--client-idx", "0", "--host", "10.0.23.189", "--dataset", "MNIST"]
+    command: ["python", "-m", "src.system.client", "--client-idx", "0", "--host", "10.0.23.189", "--dataset", "MNIST", "--ala", "0"]
 networks:
   docker-tc:
     driver: bridge

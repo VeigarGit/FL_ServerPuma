@@ -16,6 +16,7 @@ ENV PATH /opt/conda/envs/pfllib/bin:$PATH
 WORKDIR /app
 COPY . .
 
+RUN mkdir -p /app/dados_compartilhados
 # Específico para cada serviço
 WORKDIR /app
 # O CMD fica diferente para server/client
