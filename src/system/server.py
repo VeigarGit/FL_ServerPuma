@@ -20,6 +20,8 @@ import builtins
 from synexp import LayerComplexityCalculator
 import numpy as np
 import random
+from prunning_nisp import prune_fc1
+from prunning_snip import snip_pruning, apply_mask
 
 def print(*args, **kwargs):
     builtins.print(*args, **kwargs, flush=True)
@@ -598,11 +600,31 @@ class FederatedLearningServer:
                     max_amount = self.clients_info[client_id]['pruning_rate']
                 
                 self.clients_info[client_id]['original_model_size'] = sys.getsizeof(pickle.dumps(self.global_model))/ (1024 * 1024)
-                #max_amount = 0.9
+                #max_amount = 0.0 m
                 print(f"--- SERVER: Calculated pruning rate: {max_amount:.4f}")
                 g_model_pruned = copy.deepcopy(self.global_model)
-                
-                g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=max_amount, size_fc=self.size_fc, data=self.args.dataset)
+                mask = None
+                if self.args.pm == 'OPALA':
+                    g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=max_amount, size_fc=self.size_fc, data=self.args.dataset)
+                elif self.args.pm == 'NISP':
+                    trainloader = self.load_test_data("Cifar10", client_id, 32)
+                    
+                    g_model_pruned, _ = prune_fc1(model=g_model_pruned, 
+                                                       dataloader=trainloader, 
+                                                       pruning_ratio=max_amount,
+                                                       device=self.args.device)
+                    g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=0.0, size_fc=self.size_fc, data=self.args.dataset)
+                elif self.args.pm == 'SNIP':
+                    trainloader = self.load_test_data("Cifar10", client_id, 32)
+                    
+                    self.mask = snip_pruning(model=g_model_pruned, 
+                                                  dataloader=trainloader,
+                                                  criterion=nn.CrossEntropyLoss(), 
+                                                  pruning_ratio=max_amount,
+                                                  device=self.args.device)
+                    g_model_pruned = apply_mask(g_model_pruned, self.mask)
+                    g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=0.0, size_fc=self.size_fc, data=self.args.dataset)
+                    #mask = self.mask
                 self.masks.append(mask)
                 
                 # Armazenar máscara para este cliente para usar na agregação
@@ -728,7 +750,8 @@ class FederatedLearningServer:
                 ammount = 0.85
             return ammount
     
-    def save_results(self):
+    def save_results(self, i):
+        i =str(i)
         if self.args.prune == 0:
             a = "prune"
         else:
@@ -738,7 +761,7 @@ class FederatedLearningServer:
             b = "FedALA"
         else:
             b = "FedAVG"
-        algo = self.args.dataset + "_" + a + "_" + b
+        algo = self.args.dataset + "_" + a + "_" + b + "_" + i
         result_path = "../results/"
         if not os.path.exists(result_path):
             os.makedirs(result_path)
@@ -752,7 +775,7 @@ class FederatedLearningServer:
             hf.create_dataset('Round_time', data=self.round_time)
     
     
-    def run_server(self):
+    def run_server(self, times):
         print("=== Federated Learning Server ===")
         print(f"Host: {self.args.host}:{self.args.port}")
         print(f"Dataset: {self.args.dataset}")
@@ -879,13 +902,13 @@ class FederatedLearningServer:
                 except:
                     pass
             print("All client connections closed.")
-        self.save_results()
+        self.save_results(times)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Server')
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=9000)
-    parser.add_argument('--clients-per-round', type=int, default=3)
+    parser.add_argument('--clients-per-round', type=int, default=8)
     parser.add_argument('--rounds', type=int, default=25)
     parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
     parser.add_argument('--test-client-idx', type=int, default=0)
@@ -896,6 +919,7 @@ def parse_args():
     parser.add_argument('--max-clients', type=int, default=10)
     parser.add_argument('--prune', type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     return parser.parse_args()
 
@@ -906,8 +930,9 @@ def main():
         print("\ncuda is not avaiable.\n")
         args.device = "cpu"
     device = torch.device(args.device)
-    server = FederatedLearningServer(args)
-    server.run_server()
+    for i in range(0, 11):
+        server = FederatedLearningServer(args)
+        server.run_server(i)
 
 if __name__ == '__main__':
     main()
