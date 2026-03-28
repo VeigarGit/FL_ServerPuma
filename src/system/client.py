@@ -5,20 +5,31 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from .data_utils import read_client_data
 import argparse
 import sys
 import copy
 import time
 import os
 import h5py
-from .prunning import prune_and_restructure
-from .ALA import ALA
-from .model import SimpleModel
 import builtins
+from pathlib import Path
 
-from ..utils.network_utils import send_data, recv_data, recvall
-from ..utils.model_utils import quantization, dequantization
+# --- HACK PERMITIDO: Inserindo a pasta 'src' no path do Python ---
+current_dir = Path(__file__).resolve().parent
+parent_dir = current_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.append(str(parent_dir))
+# -----------------------------------------------------------------
+
+# Importações absolutas restabelecidas:
+from data_utils import read_client_data
+from prunning import prune_and_restructure
+from ALA import ALA
+from model import SimpleModel
+
+# ---> A LINHA QUE FALTOU ESTÁ AQUI <---
+from utils.network_utils import send_data, recv_data, recvall
+from utils.model_utils import quantization, dequantization
 
 def print(*args, **kwargs):
     builtins.print(*args, **kwargs, flush=True)
@@ -91,7 +102,12 @@ def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, r
     optimizer = optim.SGD(model.parameters(), lr=learning_rate)
     loss_fn = nn.CrossEntropyLoss()
     
+    device = next(model.parameters()).device
+    
     for x, y in train_loader:
+        # ---> INJETE ESTA LINHA:
+        x, y = x.to(device), y.to(device)
+        
         optimizer.zero_grad()
         output = model(x)
         loss = loss_fn(output, y)
@@ -100,25 +116,27 @@ def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, r
     
     return model.state_dict()
 
-def evaluate_model(model, data_loader):
-    model.eval()
-    correct = 0
-    total = 0
-    loss_fn = nn.CrossEntropyLoss()
-    total_loss = 0.0
+def evaluate_model(model, data_loader): # (Em client.py e server.py)
+        model.eval()
+        correct = 0
+        total = 0
+        loss_fn = nn.CrossEntropyLoss()
+        total_loss = 0.0
+        device = next(model.parameters()).device
+        with torch.no_grad():
+            for x, y in data_loader:
+                x, y = x.to(device), y.to(device)
+                
+                output = model(x)
+                loss = loss_fn(output, y)
+                total_loss += loss.item()
+                _, predicted = torch.max(output, 1)
+                total += y.size(0)
+                correct += (predicted == y).sum().item()
 
-    with torch.no_grad():
-        for x, y in data_loader:
-            output = model(x)
-            loss = loss_fn(output, y)
-            total_loss += loss.item()
-            _, predicted = torch.max(output, 1)
-            total += y.size(0)
-            correct += (predicted == y).sum().item()
-
-    accuracy = 100 * correct / total
-    average_loss = total_loss / len(data_loader)
-    return accuracy, average_loss
+        accuracy = 100 * correct / total
+        average_loss = total_loss / len(data_loader)
+        return accuracy, average_loss
 
 def load_data(dataset, client_idx, is_train=True, batch_size=32):
     train_data = read_client_data(dataset, client_idx, is_train)
@@ -133,17 +151,17 @@ def set_parameters(model, state_new):
         old_param.data = new_param.data.clone()
 
 def save_results(args, rs_test_acc, rs_test_loss, idx=0, argalgo=0):
-    b = argalgo
-    if b == 0:
-        b = "FedALA"
-    else:
-        b = "FedAVG"
-    algo = args.dataset + "_" + b + "_client_" + str(idx)
-    result_path = "dados_compartilhados/"
-    if not os.path.exists(result_path):
-        os.makedirs(result_path)
-    file_path = result_path + "{}.h5".format(algo)
+    b = "FedALA" if argalgo == 0 else "FedAVG"
+    algo = f"{args.dataset}_{b}_client_{idx}"
+    
+    # Usando pathlib para ancorar a pasta
+    current_dir = Path(__file__).resolve().parent
+    result_path = current_dir / "dados_compartilhados"
+    result_path.mkdir(parents=True, exist_ok=True)
+    
+    file_path = result_path / f"{algo}.h5"
     print(file_path)
+    
     with h5py.File(file_path, 'w') as hf:
         hf.create_dataset('rs_test_acc', data=rs_test_acc)
         hf.create_dataset('rs_train_loss', data=rs_test_loss)
@@ -152,7 +170,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Federated Learning Client')
     parser.add_argument('--host', type=str, default='localhost')
     parser.add_argument('--port', type=int, default=9000)
-    parser.add_argument('--rounds', type=int, default=3)
+    parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar100', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
     parser.add_argument('--client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
@@ -227,6 +245,7 @@ def main():
         model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
     if args.dataset =='Cifar100':
         model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
+    model = model.to(args.device)
     
     loss = nn.CrossEntropyLoss()
     acc=[]
@@ -256,16 +275,19 @@ def main():
             
             global_state = recv_data(s)
             prune = recv_data(s)
-            if round_num+1 >=2 and prune ==0 :
-                ammount = recv_data(s)
-            #    print(f"Client {args.client_idx}: Received pruning rate {ammount:.4f}. Pruning local model...")
-            #    local_model, _ = prune_and_restructure(model=model, pruning_rate=ammount, size_fc=25, data=args.dataset)
-            #    
-            #    set_parameters(model, local_model)
+            
             if global_state is None:
                 print("Failed to receive global model. Connection may be closed.")
                 break
+                
             print("Received global model.")
+            
+            # ---> A CORREÇÃO ESTÁ AQUI: Desquantiza o modelo imediatamente! <---
+            global_state = dequantization(global_state)
+            
+            if round_num+1 >=2 and prune ==0 :
+                ammount = recv_data(s)
+            
             if round_num+1 >=2:
                 local = resize_model_to_pruned(model, global_state)
                 test_accuracy, test_loss = evaluate_model(local, test_loader)

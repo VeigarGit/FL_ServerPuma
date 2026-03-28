@@ -1,9 +1,7 @@
 import os
 import argparse
 
-def generate_docker_compose(num_clients, dataset):
-    # The client template is defined *outside* the 'services' block
-    # It starts with 'x-' so docker-compose ignores it as a service
+def generate_docker_compose(num_clients, dataset, rounds, prune, ala):
     template = f"""
 x-client-template: &client
   build:
@@ -12,17 +10,28 @@ x-client-template: &client
     args:
       - NO_CACHE=true
   image: fl-client-image
-  restart: 'no' # <-- ADD THIS LINE
+  restart: 'no'
+  working_dir: /app/src/system
   environment: 
     - PYTHONUNBUFFERED=1
+    - PYTHONPATH=/app/src/system:/app/src
+  volumes:
+    - ./src/dataset:/app/src/dataset
+    - ./src/results:/app/src/results
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
   depends_on:
     - server
   networks:
     - docker-tc
-  # Adicionando labels para o docker-tc nos clientes
   labels:
     - "com.docker-tc.enabled=1"
-    - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
+    - "com.docker-tc.loss=10%"
 
 services:
   server:
@@ -32,28 +41,38 @@ services:
       args:
         - NO_CACHE=true
     container_name: fl-server
-    restart: 'no' # <-- ADD THIS LINE
+    restart: 'no'
+    working_dir: /app/src/system
     environment: 
       - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src/system:/app/src
+    volumes:
+      - ./src/dataset:/app/src/dataset
+      - ./src/results:/app/src/results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
       - "9090:9090"
-    command: ["python", "-m", "src.system.server", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}"]
+    command: ["python", "server.py", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}", "--rounds", "{rounds}", "--prune", "{prune}"]
     networks:
       - docker-tc
-    # Adicionando labels para o docker-tc no servidor
     labels:
       - "com.docker-tc.enabled=1"
-      - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
-      - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
+      - "com.docker-tc.limit=1mbit"
+      - "com.docker-tc.delay=100ms"
 """
 
-    # Adicionar clients dinamicamente
     for i in range(0, num_clients):
         template += f"""
   client-{i}:
     <<: *client
     container_name: fl-client-{i}
-    command: ["python", "-m", "src.system.client", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "{dataset}"]
+    command: ["python", "client.py", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "{dataset}", "--rounds", "{rounds}", "--ala", "{ala}"]
 """
 
     template += """
@@ -65,25 +84,15 @@ networks:
     with open('docker-compose.generated.yml', 'w') as f:
         f.write(template)
     
-    print(f"Generated docker-compose.generated.yml with {num_clients} clients for {dataset} dataset")
+    print(f"Gerado docker-compose com {num_clients} clientes | Dataset: {dataset} | Rounds: {rounds} | Prune: {prune} | ALA: {ala}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate Docker Compose file for Federated Learning')
-    
-    parser.add_argument(
-        '--clients', 
-        type=int, 
-        default=3, 
-        help='Number of clients to create (default: 3)'
-    )
-    parser.add_argument(
-        '--dataset', 
-        type=str, 
-        default='MNIST', 
-        choices=['MNIST', 'Cifar10', 'Cifar100'], 
-        help='Dataset to use (default: MNIST)'
-    )
+    parser.add_argument('--clients', type=int, default=3, help='Number of clients')
+    parser.add_argument('--dataset', type=str, default='Cifar100', choices=['MNIST', 'Cifar10', 'Cifar100'])
+    parser.add_argument('--rounds', type=int, default=5, help='Number of training rounds')
+    parser.add_argument('--prune', type=int, default=0, help='Enable Adaptive Pruning (1 = On, 0 = Off)')
+    parser.add_argument('--ala', type=int, default=0, help='Enable FedALA (0 = On, 1 = Off/FedAvg)')
     
     args = parser.parse_args()
-    
-    generate_docker_compose(args.clients, args.dataset)
+    generate_docker_compose(args.clients, args.dataset, args.rounds, args.prune, args.ala)

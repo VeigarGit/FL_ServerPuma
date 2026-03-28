@@ -1,6 +1,8 @@
 #!/bin/bash
 
-# Valores padrão
+# ==========================================
+# 1. Definição de Valores Padrão
+# ==========================================
 CLIENT_COUNT=2
 HOST="localhost"
 PORT=9000
@@ -14,115 +16,52 @@ DIM=1600
 BATCH_SIZE=32
 MAX_CLIENTS=10
 PRUNE=0
+ALA=0             # <-- NOVO: 0 = FedALA ligado, 1 = FedAvg (Desligado)
 DEVICE="cuda"
 DEVICE_ID="0"
 
-# Processar argumentos
+# ==========================================
+# 2. Processamento de Argumentos
+# ==========================================
 while [ $# -gt 0 ]; do
     case $1 in
-        -c|--clients)
-            CLIENT_COUNT="$2"
-            shift
-            shift
-            ;;
-        -h|--host)
-            HOST="$2"
-            shift
-            shift
-            ;;
-        -p|--port)
-            PORT="$2"
-            shift
-            shift
-            ;;
-        -d|--dataset)
-            DATASET="$2"
-            shift
-            shift
-            ;;
-        -s|--session)
-            SESSION_NAME="$2"
-            shift
-            shift
-            ;;
-        -r|--rounds)
-            ROUNDS="$2"
-            shift
-            shift
-            ;;
-        -t|--test-client-idx)
-            TEST_CLIENT_IDX="$2"
-            shift
-            shift
-            ;;
-        --in-features)
-            IN_FEATURES="$2"
-            shift
-            shift
-            ;;
-        --num-classes)
-            NUM_CLASSES="$2"
-            shift
-            shift
-            ;;
-        --dim)
-            DIM="$2"
-            shift
-            shift
-            ;;
-        --batch-size)
-            BATCH_SIZE="$2"
-            shift
-            shift
-            ;;
-        --max-clients)
-            MAX_CLIENTS="$2"
-            shift
-            shift
-            ;;
-        --prune)
-            PRUNE="$2"
-            shift
-            shift
-            ;;
-        --device)
-            DEVICE="$2"
-            shift
-            shift
-            ;;
-        --device-id)
-            DEVICE_ID="$2"
-            shift
-            shift
-            ;;
-        *)
-            echo "Argumento desconhecido: $1"
-            exit 1
-            ;;
+        -c|--clients) CLIENT_COUNT="$2"; shift 2 ;;
+        -h|--host) HOST="$2"; shift 2 ;;
+        -p|--port) PORT="$2"; shift 2 ;;
+        -d|--dataset) DATASET="$2"; shift 2 ;;
+        -s|--session) SESSION_NAME="$2"; shift 2 ;;
+        -r|--rounds) ROUNDS="$2"; shift 2 ;;
+        -t|--test-client-idx) TEST_CLIENT_IDX="$2"; shift 2 ;;
+        --in-features) IN_FEATURES="$2"; shift 2 ;;
+        --num-classes) NUM_CLASSES="$2"; shift 2 ;;
+        --dim) DIM="$2"; shift 2 ;;
+        --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+        --max-clients) MAX_CLIENTS="$2"; shift 2 ;;
+        --prune) PRUNE="$2"; shift 2 ;;
+        --ala) ALA="$2"; shift 2 ;;  # <-- NOVO: Lê o parâmetro --ala
+        --device) DEVICE="$2"; shift 2 ;;
+        --device-id) DEVICE_ID="$2"; shift 2 ;;
+        *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
 done
 
-echo "Configuração:"
-echo "  Clientes: $CLIENT_COUNT"
-echo "  Host: $HOST"
-echo "  Porta: $PORT"
-echo "  Dataset: $DATASET"
-echo "  Rodadas: $ROUNDS"
-echo "  Índice Cliente Teste: $TEST_CLIENT_IDX"
-echo "  In Features: $IN_FEATURES"
-echo "  Num Classes: $NUM_CLASSES"
-echo "  Dim: $DIM"
-echo "  Batch Size: $BATCH_SIZE"
-echo "  Max Clientes: $MAX_CLIENTS"
-echo "  Prune: $PRUNE"
-echo "  Device: $DEVICE"
-echo "  Device ID: $DEVICE_ID"
+# ==========================================
+# 3. Exibir Configuração
+# ==========================================
+echo "===================================="
+echo "⚙️ Configuração do Treinamento:"
+echo "===================================="
+echo "  Clientes: $CLIENT_COUNT | Rodadas: $ROUNDS"
+echo "  Dataset: $DATASET | Prune: $PRUNE"
+echo "  ALA (0=FedALA, 1=FedAvg): $ALA"
+echo "  Device: $DEVICE ($DEVICE_ID)"
 echo "  Sessão TMUX: $SESSION_NAME"
+echo "===================================="
 
-# Mudar para diretório do dataset
+# ==========================================
+# 4. Preparação do Dataset
+# ==========================================
 cd ../dataset || exit 1
-
-# Gerar dataset baseado no argumento
 if [ "$DATASET" = "Cifar100" ]; then
     python generate_Cifar100.py noniid - dir
 elif [ "$DATASET" = "Cifar10" ]; then
@@ -130,26 +69,34 @@ elif [ "$DATASET" = "Cifar10" ]; then
 elif [ "$DATASET" = "MNIST" ]; then
     python generate_MNIST.py noniid - dir
 else
-    echo "Dataset não reconhecido: $DATASET"
-    exit 1
+    echo "❌ Dataset não reconhecido: $DATASET"; exit 1
 fi
 
-# Voltar para system
 cd ../system || exit 1
 
-# Criar sessão tmux com servidor e todos os parâmetros
-tmux new-session -d -s "$SESSION_NAME" "python server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID"
+# ==========================================
+# 5. Inicialização do Servidor (com ; read)
+# ==========================================
+tmux new-session -d -s "$SESSION_NAME" "python server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID ; echo 'Servidor Finalizado! Pressione ENTER para sair...'; read"
 
 sleep 2
 
-# Criar panes para clientes
+# ==========================================
+# 6. Inicialização dos Clientes (com argumentos e ; read)
+# ==========================================
 for i in $(seq 0 $((CLIENT_COUNT-1))); do
+    # Montamos o comando do cliente com todos os parâmetros necessários
+    CLIENT_CMD="python client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $DEVICE_ID ; read"
+    
     if [ $((i % 3)) -eq 0 ]; then
-        tmux split-window -h "python client.py --client-idx $i --host $HOST --dataset $DATASET --rounds $ROUNDS"
+        tmux split-window -h "$CLIENT_CMD"
     else
-        tmux split-window -v "python client.py --client-idx $i --host $HOST --dataset $DATASET --rounds $ROUNDS"
+        tmux split-window -v "$CLIENT_CMD"
     fi
 done
 
-# Anexar à sessão
+# ==========================================
+# 7. Organização Final
+# ==========================================
+tmux select-layout -t "$SESSION_NAME" tiled
 tmux attach-session -t "$SESSION_NAME"

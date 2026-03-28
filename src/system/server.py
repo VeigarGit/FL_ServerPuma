@@ -40,6 +40,7 @@ class FederatedLearningServer:
             self.input_size = (1, 3, 32, 32)
         
 
+        self.global_model = self.global_model.to(args.device)
         self.rs_test_acc = []
         self.rs_test_loss = []
         self.global_state = self.global_model.state_dict()
@@ -110,7 +111,7 @@ class FederatedLearningServer:
                     
                     # Verificar compatibilidade
                     if self._are_compatible_with_pruning(local_val, global_val, key):
-                        # Converter para numpy para consistência
+                        # Converter o LOCAL para numpy para consistência
                         if isinstance(local_val, torch.Tensor):
                             local_np = local_val.detach().cpu().numpy()
                         elif isinstance(local_val, np.ndarray):
@@ -118,9 +119,19 @@ class FederatedLearningServer:
                         else:
                             local_np = np.array(local_val)
                         
-                        # Alinhar valores se necessário
+                        # -----> INJETE A CONVERSÃO DO GLOBAL AQUI <-----
+                        # Converter o GLOBAL para numpy também!
+                        if isinstance(global_val, torch.Tensor):
+                            global_np = global_val.detach().cpu().numpy()
+                        elif isinstance(global_val, np.ndarray):
+                            global_np = global_val
+                        else:
+                            global_np = np.array(global_val)
+                        # -----------------------------------------------
+
+                        # Alinhar valores se necessário (PASSANDO O global_np AGORA)
                         aligned_val = self._align_to_global_structure(
-                            local_np, global_val, key, model_state, idx
+                            local_np, global_np, key, model_state, idx
                         )
                         
                         weight = normalized_weights[idx]
@@ -286,15 +297,21 @@ class FederatedLearningServer:
         
         return aligned
     
-    def evaluate_model(self, model, data_loader):
+    def evaluate_model(self,model, data_loader): # (Em client.py e server.py)
         model.eval()
         correct = 0
         total = 0
         loss_fn = nn.CrossEntropyLoss()
         total_loss = 0.0
 
+        # ---> INJETE ESTA LINHA: Descobre onde o modelo está (CPU ou GPU)
+        device = next(model.parameters()).device
+
         with torch.no_grad():
             for x, y in data_loader:
+                # ---> INJETE ESTA LINHA: Joga os dados para o mesmo lugar do modelo
+                x, y = x.to(device), y.to(device)
+                
                 output = model(x)
                 loss = loss_fn(output, y)
                 total_loss += loss.item()
@@ -666,6 +683,14 @@ class FederatedLearningServer:
             
             updated_state, rate = self.recv_data(conn)
             bit_rate.append(rate)
+            
+            # ---> ESCUDO DE PROTEÇÃO (FAULT-TOLERANCE) <---
+            if updated_state is None:
+                print(f"Round {round_num}: Cliente {client_id} falhou/desconectou. Abortando thread.")
+                self.clients_info[client_id]['training_time'] = time.time() - start_time
+                return
+            # ----------------------------------------------
+            
             updated_state = self.dequantization(updated_state)
             data ,rate = self.recv_data(conn)
             self.client_data[client_id] = data
@@ -909,7 +934,7 @@ def parse_args():
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--clients-per-round', type=int, default=8)
-    parser.add_argument('--rounds', type=int, default=25)
+    parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
     parser.add_argument('--test-client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
@@ -921,6 +946,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
     parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
+    parser.add_argument('--experiments', type=int, default=1)
     return parser.parse_args()
 
 def main():
@@ -930,7 +956,9 @@ def main():
         print("\ncuda is not avaiable.\n")
         args.device = "cpu"
     device = torch.device(args.device)
-    for i in range(0, 11):
+    
+    for i in range(args.experiments):
+        print(f"\n=== Iniciando Experimento {i+1}/{args.experiments} ===")
         server = FederatedLearningServer(args)
         server.run_server(i)
 
