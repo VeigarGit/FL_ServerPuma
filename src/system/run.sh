@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
         --batch-size) BATCH_SIZE="$2"; shift 2 ;;
         --max-clients) MAX_CLIENTS="$2"; shift 2 ;;
         --prune) PRUNE="$2"; shift 2 ;;
-        --ala) ALA="$2"; shift 2 ;;  # <-- NOVO: Lê o parâmetro --ala
+        --ala) ALA="$2"; shift 2 ;;
         --device) DEVICE="$2"; shift 2 ;;
         --device-id) DEVICE_ID="$2"; shift 2 ;;
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
@@ -59,15 +59,15 @@ echo "  Sessão TMUX: $SESSION_NAME"
 echo "===================================="
 
 # ==========================================
-# 4. Preparação do Dataset
+# 4. Preparação do Dataset (Blindado com uv run)
 # ==========================================
 cd ../dataset || exit 1
 if [ "$DATASET" = "Cifar100" ]; then
-    python generate_Cifar100.py noniid - dir
+    uv run generate_Cifar100.py noniid - dir
 elif [ "$DATASET" = "Cifar10" ]; then
-    python generate_Cifar10.py noniid - dir
+    uv run generate_Cifar10.py noniid - dir
 elif [ "$DATASET" = "MNIST" ]; then
-    python generate_MNIST.py noniid - dir
+    uv run generate_MNIST.py noniid - dir
 else
     echo "❌ Dataset não reconhecido: $DATASET"; exit 1
 fi
@@ -75,18 +75,18 @@ fi
 cd ../system || exit 1
 
 # ==========================================
-# 5. Inicialização do Servidor (com ; read)
+# 5. Inicialização do Servidor (Blindado com uv run)
 # ==========================================
-tmux new-session -d -s "$SESSION_NAME" "python server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID ; echo 'Servidor Finalizado! Pressione ENTER para sair...'; read"
+tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID ; echo 'Servidor Finalizado! Pressione ENTER para sair...'; read"
 
 sleep 2
 
 # ==========================================
-# 6. Inicialização dos Clientes (com argumentos e ; read)
+# 6. Inicialização dos Clientes (Blindado com uv run)
 # ==========================================
 for i in $(seq 0 $((CLIENT_COUNT-1))); do
     # Montamos o comando do cliente com todos os parâmetros necessários
-    CLIENT_CMD="python client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $DEVICE_ID ; read"
+    CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $DEVICE_ID ; read"
     
     if [ $((i % 3)) -eq 0 ]; then
         tmux split-window -h "$CLIENT_CMD"

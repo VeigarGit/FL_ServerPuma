@@ -8,6 +8,7 @@ The system features:
 * **Adaptive Structural Pruning:** The server dynamically calculates and applies pruning masks based on network latency bottlenecks and computational complexity (FLOPs).
 * **FedALA Support:** Integrates Adaptive Local Aggregation to handle Non-IID data distribution efficiently.
 * **Network Simulation:** Uses `docker-tc` to accurately simulate real-world conditions like bandwidth limits (e.g., 1Mbit/s) and packet loss (e.g., 10%).
+* **Modern Reproducible Infrastructure:** Powered by `uv` and Multi-stage Docker builds, ensuring hermetic, extremely fast, and deterministic executions across any hardware without dependency conflicts.
 * **Multi-Execution Environments:** Run the simulation via Docker Compose, automated Tmux sessions, or isolated manual terminals.
 
 ---
@@ -17,7 +18,10 @@ The system features:
 Depending on your chosen execution method, ensure the following tools are installed:
 
 ### For Local Execution (Bash/Tmux or Manual)
-1. **Conda:** To manage the Python environment.
+1. **uv:** The modern, lightning-fast Python package and project manager (replaces Conda/pip).
+   ```bash
+   curl -LsSf [https://astral.sh/uv/install.sh](https://astral.sh/uv/install.sh) | sh
+   ```
 2. **Tmux:** For the automated bash script.
    ```bash
    sudo apt update && sudo apt install tmux
@@ -34,31 +38,30 @@ Depending on your chosen execution method, ensure the following tools are instal
 
 ## 🛠️ Step 0: Environment Setup & Dataset Generation
 
-Regardless of the execution method, the partitioned dataset must be generated first.
+Regardless of the execution method, the environment must be synced and the partitioned dataset generated first. You **do not** need to manually activate environments; `uv` handles isolation automatically.
 
-1. **Create and activate the environment:**
+1. **Sync the hermetic environment (installs Python and all dependencies from `uv.lock`):**
    ```bash
-   conda env create -f env_cuda_latest.yaml
-   conda activate pfllib
+   uv sync
    ```
 
 2. **Generate the Non-IID Dataset:**
    ```bash
    cd src/dataset/
-   python generate_Cifar100.py noniid - dir
-   cd ../system/
+   uv run generate_Cifar100.py noniid - dir
+   cd ../../
    ```
 
 ---
 
-## 🚀 Method 1: Docker Execution
+## 🚀 Method 1: Docker Execution (Recommended)
 
-This method containerizes the server and clients, automatically applying network constraints and mounting local volumes to save results persistently.
+This method containerizes the server and clients using highly optimized Multi-stage builds, automatically applying network constraints and mounting local volumes to save results persistently.
 
 **1. Generate the Docker Compose file dynamically:**
 Use `generate_compose.py` to set up your experiment parameters.
 ```bash
-python generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --prune 1 --ala 0
+uv run generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --prune 1 --ala 0
 ```
 *Parameters:*
 * `--clients`: Number of clients to simulate.
@@ -85,17 +88,17 @@ docker compose -f docker-compose.generated.yml down
 
 ## 🚀 Method 2: Tmux Automation Script (Local)
 
-This script automates the setup on the host machine using `tmux` to manage multiple processes in a visually split terminal session.
+This script automates the setup on the host machine using `tmux` to manage multiple processes in a visually split terminal session. The script safely encapsulates all runs using `uv run`.
 
 ```bash
-# Make the script executable
+# Make the script executable (only needed once)
 chmod +x run.sh
 
 # Run with default parameters
 ./run.sh
 
 # Or run with custom parameters
-sh run.sh --clients 3 --host "localhost" --dataset "Cifar100" --session "fl_session" --ala 0 --prune 1
+./run.sh --clients 3 --host "localhost" --port 9050 --dataset "Cifar100" --session "fl_session" --ala 0 --prune 1
 ```
 
 ### 🖥️ Tmux Layout & Cheat Sheet
@@ -113,27 +116,24 @@ The script creates a layout with the Server on the left and Clients stacked on t
 
 ## 🚀 Method 3: Manual Execution
 
-To isolate logs and debug specific client-server interactions, open multiple terminal windows manually.
+To isolate logs and debug specific client-server interactions, open multiple terminal windows manually. There is no need to activate virtual environments.
 
 **Terminal 1 (Server):**
 ```bash
-conda activate pfllib
 cd src/system/
-python server.py --dataset Cifar100 --clients-per-round 3 --rounds 5 --prune 1
+uv run server.py --dataset Cifar100 --clients-per-round 3 --rounds 5 --prune 1
 ```
 
 **Terminal 2 (Client 0):**
 ```bash
-conda activate pfllib
 cd src/system/
-python client.py --client-idx 0 --dataset Cifar100 --rounds 5 --ala 0
+uv run client.py --client-idx 0 --dataset Cifar100 --rounds 5 --ala 0
 ```
 
 **Terminal 3 (Client 1):**
 ```bash
-conda activate pfllib
 cd src/system/
-python client.py --client-idx 1 --dataset Cifar100 --rounds 5 --ala 0
+uv run client.py --client-idx 1 --dataset Cifar100 --rounds 5 --ala 0
 ```
 *(Repeat for as many clients as specified in `--clients-per-round`)*
 
