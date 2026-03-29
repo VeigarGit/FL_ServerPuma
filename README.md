@@ -20,7 +20,7 @@ Depending on your chosen execution method, ensure the following tools are instal
 ### For Local Execution (Bash/Tmux or Manual)
 1. **uv:** The modern, lightning-fast Python package and project manager (replaces Conda/pip).
    ```bash
-   curl -LsSf [https://astral.sh/uv/install.sh](https://astral.sh/uv/install.sh) | sh
+   curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
 2. **Tmux:** For the automated bash script.
    ```bash
@@ -47,10 +47,7 @@ Regardless of the execution method, the environment must be synced and the parti
 
 2. **Generate the Non-IID Dataset:**
    ```bash
-   cd src/dataset/
-   uv run generate_Cifar100.py noniid - dir
-   cd ../../
-   ```
+   uv run python src/dataset/generate_Cifar100.py noniid - dir
 
 ---
 

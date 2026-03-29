@@ -60,4 +60,4 @@ url = "https://download.pytorch.org/whl/cu118"
 explicit = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/system", "src/dataset"]
+packages = ["src/system", "src/dataset", "src/utils"]
