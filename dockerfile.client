@@ -17,6 +17,15 @@ RUN uv sync --frozen --no-dev --no-install-project
 # ==========================================
 FROM python:3.11-slim
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 libstdc++6 && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
