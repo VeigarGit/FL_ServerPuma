@@ -16,3 +16,5 @@ __pycache__/
 Dockerfile
 docker-compose.yml
 .env_cuda_latest.yaml
+results2/
+results2.zip

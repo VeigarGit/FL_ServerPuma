@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
-from utils.dataset_utils import check, separate_data, split_data, save_file
+from dataset.utils.dataset_utils import check, separate_data, split_data, save_file
 import random
 random.seed(1)
 np.random.seed(1)

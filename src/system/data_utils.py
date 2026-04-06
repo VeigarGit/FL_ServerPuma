@@ -22,7 +22,7 @@ import torch
 
 def read_data(dataset, idx, is_train=True):
     if is_train:
-        train_data_dir = os.path.join('src', 'dataset', dataset, 'train/')
+        train_data_dir = os.path.join('..', 'dataset', dataset, 'train/')
 
         train_file = train_data_dir + str(idx) + '.npz'
         with open(train_file, 'rb') as f:
@@ -31,7 +31,7 @@ def read_data(dataset, idx, is_train=True):
         return train_data
 
     else:
-        test_data_dir = os.path.join('src', 'dataset', dataset, 'train/')
+        test_data_dir = os.path.join('..', 'dataset', dataset, 'train/')
 
         test_file = test_data_dir + str(idx) + '.npz'
         with open(test_file, 'rb') as f:
@@ -100,4 +100,3 @@ def read_client_data_Shakespeare(dataset, idx, is_train=True):
         y_test = torch.Tensor(test_data['y']).type(torch.int64)
         test_data = [(x, y) for x, y in zip(X_test, y_test)]
         return test_data
-

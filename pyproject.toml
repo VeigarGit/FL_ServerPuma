@@ -1,0 +1,63 @@
+[build-system]
+# Desvincula o empacotamento do setuptools arcaico
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fl-serverpuma"
+version = "0.1.0"
+description = "Adaptive Federated Learning Simulator"
+# Baseado no seu env do Conda
+requires-python = ">=3.11"
+dependencies = [
+    # Core scientific computing
+    "numpy<2",
+    "pandas",
+    "scikit-learn",
+    "scipy",
+    "ujson",
+    "h5py",
+    # Visualization
+    "seaborn",
+    "matplotlib",
+    # Utilities
+    "click",
+    "calmsize",
+    "memory-profiler",
+    "portalocker",
+    "tqdm",
+    "cmake<4.0.0",  # <--- A vacina contra o erro de compilação do Triton/PyTorch
+    # PyTorch ecosystem (Mantendo a versão travada)
+    "torch==2.0.1",
+    "torchaudio==2.0.2",
+    "torchtext",
+    "torchvision==0.15.2",
+    # Advanced ML
+    "cvxpy",
+    "higher",
+    "diffusers",
+    "accelerate",
+    "transformers",
+]
+
+[tool.ruff]
+# Configuração base do linter ultrarrápido Ruff
+line-length = 99
+indent-width = 4
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/system", "src/dataset", "src/utils"]

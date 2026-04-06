@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.utils.prune as prune
 import copy
 import numpy as np
-
+ 
 def prune_and_restructure(model, pruning_rate = 0.5, n_in = 1, size_fc = 25, data='Cifar100'):
     model_copy = copy.deepcopy(model)
     layers = []

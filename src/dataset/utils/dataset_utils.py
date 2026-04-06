@@ -20,15 +20,16 @@ import ujson
 import numpy as np
 import gc
 from sklearn.model_selection import train_test_split
+from pathlib import Path
 
 batch_size = 10
 train_ratio = 0.75 # merge original training set and test set, then split it manually. 
 alpha = 0.1 # for Dirichlet distribution. 100 for exdir
 
-def check(config_path, train_path, test_path, num_clients, niid=False, 
-        balance=True, partition=None):
-    # check existing dataset
-    if os.path.exists(config_path):
+def check(config_path: Path, train_path: Path, test_path: Path, num_clients, niid=False, 
+          balance=True, partition=None):
+    # check existing dataset (substituindo os.path.exists)
+    if config_path.exists():
         with open(config_path, 'r') as f:
             config = ujson.load(f)
         if config['num_clients'] == num_clients and \
@@ -40,12 +41,9 @@ def check(config_path, train_path, test_path, num_clients, niid=False,
             print("\nDataset already generated.\n")
             return True
 
-    dir_path = os.path.dirname(train_path)
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
-    dir_path = os.path.dirname(test_path)
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+    # Cria as pastas de destino limpas sem depender do final com "/"
+    train_path.mkdir(parents=True, exist_ok=True)
+    test_path.mkdir(parents=True, exist_ok=True)
 
     return False
 
@@ -244,8 +242,8 @@ def split_data(X, y):
 
     return train_data, test_data
 
-def save_file(config_path, train_path, test_path, train_data, test_data, num_clients, 
-                num_classes, statistic, niid=False, balance=True, partition=None):
+def save_file(config_path: Path, train_path: Path, test_path: Path, train_data, test_data, num_clients, 
+              num_classes, statistic, niid=False, balance=True, partition=None):
     config = {
         'num_clients': num_clients, 
         'num_classes': num_classes, 
@@ -261,11 +259,15 @@ def save_file(config_path, train_path, test_path, train_data, test_data, num_cli
     print("Saving to disk.\n")
 
     for idx, train_dict in enumerate(train_data):
-        with open(train_path + str(idx) + '.npz', 'wb') as f:
+        # Substitui a velha concatenação (train_path + str(idx) + '.npz')
+        with open(train_path / f"{idx}.npz", 'wb') as f:
             np.savez_compressed(f, data=train_dict)
+            
     for idx, test_dict in enumerate(test_data):
-        with open(test_path + str(idx) + '.npz', 'wb') as f:
+        # Substitui a velha concatenação
+        with open(test_path / f"{idx}.npz", 'wb') as f:
             np.savez_compressed(f, data=test_dict)
+            
     with open(config_path, 'w') as f:
         ujson.dump(config, f)
 

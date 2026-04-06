@@ -5,3 +5,5 @@ src/results
 __pycache__/
 *.pyc
 *.generated.yml*.pyc
+docker-tc/
+Cifar100

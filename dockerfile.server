@@ -1,21 +1,39 @@
-FROM continuumio/miniconda3
+# ==========================================
+# ESTÁGIO 1: BUILDER
+# ==========================================
+FROM python:3.11-slim AS builder
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Copiar apenas o environment file primeiro
-COPY env_cuda_latest.yaml .
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
 
-# Instalar e LIMPAR (CRÍTICO)
-RUN conda env create -f env_cuda_latest.yaml && \
-    conda clean -afy && \
-    pip cache purge && \
-    rm -rf /tmp/* /var/tmp/* && \
-    find /opt/conda -type f -name '*.pyc' -delete && \
-    find /opt/conda -type d -name '__pycache__' -delete
+ENV UV_COMPILE_BYTECODE=1
+# Forçamos o uv a criar o ambiente num local blindado do SO
+ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
 
-ENV PATH /opt/conda/envs/pfllib/bin:$PATH
+RUN uv sync --frozen --no-dev --no-install-project
+
+# ==========================================
+# ESTÁGIO 2: FINAL
+# ==========================================
+FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 libstdc++6 && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 COPY . .
 
-# Específico para cada serviço
-WORKDIR /app
-# O CMD fica diferente para server/client
+EXPOSE 9000
+
+WORKDIR /app/src/system
+CMD ["python", "server.py"]
