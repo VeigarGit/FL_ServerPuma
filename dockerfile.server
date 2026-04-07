@@ -25,13 +25,19 @@ RUN apt-get update && \
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
-
 COPY --from=builder /opt/venv /opt/venv
+
+# A correção cirúrgica exata e determinística
+RUN cd /opt/venv/lib/python3.11/site-packages/torch/lib && \
+    ln -s libnvrtc-672ee683.so.11.2 libnvrtc.so
+    
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/torch/lib:$LD_LIBRARY_PATH"
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 COPY . .
+
+# (O restante do Dockerfile segue normal...)
 
 EXPOSE 9000
 

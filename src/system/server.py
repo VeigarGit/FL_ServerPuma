@@ -485,7 +485,8 @@ class FederatedLearningServer:
         algo = f"{self.args.dataset}_{a}_{b}_{i_str}"
         
         # O Descarte Definitivo da Biblioteca os.path na Gestão Relacional 
-        result_path = Path("..") / "results"
+        # O caminho é ancorado a partir do arquivo atual (server.py), subindo duas pastas (system -> src) e entrando em results
+        result_path = Path(__file__).resolve().parent.parent / "results"
         result_path.mkdir(parents=True, exist_ok=True)
         
         file_path = result_path / f"{algo}.h5"
@@ -581,7 +582,12 @@ class FederatedLearningServer:
                     logger.info(f"Round {round_num + 1}: Aggregating {len(client_updates)} updates")
                     self.aggregated_clients.append(len(client_updates))
                     
-                    aggregated_state = self.aggregate_models(client_updates, self.global_state, client_weights)
+                    # Bloqueamos o cofre rapidamente para copiar o estado exato das listas
+                    with self.lock:
+                        frozen_updates = list(client_updates)
+                        frozen_weights = list(client_weights)
+                        
+                    aggregated_state = self.aggregate_models(frozen_updates, self.global_state, frozen_weights)
                     
                     with self.lock:
                         self.global_state = aggregated_state

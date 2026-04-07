@@ -10,6 +10,7 @@ x-client-template: &client
     args:
       - NO_CACHE=true
   image: fl-client-image
+  user: "${{LOCAL_UID:-1000}}:${{LOCAL_GID:-1000}}"
   restart: 'no'
   working_dir: /app/src/system
   environment: 
@@ -18,6 +19,7 @@ x-client-template: &client
   volumes:
     - ./src/dataset:/app/src/dataset
     - ./src/results:/app/src/results
+    - ./src/system/dados_compartilhados:/app/src/system/dados_compartilhados
   deploy:
     resources:
       reservations:
@@ -41,6 +43,7 @@ services:
       args:
         - NO_CACHE=true
     container_name: fl-server
+    user: "${{LOCAL_UID:-1000}}:${{LOCAL_GID:-1000}}"
     restart: 'no'
     working_dir: /app/src/system
     environment: 
@@ -49,6 +52,7 @@ services:
     volumes:
       - ./src/dataset:/app/src/dataset
       - ./src/results:/app/src/results
+      - ./src/system/dados_compartilhados:/app/src/system/dados_compartilhados
     deploy:
       resources:
         reservations:
@@ -63,8 +67,8 @@ services:
       - docker-tc
     labels:
       - "com.docker-tc.enabled=1"
-      - "com.docker-tc.limit=1mbit"
-      - "com.docker-tc.delay=100ms"
+      - "com.docker-tc.limit=10mbit"
+      - "com.docker-tc.delay=10ms"
 """
 
     for i in range(0, num_clients):
