@@ -23,23 +23,24 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 from dataset.utils.dataset_utils import check, separate_data, split_data, save_file
+from pathlib import Path
 
 
 random.seed(1)
 np.random.seed(1)
 num_clients = 5
-dir_path = "MNIST/"
+dir_path = Path(__file__).parent / "MNIST"
 
 
 # Allocate data to users
-def generate_dataset(dir_path, num_clients, niid, balance, partition):
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+def generate_dataset(dir_path: Path, num_clients, niid, balance, partition):
+    # Substitui o os.path.exists e os.makedirs
+    dir_path.mkdir(parents=True, exist_ok=True)
         
-    # Setup directory for train/test data
-    config_path = dir_path + "config.json"
-    train_path = dir_path + "train/"
-    test_path = dir_path + "test/"
+    # Setup directory for train/test data usando o operador /
+    config_path = dir_path / "config.json"
+    train_path = dir_path / "train"
+    test_path = dir_path / "test"
 
     if check(config_path, train_path, test_path, num_clients, niid, balance, partition):
         return
@@ -54,9 +55,9 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
     trainset = torchvision.datasets.MNIST(
-        root=dir_path+"rawdata", train=True, download=True, transform=transform)
+        root=dir_path / "rawdata", train=True, download=True, transform=transform)
     testset = torchvision.datasets.MNIST(
-        root=dir_path+"rawdata", train=False, download=True, transform=transform)
+        root=dir_path / "rawdata", train=False, download=True, transform=transform)
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=len(trainset.data), shuffle=False)
     testloader = torch.utils.data.DataLoader(

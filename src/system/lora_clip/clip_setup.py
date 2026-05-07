@@ -425,8 +425,13 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     total_ce_loss = 0.0
     total_sparse_loss = 0.0
     total_loss = 0.0
+    
+    device = next(model.parameters()).device
 
     for pixel_values, labels in tqdm(loader, desc="train", leave=False):
+        pixel_values = pixel_values.to(device)
+        labels = labels.to(device)
+        
         optimizer.zero_grad()
         if sparse_optimizer is not None:
             sparse_optimizer.zero_grad()

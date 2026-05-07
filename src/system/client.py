@@ -111,31 +111,39 @@ def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, r
     
     # --- 1. SELEÇÃO DE OTIMIZADOR ---
     if model_type == 'clip':
-        from lora_clip.clip_setup import build_optimizer
+        from lora_clip.clip_setup import build_optimizer, train_epoch
         # O build_optimizer já sabe se é LoRA ou SoRA lendo o run_config. 
         # Como é só LoRA, sparse_optimizer será None.
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
+        # Verifica se o SoRA está ativo e resgata o lambda de esparsidade do YAML
+        is_sora = run_config["model"]["lora"]["mode"] in ["with_sora_no_schedule", "with_sora_schedule"]
+        sparse_lambda = run_config["model"].get("sora", {}).get("sparse_lambda", 0.0) if is_sora else 0.0
+        
+        # O train_epoch já faz o loop no train_loader, calcula as perdas e atualiza os pesos
+        metrics = train_epoch(model, train_loader, optimizer, sparse_optimizer, sparse_lambda)
+        
+        logger.info(f"Métricas do Treino Local - CE Loss: {metrics['ce_loss']:.4f} | Sparse Loss: {metrics['sparse_loss']:.4f}")
     else:
         optimizer = optim.SGD(model.parameters(), lr=learning_rate)
         sparse_optimizer = None
     
-    for x, y in train_loader:
-        x, y = x.to(device), y.to(device)
-        
-        optimizer.zero_grad()
-        if sparse_optimizer is not None:
-            sparse_optimizer.zero_grad()
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
             
-        output = model(x)
-        if isinstance(output, dict):
-            output = output["logits"]
+            optimizer.zero_grad()
+            if sparse_optimizer is not None:
+                sparse_optimizer.zero_grad()
+                
+            output = model(x)
+            if isinstance(output, dict):
+                output = output["logits"]
+                
+            loss = loss_fn(output, y)
+            loss.backward()
+            optimizer.step()
             
-        loss = loss_fn(output, y)
-        loss.backward()
-        optimizer.step()
-        
-        if sparse_optimizer is not None:
-            sparse_optimizer.step()
+            if sparse_optimizer is not None:
+                sparse_optimizer.step()
     
     # --- 2. SELEÇÃO DOS PESOS QUE SERÃO ENVIADOS PARA O SERVIDOR ---
     if model_type == 'clip':

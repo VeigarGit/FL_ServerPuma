@@ -4,7 +4,7 @@ dataset:
 model:
   name: openai/clip-vit-base-patch32
   lora:
-    mode: with_lora          # with_lora | without_lora | both | with_sora_no_schedule | with_sora_schedule
+    mode: with_sora_no_schedule          # with_lora | without_lora | both | with_sora_no_schedule | with_sora_schedule
     r: 8
     alpha: 32
     dropout: 0.05

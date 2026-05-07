@@ -129,6 +129,72 @@ def prune_sora_to_lora_and_report(model):
     return model
 
 @torch.no_grad()
+def prune_sora_iterative(model):
+    """
+    Poda Iterativa (Intermediária) para Aprendizado Federado.
+    Reduz o tamanho das matrizes A, B e do gate, MAS MANTÉM o gate vivo
+    para que o modelo continue a aprender esparsidade nas próximas rodadas.
+    """
+    total_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    sora_modules = 0
+    
+    print("\n" + "="*75)
+    print("PRUNING ITERATIVO (SoRA → SoRA Compacto)")
+    print("="*75)
+
+    for name, module in model.named_modules():
+        if not isinstance(module, SoRAWrappedLinear):
+            continue
+
+        sora = module.sora
+        gate = sora.gate.data.squeeze(0)
+        
+        # Identifica quais dimensões manter (onde gate > 1e-8)
+        mask = torch.abs(gate) > 1e-8
+        keep_idx = torch.where(mask)[0]
+        r_new = len(keep_idx)
+        r_original = len(gate)
+
+        # Garante que o rank não seja zero (mantém ao menos 1 dimensão)
+        if r_new == 0:
+            keep_idx = torch.topk(gate.abs(), k=1).indices
+            r_new = 1
+            print(f"    {name:<50} → Rank zerado forçado para 1")
+
+        # Se o rank não diminuiu nesta camada, não fazemos nada
+        if r_new == r_original:
+            continue
+
+        # --- A GRANDE MÁGICA ACONTECE AQUI ---
+        # 1. Fatiamos as matrizes usando apenas os índices úteis (keep_idx)
+        A_pruned = sora.lora_A.data[keep_idx, :]
+        B_pruned = sora.lora_B.data[:, keep_idx]
+        g_pruned = sora.gate.data[:, keep_idx] # O gate continua a existir!
+
+        # 2. Re-instanciamos os parâmetros de rede para avisar o PyTorch da mudança
+        sora.lora_A = nn.Parameter(A_pruned)
+        sora.lora_B = nn.Parameter(B_pruned)
+        sora.gate = nn.Parameter(g_pruned)
+        
+        # 3. Atualizamos a variável de controle do rank
+        sora.r = r_new 
+        
+        # Nota de Engenharia: NÃO alteramos o sora.scaling! 
+        # Manter o scaling original evita que os gradientes explodam após a poda.
+
+        sora_modules += 1
+        print(f"   {name:<50} Rank: {r_original:3d} → {r_new:3d}")
+
+    total_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print("="*70)
+    print(f"   RESUMO DA PODA ITERATIVA: {sora_modules} módulos afetados")
+    print(f"   Redução de parâmetros treináveis: {((1 - total_after / total_before) * 100):.2f}%")
+    print("="*70)
+    
+    return model
+
+@torch.no_grad()
 def pre_prune_whole_model(model, prune_ratio=0.3, device="cpu"):
     """
     Otimização Preventiva do Backbone.

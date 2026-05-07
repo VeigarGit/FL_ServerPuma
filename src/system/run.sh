@@ -29,6 +29,7 @@ DIM=1600
 # <-- NOVO: Seletor de Modelo e Configuração
 MODEL="cnn"            # Pode ser "cnn" ou "clip"
 CONFIG_FILE="lora_clip/train_config.yml"         # Caminho do YAML (obrigatório se MODEL="clip")
+PRUNE_FREQ=0
 
 # ==========================================
 # 2. Processamento de Argumentos
@@ -53,6 +54,7 @@ while [ $# -gt 0 ]; do
         --device-id) DEVICE_ID="$2"; shift 2 ;;
         -m|--model) MODEL="$2"; shift 2 ;;         # <-- NOVO: cnn ou clip
         --config) CONFIG_FILE="$2"; shift 2 ;;     # <-- NOVO: caminho do yaml
+        --prune-freq) PRUNE_FREQ="$2"; shift 2 ;;
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
 done
@@ -103,8 +105,7 @@ cd ../system || exit 1
 # 5. Inicialização do Servidor
 # ==========================================
 # Passando --model e --config para o Python
-tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --config \"$CONFIG_FILE\" ; echo 'Servidor Finalizado! Pressione ENTER para sair...'; read"
-
+tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ ; echo 'Servidor Finalizado! Pressione ENTER para sair...'; read"
 sleep 2
 
 # ==========================================
