@@ -1,9 +1,11 @@
 src/dataset/Cifar10
 src/dataset/MNIST
+src/dataset/OxfordPets
 src/dataset/Cifar100
 src/results
 __pycache__/
 *.pyc
+*.npz
 *.generated.yml*.pyc
 docker-tc/
 Cifar100

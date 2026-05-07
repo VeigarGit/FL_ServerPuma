@@ -42,6 +42,8 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
         for x, y in data_loader:
             x, y = x.to(device), y.to(device)
             output = model(x)
+            if isinstance(output, dict):
+                output = output["logits"]
             loss = loss_fn(output, y)
             total_loss += loss.item()
             _, predicted = torch.max(output, 1)

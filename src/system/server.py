@@ -15,6 +15,14 @@ from torch.utils.data import DataLoader
 import numpy as np
 import h5py
 
+#Para o Lora
+from lora_clip.clip_setup import (
+    parse_args, load_config, get_device, resolve_run_modes, 
+    build_run_config, build_output_path, build_dataloaders,
+    build_model, build_optimizer, build_scheduler, 
+    benchmark_attention, quantize_weights
+)
+
 # --- HACK PERMITIDO: Inserindo a pasta 'src' no path do Python ---
 current_dir = Path(__file__).resolve().parent
 parent_dir = current_dir.parent
@@ -46,19 +54,43 @@ class FederatedLearningServer:
         self.args = args
         
         # Uso do Structural Pattern Matching (Substituindo a cadeia de IFs)
-        match args.dataset:
-            case 'MNIST':
-                self.global_model = SimpleModel(in_features=1, num_classes=10, dim=1024)
-                self.input_size = (1, 1, 28, 28)
-            case 'Cifar10':
-                self.global_model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
-                self.input_size = (1, 3, 32, 32)
-            case 'Cifar100':
-                self.global_model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
-                self.input_size = (1, 3, 32, 32)
-            case _:
-                logger.error(f"Dataset não reconhecido: {args.dataset}")
-                raise ValueError(f"Dataset inválido: {args.dataset}")
+        match args.model:
+            case 'cnn':
+                match args.dataset:
+                    case 'MNIST':
+                        self.global_model = SimpleModel(in_features=1, num_classes=10, dim=1024)
+                        self.input_size = (1, 1, 28, 28)
+                    case 'Cifar10':
+                        self.global_model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
+                        self.input_size = (1, 3, 32, 32)
+                    case 'Cifar100':
+                        self.global_model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
+                        self.input_size = (1, 3, 32, 32)
+                    case _:
+                        logger.error(f"Dataset não reconhecido: {args.dataset}")
+                        raise ValueError(f"Dataset inválido: {args.dataset}")
+            case 'clip':
+                config = load_config(args.config)
+                match config["dataset"]["name"]:
+                    case "enterprise-explorers/oxford-pets":
+                        # 1. Carrega o YAML passado no argumento --config
+                        
+                        # 2. Descobre o modo (ex: "with_lora") configurado no YAML
+                        run_mode = resolve_run_modes(config)[0]
+                        run_config = build_run_config(config, run_mode=run_mode)
+                        
+                        # 3. Instancia o CLIP (Oxford Pets tem 37 classes)
+                        self.global_model = build_model(
+                            config=run_config, 
+                            num_classes=args.num_classes, 
+                            device=args.device
+                        )
+                        
+                        # 4. Input size padrão do processador do CLIP (1 batch, 3 canais, 224x224)
+                        # Necessário para o LayerComplexityCalculator não quebrar logo abaixo
+                        self.input_size = (1, 3, 224, 224)
+                        
+                
 
         self.global_model = self.global_model.to(args.device)
         self.rs_test_acc = []
@@ -350,7 +382,11 @@ class FederatedLearningServer:
             logger.info(f"Round {round_num}: Handling client {client_id}")
             
             with self.lock:
-                current_global_state = self.global_state.copy()
+                if self.args.model == 'clip':
+                    from lora_clip.sora import get_trainable_state_dict
+                    current_global_state = get_trainable_state_dict(self.global_model)
+                else:
+                    current_global_state = self.global_state.copy()
             
             if round_num >= 2 and self.prune == 0:
                 logger.info("--- SERVER: PRUNING START (Round 2) ---")
@@ -637,7 +673,10 @@ def parse_args():
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--clients-per-round', type=int, default=8)
     parser.add_argument('--rounds', type=int, default=5)
-    parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
+    parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 
+                                                                           'MNIST', 'FashionMNIST', 
+                                                                           'Cifar100', 
+                                                                           "OxfordPets"])
     parser.add_argument('--test-client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
     parser.add_argument('--num-classes', type=int, default=100)
@@ -649,6 +688,8 @@ def parse_args():
     parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('--experiments', type=int, default=1)
+    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip"])
+    parser.add_argument('--config', type=str, default="lora_clip/config.yaml")
     return parser.parse_args()
 
 def main():

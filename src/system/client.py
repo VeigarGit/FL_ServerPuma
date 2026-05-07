@@ -15,6 +15,13 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import h5py
 
+from lora_clip.clip_setup import (
+    load_config, resolve_run_modes, build_run_config, build_model
+)
+
+from lora_clip.clip_setup import build_optimizer
+from lora_clip.sora import get_trainable_state_dict
+
 # --- HACK PERMITIDO: Inserindo a pasta 'src' no path do Python ---
 # Nota: Esta é uma mitigação aceita enquanto o projeto não for
 # completamente empacotado como biblioteca via pyproject.toml
@@ -82,11 +89,12 @@ def map_sequential_to_simplemodel(state_dict):
 #             quantized_state_dict[k] = v
 #     return quantized_state_dict
 
-def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None):
+def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None, model_type='cnn', run_config=None):
     state_dict = dequantization(state_dict)
     
     if round_num >= 2 and prune == 0:
-        state_dict = map_sequential_to_simplemodel(state_dict)
+        if model_type == 'cnn':
+            state_dict = map_sequential_to_simplemodel(state_dict)
 
     local_model = resize_model_to_pruned(model, state_dict)
     state = copy.deepcopy(local_model)
@@ -97,24 +105,44 @@ def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, r
         
     set_parameters(model, state)
     
-    size_before = sys.getsizeof(pickle.dumps(model)) / (1024 * 1024)    
-    logger.debug(f"Tamanho antes: {size_before:.2f} MB")    
-    
     model.train()
-    optimizer = optim.SGD(model.parameters(), lr=learning_rate)
     loss_fn = nn.CrossEntropyLoss()
     device = next(model.parameters()).device
+    
+    # --- 1. SELEÇÃO DE OTIMIZADOR ---
+    if model_type == 'clip':
+        from lora_clip.clip_setup import build_optimizer
+        # O build_optimizer já sabe se é LoRA ou SoRA lendo o run_config. 
+        # Como é só LoRA, sparse_optimizer será None.
+        optimizer, sparse_optimizer = build_optimizer(model, run_config)
+    else:
+        optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+        sparse_optimizer = None
     
     for x, y in train_loader:
         x, y = x.to(device), y.to(device)
         
         optimizer.zero_grad()
+        if sparse_optimizer is not None:
+            sparse_optimizer.zero_grad()
+            
         output = model(x)
+        if isinstance(output, dict):
+            output = output["logits"]
+            
         loss = loss_fn(output, y)
         loss.backward()
         optimizer.step()
+        
+        if sparse_optimizer is not None:
+            sparse_optimizer.step()
     
-    return model.state_dict()
+    # --- 2. SELEÇÃO DOS PESOS QUE SERÃO ENVIADOS PARA O SERVIDOR ---
+    if model_type == 'clip':
+        from lora_clip.sora import get_trainable_state_dict
+        return get_trainable_state_dict(model) # Envia APENAS o LoRA e Head
+    else:
+        return model.state_dict() # Envia tudo do CNN
 
 def evaluate_model(model, data_loader):
     model.eval()
@@ -128,6 +156,8 @@ def evaluate_model(model, data_loader):
         for x, y in data_loader:
             x, y = x.to(device), y.to(device)
             output = model(x)
+            if isinstance(output, dict):
+                output = output["logits"]
             loss = loss_fn(output, y)
             total_loss += loss.item()
             _, predicted = torch.max(output, 1)
@@ -196,7 +226,11 @@ def parse_args():
     parser.add_argument('--host', type=str, default='localhost')
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--rounds', type=int, default=5)
-    parser.add_argument('--dataset', type=str, default='Cifar100', choices=['Cifar10', 'MNIST', 'FashionMNIST', 'Cifar100'])
+    parser.add_argument('--dataset', type=str, default='Cifar100', choices=['Cifar10', 
+                                                                            'MNIST', 
+                                                                            'FashionMNIST',
+                                                                            'Cifar100',
+                                                                            "OxfordPets"])
     parser.add_argument('--client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
     parser.add_argument('--num-classes', type=int, default=100)
@@ -207,6 +241,8 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument("--ala", type=int, default=0)
+    parser.add_argument("--model", type=str, default="cnn")
+    parser.add_argument('--config', type=str, default="lora_clip/config.yaml")
     return parser.parse_args()
 
 def main():
@@ -229,16 +265,31 @@ def main():
     logger.info("=================================")
     
     # Adoção de Structural Pattern Matching
-    match args.dataset:
-        case 'MNIST':
-            model = SimpleModel(in_features=1, num_classes=10, dim=1024)
-        case 'Cifar10':
-            model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
-        case 'Cifar100':
-            model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
-        case _:
-            logger.error(f"Dataset inválido: {args.dataset}")
-            sys.exit(1)
+    match args.model:
+        case 'cnn':
+            match args.dataset:
+                case 'MNIST':
+                    model = SimpleModel(in_features=1, num_classes=10, dim=1024)
+                case 'Cifar10':
+                    model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
+                case 'Cifar100':
+                    model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
+                case _:
+                    logger.error(f"Dataset inválido: {args.dataset}")
+                    sys.exit(1)
+        case 'clip':
+            config = load_config(args.config)
+            
+            # Resolve o modo de execução a partir do YAML
+            run_mode = resolve_run_modes(config)[0]
+            run_config = build_run_config(config, run_mode=run_mode)
+            
+            match config["dataset"]["name"]:
+                case "enterprise-explorers/oxford-pets":
+                    model = build_model(config=run_config, num_classes=37, device=device)
+                case _:
+                    # Fallback para caso utilize Cifar10 ou Cifar100 via bash
+                    model = build_model(config=run_config, num_classes=args.num_classes, device=device)
             
     model = model.to(device)
     loss = nn.CrossEntropyLoss()
@@ -291,7 +342,18 @@ def main():
             acc.append(test_accuracy)
             losses.append(test_loss)
             
-            updated_state = local_training(model, global_state, prune, train_loader, args.learning_rate, round_num + 1, args.ala, ala)
+            updated_state = local_training(
+                model=model, 
+                state_dict=global_state, 
+                prune=prune, 
+                train_loader=train_loader, 
+                learning_rate=args.learning_rate, 
+                round_num=round_num + 1, 
+                alaarg=args.ala, 
+                ala=ala,
+                model_type=args.model, 
+                run_config=run_config if args.model == 'clip' else None 
+            )
             logger.info("Local training completed.")
 
             train_accuracy, train_loss = evaluate_model(model, train_loader)
