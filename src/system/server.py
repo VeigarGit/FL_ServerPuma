@@ -690,6 +690,8 @@ def parse_args():
     parser.add_argument('--experiments', type=int, default=1)
     parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip"])
     parser.add_argument('--config', type=str, default="lora_clip/config.yaml")
+    
+    parser.add_argument('--prune-freq', type=int, default=0)
     return parser.parse_args()
 
 def main():
