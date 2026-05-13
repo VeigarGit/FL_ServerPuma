@@ -1,35 +1,44 @@
-def apply_sora_hot_swap(model, global_state):
+import torch
+import copy
+
+def reduce_sora_state_dict_rank(state_dict, threshold=1e-8):
     """
-    HOT-SWAP: Analisa os pesos recebidos do servidor e substitui os adaptadores
-    SoRA locais se o servidor tiver reduzido o Rank deles.
+    Analisa o state_dict e reduz iterativamente o rank das matrizes SoRA
+    removendo as dimensões onde o gate está zerado, mantendo-as treináveis.
     """
-    from lora_clip.sora import SoRALinear, SoRAWrappedLinear
+    new_state_dict = copy.deepcopy(state_dict)
+    gate_keys = [k for k in new_state_dict.keys() if "sora.gate" in k]
     
-    swapped = 0
-    for name, module in model.named_modules():
-        if isinstance(module, SoRAWrappedLinear) and module.sora is not None:
-            # A matriz A tem o formato (r, in_features). Vamos descobrir o 'r' que o servidor enviou!
-            lora_A_key = f"{name}.sora.lora_A"
-            if lora_A_key in global_state:
-                new_rank = global_state[lora_A_key].shape[0] 
-                current_rank = module.sora.r
-                
-                if new_rank != current_rank:
-                    logger.debug(f"Hot-Swap na {name}: Rank {current_rank} -> {new_rank}")
-                    
-                    # Cria a nova peça de hardware (adaptador menor) com as configs originais
-                    new_sora = SoRALinear(
-                        in_features=module.original.in_features,
-                        out_features=module.original.out_features,
-                        r=new_rank,
-                        lora_alpha=module.sora.lora_alpha,
-                        lora_dropout=module.sora.lora_dropout.p if isinstance(module.sora.lora_dropout, nn.Dropout) else 0.0
-                    ).to(next(model.parameters()).device)
-                    
-                    # Desparafusa a antiga e coloca a nova
-                    module.sora = new_sora
-                    swapped += 1
-                    
-    if swapped > 0:
-        logger.info(f"🔧 Hot-Swap Concluído: {swapped} adaptadores substituídos para o novo tamanho.")
-    return model
+    total_params_before = 0
+    total_params_after = 0
+    ranks_info = []
+    
+    for gate_key in gate_keys:
+        base_key = gate_key.replace(".gate", "")
+        A_key = f"{base_key}.lora_A"
+        B_key = f"{base_key}.lora_B"
+        
+        gate_tensor = new_state_dict[gate_key].squeeze(0)
+        A_tensor = new_state_dict[A_key]
+        B_tensor = new_state_dict[B_key]
+        
+        r_original = len(gate_tensor)
+        total_params_before += A_tensor.numel() + B_tensor.numel() + gate_tensor.numel()
+        
+        mask = torch.abs(gate_tensor) > threshold
+        keep_idx = torch.where(mask)[0]
+        
+        if len(keep_idx) == 0:
+            keep_idx = torch.topk(gate_tensor.abs(), k=1).indices
+            
+        r_new = len(keep_idx)
+        
+        new_state_dict[A_key] = A_tensor[keep_idx, :]
+        new_state_dict[B_key] = B_tensor[:, keep_idx]
+        new_state_dict[gate_key] = gate_tensor[keep_idx].unsqueeze(0)
+        
+        total_params_after += new_state_dict[A_key].numel() + new_state_dict[B_key].numel() + new_state_dict[gate_key].numel()
+        if r_new < r_original:
+            ranks_info.append(f"{base_key}: {r_original} -> {r_new}")
+        
+    return new_state_dict, total_params_before, total_params_after, ranks_info

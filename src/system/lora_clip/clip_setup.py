@@ -31,6 +31,7 @@ class CLIPForClassification(nn.Module):
         self.num_classes = num_classes
         hidden_size = self.vision_model.config.hidden_size
         self.classifier = nn.Linear(hidden_size, num_classes)
+        self.classifier.to(next(self.vision_model.parameters()).dtype)
 
         # Congela os parâmetros do backbone para garantir um Fine-Tuning eficiente (apenas o head ou adaptadores treinam)
         if freeze_vision:
@@ -245,7 +246,11 @@ def build_model(config, num_classes, device):
     lora_config = model_config["lora"]
 
     # Carrega o modelo com Scaled Dot Product Attention (SDPA)
-    clip_model = CLIPModel.from_pretrained(model_config["name"], attn_implementation="sdpa")
+    clip_model = CLIPModel.from_pretrained(
+            model_config["name"], 
+            attn_implementation="sdpa",
+            torch_dtype=torch.float32
+        )    
     vision_model = clip_model.vision_model
     del clip_model
 
@@ -429,7 +434,7 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     device = next(model.parameters()).device
 
     for pixel_values, labels in tqdm(loader, desc="train", leave=False):
-        pixel_values = pixel_values.to(device)
+        pixel_values = pixel_values.to(device, dtype=next(model.parameters()).dtype)
         labels = labels.to(device)
         
         optimizer.zero_grad()
@@ -484,7 +489,11 @@ def evaluate(model, loader):
     true_labels = []
 
     with torch.no_grad():
+        device = next(model.parameters()).device
+        model_dtype = next(model.parameters()).dtype
+        
         for pixel_values, labels in tqdm(loader, desc="eval", leave=False):
+            pixel_values = pixel_values.to(device, dtype=model_dtype)
             outputs = model(pixel_values=pixel_values)
             logits = outputs["logits"]
             pred = torch.argmax(logits, dim=1).cpu().numpy()

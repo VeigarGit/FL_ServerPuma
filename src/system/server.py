@@ -23,6 +23,9 @@ from lora_clip.clip_setup import (
     benchmark_attention, quantize_weights
 )
 
+from utils.fl_math import resize_model_to_pruned
+from lora_clip.clip_sora_utils import reduce_sora_state_dict_rank
+
 # --- HACK PERMITIDO: Inserindo a pasta 'src' no path do Python ---
 current_dir = Path(__file__).resolve().parent
 parent_dir = current_dir.parent
@@ -388,7 +391,7 @@ class FederatedLearningServer:
                 else:
                     current_global_state = self.global_state.copy()
             
-            if round_num >= 2 and self.prune == 0:
+            if round_num >= 2 and self.prune == 0 and self.args.model != 'clip':
                 logger.info("--- SERVER: PRUNING START (Round 2) ---")
                 if self.clients_info[client_id]['original_model_size'] is None:
                     max_amount = self.new_set_amount_prune(client_id)
@@ -419,7 +422,7 @@ class FederatedLearningServer:
                 g_model_pruned = g_model_pruned.state_dict()
                 logger.info("--- SERVER: PRUNING COMPLETE ---")
 
-            if round_num >= 2 and self.prune == 0:
+            if round_num >= 2 and self.prune == 0 and self.args.model != 'clip':
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
                 self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                 g_model_pruned = quantization(g_model_pruned)
@@ -469,9 +472,8 @@ class FederatedLearningServer:
             training_time = time.time() - start_time
             
             if updated_state is not None:
-                with self.lock:
-                    client_updates.append(updated_state)
-                    client_weights.append(dataset_size)
+                client_updates.append(updated_state)
+                client_weights.append(dataset_size)
                 
                 self.clients_info[client_id]['training_time'] = training_time
                 logger.info(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
@@ -618,6 +620,25 @@ class FederatedLearningServer:
                     self.aggregated_clients.append(len(client_updates))
                     
                     aggregated_state = self.aggregate_models(client_updates, self.global_state, client_weights)
+                    
+                    if self.args.model == 'clip' and self.args.prune_freq > 0:
+                        # Verifica se a rodada atual é múltipla da frequência desejada
+                        if (round_num + 1) % self.args.prune_freq == 0:
+                            logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")
+                            
+                            pruned_state, before, after, ranks_info = reduce_sora_state_dict_rank(aggregated_state)
+                            
+                            if before > 0 and after < before:
+                                reduction = (1 - after/before) * 100
+                                logger.info(f"   SoRA Params: {before:,} -> {after:,} ({reduction:.2f}% reduzido)")
+                                for info in ranks_info[:5]: # Mostra apenas as 5 primeiras para não poluir
+                                    logger.info(f"   - {info}")
+                                
+                                # Atualiza o estado agregado com as matrizes reduzidas
+                                aggregated_state = pruned_state
+                                
+                                # Redimensiona o modelo global localmente no servidor
+                                self.global_model = resize_model_to_pruned(self.global_model, aggregated_state)
                     
                     with self.lock:
                         self.global_state = aggregated_state

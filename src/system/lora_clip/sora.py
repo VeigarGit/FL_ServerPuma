@@ -52,6 +52,9 @@ class SoRAWrappedLinear(nn.Module):
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
         )
+        
+        self.sora.to(original_linear.weight.dtype)
+        
         # Congela os pesos originais para garantir que apenas o adaptador aprenda
         for p in self.original.parameters():
             p.requires_grad = False
