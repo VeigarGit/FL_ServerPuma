@@ -38,12 +38,12 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
     total_loss = 0.0
     device = next(model.parameters()).device
     
-    print(f"\n[DIAGNÓSTICO] Iniciando evaluate_model no device: {device}")
+    #print(f"\n[DIAGNÓSTICO] Iniciando evaluate_model no device: {device}")
     
     with torch.no_grad():
         model_dtype = next(model.parameters()).dtype
         for batch_idx, (x, y) in enumerate(data_loader):
-            print(f"--- Processando Batch {batch_idx} ---")
+            #print(f"--- Processando Batch {batch_idx} ---")
             if x.is_floating_point():
                 x = x.to(device, dtype=model_dtype)
             else:
@@ -52,13 +52,13 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
             y = y.to(device)
             
             # TESTE A: Verificando os Tipos de Dados (A Teoria do Conflito de Tipos)
-            print(f"[Teste A] Tipo da imagem (x): {x.dtype} | Shape: {x.shape}")
-            print(f"[Teste A] Tipo do parâmetro do modelo: {next(model.parameters()).dtype}")
+            #print(f"[Teste A] Tipo da imagem (x): {x.dtype} | Shape: {x.shape}")
+            #print(f"[Teste A] Tipo do parâmetro do modelo: {next(model.parameters()).dtype}")
             
             # TESTE B: Isolando o Forward Pass
-            print(f"[Teste B] Iniciando model(x)...")
+            #print(f"[Teste B] Iniciando model(x)...")
             output = model(x)
-            print(f"[Teste B] model(x) finalizado com sucesso!")
+            #print(f"[Teste B] model(x) finalizado com sucesso!")
             
             if isinstance(output, dict):
                 output = output.get("logits", output)
@@ -72,16 +72,16 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
             loss = loss_fn(output, y)
             
             # TESTE D: Isolando a sincronização com a CPU
-            print(f"[Teste D] Chamando loss.item()...")
+            # print(f"[Teste D] Chamando loss.item()...")
             total_loss += loss.item()
-            print(f"[Teste D] loss.item() extraído!")
+            #print(f"[Teste D] loss.item() extraído!")
             
             _, predicted = torch.max(output, 1)
             total += y.size(0)
             
-            print(f"[Teste D] Chamando sum().item()...")
+            #print(f"[Teste D] Chamando sum().item()...")
             correct += (predicted == y).sum().item()
-            print(f"[Teste D] sum().item() extraído! Batch concluído.\n")
+            #print(f"[Teste D] sum().item() extraído! Batch concluído.\n")
             
             # Parar no primeiro batch só para ver o que acontece
             break 

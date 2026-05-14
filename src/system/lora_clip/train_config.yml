@@ -4,7 +4,7 @@ dataset:
 model:
   name: openai/clip-vit-base-patch32
   lora:
-    mode: with_sora_no_schedule          # with_lora | without_lora | both | with_sora_no_schedule | with_sora_schedule
+    mode: with_sora_schedule          # with_lora | without_lora | both | with_sora_no_schedule | with_sora_schedule
     r: 8
     alpha: 32
     dropout: 0.05
@@ -16,11 +16,12 @@ model:
       - out_proj
   paca:                     # ← NOVO
     enabled: true
-    upper_layers: 6        # últimas 6 camadas do encoder (de 12 no ViT-B)
-    # upper_layers: null    # se quiser desabilitar
+    #Testar para todas as camadas com fine tuning
+    # upper_layers: 6        # últimas 6 camadas do encoder (de 12 no ViT-B)
+    upper_layers: null    # se quiser desabilitar
   sora:
     sparse_lambda: 0.001
-    sparse_lambda_2: 3.0e-3
+    sparse_lambda_2: 3.0e-4 # Testar para 3.0e-4
     sparse_lr: null
     lambda_schedule: linear
     max_lambda: 7.0e-4
