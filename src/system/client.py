@@ -245,7 +245,8 @@ def set_parameters(model, state_new):
 
 def save_results(args, rs_test_acc, rs_test_loss, idx=0, argalgo=0):
     b = "FedALA" if argalgo == 0 else "FedAVG"
-    algo = f"{args.dataset}_{b}_client_{idx}"
+    
+    algo = f"{args.dataset}_{args.strategy}_{b}_client_{idx}_run{args.run_id}"
     
     current_dir = Path(__file__).resolve().parent
     result_path = current_dir / "dados_compartilhados"
@@ -309,6 +310,10 @@ def parse_args():
     parser.add_argument("--ala", type=int, default=0)
     parser.add_argument("--model", type=str, default="cnn")
     parser.add_argument('--config', type=str, default="lora_clip/config.yaml")
+    parser.add_argument('--experiments', type=int, default=1)
+    parser.add_argument('--run-id', type=int, default=1)
+    parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
+    
     return parser.parse_args()
 
 def main():
@@ -347,7 +352,14 @@ def main():
         case 'clip':
             config = load_config(args.config)
             
-            # Resolve o modo de execução a partir do YAML
+            if args.strategy == 'lora':
+                config["model"]["lora"]["mode"] = "with_lora"
+            elif args.strategy == 'sora_with_schedule':
+                config["model"]["lora"]["mode"] = "with_sora_with_schedule"
+            elif args.strategy == 'sora_no_schedule':
+                config["model"]["lora"]["mode"] = "with_sora_no_schedule"
+            
+            # Resolve o modo de execução a partir do YAML modificado
             run_mode = resolve_run_modes(config)[0]
             run_config = build_run_config(config, run_mode=run_mode)
             

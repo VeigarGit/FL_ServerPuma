@@ -22,6 +22,7 @@ from lora_clip.clip_setup import (
     build_model, build_optimizer, build_scheduler, 
     benchmark_attention, quantize_weights
 )
+from lora_clip.sora import get_trainable_state_dict
 
 from utils.fl_math import resize_model_to_pruned
 from lora_clip.clip_sora_utils import reduce_sora_state_dict_rank
@@ -74,25 +75,46 @@ class FederatedLearningServer:
                         raise ValueError(f"Dataset inválido: {args.dataset}")
             case 'clip':
                 config = load_config(args.config)
+                
+                # --- INÍCIO DA SOBRESCRITA DA ESTRATÉGIA ---
+                # Pega a flag do terminal (--strategy) e força o modo no dicionário do YAML
+                if args.strategy == 'lora':
+                    print("Linha 82 =========================================")
+                    config["model"]["lora"]["mode"] = "with_lora"
+                elif args.strategy == 'sora_no_schedule':
+                    print("Linha 85 =========================================")
+                    config["model"]["lora"]["mode"] = "with_sora_no_schedule" 
+                elif args.strategy == 'sora_with_schedule':
+                    print("Linha 88 =========================================")
+                    config["model"]["lora"]["mode"] = "with_sora_schedule" 
+                elif args.strategy == 'full_ft':
+                    print("Linha 91 =========================================")
+                    config["model"]["lora"]["mode"] = "without_lora"
+
                 match config["dataset"]["name"]:
                     case "enterprise-explorers/oxford-pets":
-                        # 1. Carrega o YAML passado no argumento --config
-                        
-                        # 2. Descobre o modo (ex: "with_lora") configurado no YAML
+                        # Agora ele vai resolver o modo que nós forçamos acima!
                         run_mode = resolve_run_modes(config)[0]
                         run_config = build_run_config(config, run_mode=run_mode)
                         
-                        # 3. Instancia o CLIP (Oxford Pets tem 37 classes)
                         self.global_model = build_model(
                             config=run_config, 
                             num_classes=args.num_classes, 
                             device=args.device
                         )
-                        
-                        # 4. Input size padrão do processador do CLIP (1 batch, 3 canais, 224x224)
-                        # Necessário para o LayerComplexityCalculator não quebrar logo abaixo
                         self.input_size = (1, 3, 224, 224)
                         
+                        
+        if args.load_model:
+            logger.info(f"Carregando pesos salvos de: {args.load_model}")
+            state_dict = torch.load(args.load_model, map_location=args.device)
+            
+            # 1. Redimensiona a arquitetura do modelo em memória para o tamanho podado
+            self.global_model = resize_model_to_pruned(self.global_model, state_dict)
+            
+            # 2. Agora os formatos coincidem, podemos carregar os pesos com segurança
+            self.global_model.load_state_dict(state_dict, strict=False)
+            self.global_state = self.global_model.state_dict()
                 
 
         self.global_model = self.global_model.to(args.device)
@@ -386,7 +408,7 @@ class FederatedLearningServer:
             
             with self.lock:
                 if self.args.model == 'clip':
-                    from lora_clip.sora import get_trainable_state_dict
+            
                     current_global_state = get_trainable_state_dict(self.global_model)
                 else:
                     current_global_state = self.global_state.copy()
@@ -520,7 +542,7 @@ class FederatedLearningServer:
         i_str = str(i)
         a = "prune" if self.args.prune == 0 else "withou_Prune"
         b = "FedALA" if getattr(self, 'argalgo', 0) == 0 else "FedAVG"
-        algo = f"{self.args.dataset}_{a}_{b}_{i_str}"
+        algo = f"{self.args.dataset}_{a}_{b}_run{self.args.run_id}"
         
         # O Descarte Definitivo da Biblioteca os.path na Gestão Relacional 
         result_path = Path("..") / "results"
@@ -621,7 +643,7 @@ class FederatedLearningServer:
                     
                     aggregated_state = self.aggregate_models(client_updates, self.global_state, client_weights)
                     
-                    if self.args.model == 'clip' and self.args.prune == 0 and self.args.prune_freq > 0:
+                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0:
                         # Verifica se a rodada atual é múltipla da frequência desejada
                         if (round_num + 1) % self.args.prune_freq == 0:
                             logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")
@@ -686,6 +708,20 @@ class FederatedLearningServer:
                     logger.debug(f"Socket close exception (safe to ignore): {e}")
             logger.info("All client connections closed.")
             
+        if self.args.save_model:
+            logger.info(f"Salvando adaptadores e gates treinados...")
+            save_path = Path(self.args.save_model)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if self.args.model == 'clip':
+                # Salva APENAS o LoRA/SoRA e a Head de classificação para economizar espaço
+                weights_to_save = get_trainable_state_dict(self.global_model)
+            else:
+                weights_to_save = self.global_model.state_dict()
+
+            torch.save(weights_to_save, save_path)
+            logger.info(f"Modelo salvo com sucesso em: {save_path}")
+            
         self.save_results(times)
 
 def parse_args():
@@ -711,8 +747,13 @@ def parse_args():
     parser.add_argument('--experiments', type=int, default=1)
     parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip"])
     parser.add_argument('--config', type=str, default="lora_clip/config.yaml")
-    
     parser.add_argument('--prune-freq', type=int, default=0)
+    
+    parser.add_argument('--save-model', type=str, default=None, help='Caminho para salvar os pesos treinados (.pt)')
+    parser.add_argument('--load-model', type=str, default=None, help='Caminho para carregar pesos pré-treinados (.pt)')
+    
+    parser.add_argument('--run-id', type=int, default=1, help='ID da simulação atual')
+    parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
     return parser.parse_args()
 
 def main():
