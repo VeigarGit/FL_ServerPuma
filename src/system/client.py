@@ -355,7 +355,7 @@ def main():
             if args.strategy == 'lora':
                 config["model"]["lora"]["mode"] = "with_lora"
             elif args.strategy == 'sora_with_schedule':
-                config["model"]["lora"]["mode"] = "with_sora_with_schedule"
+                config["model"]["lora"]["mode"] = "with_sora_schedule"
             elif args.strategy == 'sora_no_schedule':
                 config["model"]["lora"]["mode"] = "with_sora_no_schedule"
             

@@ -1,11 +1,43 @@
-src/dataset/Cifar10
-src/dataset/MNIST
-src/dataset/OxfordPets
-src/dataset/Cifar100
-src/results
+# =========================
+# Cache do Python e Jupyter
+# =========================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# =========================
+# Datasets e Dados Brutos
+# =========================
+src/dataset/Cifar10/
+src/dataset/Cifar100/
+src/dataset/MNIST/
+src/dataset/OxfordPets/
+Cifar100/
 *.npz
-*.generated.yml*.pyc
+
+# =========================
+# Modelos e Resultados
+# =========================
+src/results/
+src/system/dados_compartilhados/
+*.h5
+
+# =========================
+# Gráficos e Visualizações
+# =========================
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# =========================
+# Docker e Autogerados
+# =========================
 docker-tc/
-Cifar100
+*.generated.yml
+
+# =========================
+# Arquivos Temporários
+# =========================
+*~

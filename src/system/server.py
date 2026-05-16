@@ -542,7 +542,7 @@ class FederatedLearningServer:
         i_str = str(i)
         a = "prune" if self.args.prune == 0 else "withou_Prune"
         b = "FedALA" if getattr(self, 'argalgo', 0) == 0 else "FedAVG"
-        algo = f"{self.args.dataset}_{a}_{b}_run{self.args.run_id}"
+        algo = f"{self.args.dataset}_{self.args.strategy}_{a}_{b}_run{self.args.run_id}"
         
         # O Descarte Definitivo da Biblioteca os.path na Gestão Relacional 
         result_path = Path("..") / "results"

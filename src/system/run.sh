@@ -19,7 +19,7 @@ IN_FEATURES=3
 DIM=1600
 MODEL="cnn"
 CONFIG_FILE="lora_clip/train_config.yml"
-PRUNE_FREQ=0
+PRUNE_FREQ=1
 
 # --- NOVO: Valor padrão para a estratégia ---
 STRATEGY="lora" 
