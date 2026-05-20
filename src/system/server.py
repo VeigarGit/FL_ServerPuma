@@ -133,6 +133,7 @@ class FederatedLearningServer:
         self.sended_withouquant = [0]
         self.aggregated_clients = []
         self.round_time = []
+        self.model_size_per_round = []
         self.bit = []
         self.complexity_calculated = False
         
@@ -557,6 +558,7 @@ class FederatedLearningServer:
             hf.create_dataset('Sended_without_quant', data=self.sended_withouquant)
             hf.create_dataset('Aggregated_clients', data=self.aggregated_clients)
             hf.create_dataset('Round_time', data=self.round_time)
+            hf.create_dataset('Model_size_per_round_Mb', data=self.model_size_per_round)
             
     def run_server(self, times):
         logger.info("=== Federated Learning Server ===")
@@ -685,6 +687,7 @@ class FederatedLearningServer:
                     
                     size_global_model = get_model_size(self.global_model)
                     logger.info(f'Size Global Model: {size_global_model:.2f}MB')
+                    self.model_size_per_round.append(size_global_model)
                     
                     successful_notifications = 0
                     for conn in self.client_connections:
