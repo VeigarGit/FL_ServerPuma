@@ -37,7 +37,7 @@ if str(parent_dir) not in sys.path:
 from model import SimpleModel
 from data_utils import read_client_data
 from prunning import prune_and_restructure
-from size_mode import get_model_size
+from size_mode import get_model_size, get_trainable_size_and_params
 from synexp import LayerComplexityCalculator
 from prunning_nisp import prune_fc1
 from prunning_snip import snip_pruning, apply_mask
@@ -90,6 +90,16 @@ class FederatedLearningServer:
                 elif args.strategy == 'full_ft':
                     print("Linha 91 =========================================")
                     config["model"]["lora"]["mode"] = "without_lora"
+                    
+                if "paca" not in config["model"]:
+                    config["model"]["paca"] = {}
+                
+                if args.paca is not None and args.paca > 0:
+                    config["model"]["paca"]["enabled"] = True
+                    config["model"]["paca"]["upper_layers"] = args.paca
+                else:
+                    config["model"]["paca"]["enabled"] = False
+                    config["model"]["paca"]["upper_layers"] = None
 
                 match config["dataset"]["name"]:
                     case "enterprise-explorers/oxford-pets":
@@ -134,6 +144,7 @@ class FederatedLearningServer:
         self.aggregated_clients = []
         self.round_time = []
         self.model_size_per_round = []
+        self.trainable_params_per_round = []
         self.bit = []
         self.complexity_calculated = False
         
@@ -543,8 +554,9 @@ class FederatedLearningServer:
         i_str = str(i)
         a = "prune" if self.args.prune == 0 else "withou_Prune"
         b = "FedALA" if getattr(self, 'argalgo', 0) == 0 else "FedAVG"
-        algo = f"{self.args.dataset}_{self.args.strategy}_{a}_{b}_run{self.args.run_id}"
         
+        paca_val = self.args.paca if (self.args.paca is not None and self.args.paca > 0) else 0
+        algo = f"{self.args.dataset}_{self.args.strategy}_paca{paca_val}_{a}_{b}_run{self.args.run_id}"
         # O Descarte Definitivo da Biblioteca os.path na Gestão Relacional 
         result_path = Path("..") / "results"
         result_path.mkdir(parents=True, exist_ok=True)
@@ -559,6 +571,7 @@ class FederatedLearningServer:
             hf.create_dataset('Aggregated_clients', data=self.aggregated_clients)
             hf.create_dataset('Round_time', data=self.round_time)
             hf.create_dataset('Model_size_per_round_Mb', data=self.model_size_per_round)
+            hf.create_dataset('Trainable_params', data=self.trainable_params_per_round)
             
     def run_server(self, times):
         logger.info("=== Federated Learning Server ===")
@@ -685,9 +698,10 @@ class FederatedLearningServer:
                     else:
                         logger.info(f"Round {round_num + 1}: Model aggregated (no test data)")
                     
-                    size_global_model = get_model_size(self.global_model)
-                    logger.info(f'Size Global Model: {size_global_model:.2f}MB')
-                    self.model_size_per_round.append(size_global_model)
+                    size_trainable_mb, num_trainable_params = get_trainable_size_and_params(self.global_model)
+                    logger.info(f'Size Trainable Adapters: {size_trainable_mb:.2f} MB | Trainable Params: {num_trainable_params:,}')
+                    self.model_size_per_round.append(size_trainable_mb)
+                    self.trainable_params_per_round.append(num_trainable_params)
                     
                     successful_notifications = 0
                     for conn in self.client_connections:
@@ -757,6 +771,7 @@ def parse_args():
     
     parser.add_argument('--run-id', type=int, default=1, help='ID da simulação atual')
     parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
+    parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')
     return parser.parse_args()
 
 def main():

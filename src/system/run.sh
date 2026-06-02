@@ -23,6 +23,7 @@ PRUNE_FREQ=1
 
 # --- NOVO: Valor padrão para a estratégia ---
 STRATEGY="lora" 
+PACA=12
 
 WEIGHTS_DIR="saved_weights"
 SAVE_MODEL_FLAG=""
@@ -37,6 +38,7 @@ while [ $# -gt 0 ]; do
         -p|--port) PORT="$2"; shift 2 ;;
         -d|--dataset) DATASET="$2"; shift 2 ;;
         -s|--session) SESSION_NAME="$2"; shift 2 ;;
+        --paca) PACA="$2"; shift 2 ;;
         -r|--rounds) ROUNDS="$2"; shift 2 ;;
         -t|--test-client-idx) TEST_CLIENT_IDX="$2"; shift 2 ;;
         --in-features) IN_FEATURES="$2"; shift 2 ;;
@@ -128,12 +130,12 @@ for RUN in $(seq 1 $SIMULATIONS); do
     echo "========================================================="
 
     # --- NOVO: Adicionado --strategy $STRATEGY no comando do server.py ---
-    tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN ; echo 'Servidor Finalizado! Reiniciando em 3s...'; sleep 3; tmux kill-session -t $SESSION_NAME"
+    tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --paca $PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN ; echo 'Servidor Finalizado! Reiniciando em 3s...'; sleep 3; tmux kill-session -t $SESSION_NAME"
     sleep 2
 
     for i in $(seq 0 $((CLIENT_COUNT-1))); do
         # --- NOVO: Adicionado --strategy $STRATEGY no comando do client.py ---
-        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $DEVICE_ID --model $MODEL --strategy $STRATEGY --config \"$CONFIG_FILE\" --run-id $RUN ; read"
+        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $DEVICE_ID --model $MODEL --strategy $STRATEGY --paca $PACA --config \"$CONFIG_FILE\" --run-id $RUN ; read"
         
         if [ $((i % 3)) -eq 0 ]; then
             tmux split-window -h "$CLIENT_CMD"

@@ -246,7 +246,8 @@ def set_parameters(model, state_new):
 def save_results(args, rs_test_acc, rs_test_loss, idx=0, argalgo=0):
     b = "FedALA" if argalgo == 0 else "FedAVG"
     
-    algo = f"{args.dataset}_{args.strategy}_{b}_client_{idx}_run{args.run_id}"
+    paca_val = args.paca if (args.paca is not None and args.paca > 0) else 0
+    algo = f"{args.dataset}_{args.strategy}_paca{paca_val}_{b}_client_{idx}_run{args.run_id}"
     
     current_dir = Path(__file__).resolve().parent
     result_path = current_dir / "dados_compartilhados"
@@ -313,6 +314,7 @@ def parse_args():
     parser.add_argument('--experiments', type=int, default=1)
     parser.add_argument('--run-id', type=int, default=1)
     parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
+    parser.add_argument('--paca', type=int, default=12, help='Número de camadas para a estratégia PaCA')
     
     return parser.parse_args()
 
@@ -358,6 +360,16 @@ def main():
                 config["model"]["lora"]["mode"] = "with_sora_schedule"
             elif args.strategy == 'sora_no_schedule':
                 config["model"]["lora"]["mode"] = "with_sora_no_schedule"
+                
+            if "paca" not in config["model"]:
+                config["model"]["paca"] = {}
+                
+            if args.paca is not None and args.paca > 0:
+                config["model"]["paca"]["enabled"] = True
+                config["model"]["paca"]["upper_layers"] = args.paca
+            else:
+                config["model"]["paca"]["enabled"] = False
+                config["model"]["paca"]["upper_layers"] = None
             
             # Resolve o modo de execução a partir do YAML modificado
             run_mode = resolve_run_modes(config)[0]
