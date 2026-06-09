@@ -24,6 +24,7 @@ PRUNE_FREQ=1
 # --- NOVO: Valor padrão para a estratégia ---
 STRATEGY="lora" 
 PACA=12
+RANK=8
 
 WEIGHTS_DIR="saved_weights"
 SAVE_MODEL_FLAG=""
@@ -57,13 +58,13 @@ while [ $# -gt 0 ]; do
         
         # --- NOVO: Captura da flag strategy ---
         --strategy) STRATEGY="$2"; shift 2 ;;
+        --rank) RANK="$2"; shift 2 ;;
         
         --save) 
             if [[ ! $2 =~ ^- ]] && [[ -n $2 ]]; then
                 SAVE_MODEL_PATH="$2"; shift 2
             else
-                # Adicionado a $STRATEGY no nome do arquivo para evitar conflitos!
-                SAVE_MODEL_PATH="$WEIGHTS_DIR/${MODEL}_${STRATEGY}_${DATASET}.pt"; shift 1
+                SAVE_MODEL_PATH="$WEIGHTS_DIR/${MODEL}_${STRATEGY}_rank${RANK}_${DATASET}.pt"; shift 1 # <-- ALTERADO
             fi
             SAVE_MODEL_FLAG="--save-model $SAVE_MODEL_PATH"
             ;;
@@ -71,8 +72,7 @@ while [ $# -gt 0 ]; do
             if [[ ! $2 =~ ^- ]] && [[ -n $2 ]]; then
                 LOAD_MODEL_PATH="$2"; shift 2
             else
-                # Adicionado a $STRATEGY no nome do arquivo
-                LOAD_MODEL_PATH="$WEIGHTS_DIR/${MODEL}_${STRATEGY}_${DATASET}.pt"; shift 1
+                LOAD_MODEL_PATH="$WEIGHTS_DIR/${MODEL}_${STRATEGY}_rank${RANK}_${DATASET}.pt"; shift 1 # <-- ALTERADO
             fi
             LOAD_MODEL_FLAG="--load-model $LOAD_MODEL_PATH"
             ;;
@@ -130,13 +130,11 @@ for RUN in $(seq 1 $SIMULATIONS); do
     echo "========================================================="
 
     # --- NOVO: Adicionado --strategy $STRATEGY no comando do server.py ---
-    tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --paca $PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN ; echo 'Servidor Finalizado! Reiniciando em 3s...'; sleep 3; tmux kill-session -t $SESSION_NAME"
+    tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN ; echo 'Servidor Finalizado! Reiniciando em 3s...'; sleep 3; tmux kill-session -t $SESSION_NAME"
     sleep 2
 
     for i in $(seq 0 $((CLIENT_COUNT-1))); do
-        # --- NOVO: Adicionado --strategy $STRATEGY no comando do client.py ---
-        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $DEVICE_ID --model $MODEL --strategy $STRATEGY --paca $PACA --config \"$CONFIG_FILE\" --run-id $RUN ; read"
-        
+        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $PACA --config \"$CONFIG_FILE\" --run-id $RUN ; read"        
         if [ $((i % 3)) -eq 0 ]; then
             tmux split-window -h "$CLIENT_CMD"
         else

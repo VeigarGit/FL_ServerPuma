@@ -93,6 +93,9 @@ class FederatedLearningServer:
                     
                 if "paca" not in config["model"]:
                     config["model"]["paca"] = {}
+                    
+                if "lora" in config["model"]:
+                    config["model"]["lora"]["r"] = args.rank
                 
                 if args.paca is not None and args.paca > 0:
                     config["model"]["paca"]["enabled"] = True
@@ -556,7 +559,7 @@ class FederatedLearningServer:
         b = "FedALA" if getattr(self, 'argalgo', 0) == 0 else "FedAVG"
         
         paca_val = self.args.paca if (self.args.paca is not None and self.args.paca > 0) else 0
-        algo = f"{self.args.dataset}_{self.args.strategy}_paca{paca_val}_{a}_{b}_run{self.args.run_id}"
+        algo = f"{self.args.dataset}_{self.args.strategy}_rank{self.args.rank}_paca{paca_val}_{a}_{b}_run{self.args.run_id}"
         # O Descarte Definitivo da Biblioteca os.path na Gestão Relacional 
         result_path = Path("..") / "results"
         result_path.mkdir(parents=True, exist_ok=True)
@@ -771,6 +774,7 @@ def parse_args():
     
     parser.add_argument('--run-id', type=int, default=1, help='ID da simulação atual')
     parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
+    parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA')
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')
     return parser.parse_args()
 
