@@ -143,10 +143,13 @@ for RUN in $(seq 1 $SIMULATIONS); do
     done
 
     tmux select-layout -t "$SESSION_NAME" tiled
-    tmux attach-session -t "$SESSION_NAME"
+    
+    echo "⏳ Aguardando a simulação $RUN terminar em segundo plano..."
+    # Loop que verifica a cada 5 segundos se a sessão do tmux ainda está ativa
+    while tmux has-session -t "$SESSION_NAME" 2>/dev/null; do
+        sleep 5
+    done
     
     echo "✅ Simulação $RUN concluída com sucesso!"
     sleep 2 
 done
-
-echo "🎉 Todas as $SIMULATIONS simulações foram finalizadas!"

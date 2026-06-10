@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# Loop de 2 até 8
-for current_rank in {2..4}
+# Loop de 3 até 4
+for current_rank in {4..4}
 do
     echo "========================================================="
     echo "🤖 INICIANDO EXPERIMENTO COM RANK = $current_rank"
     echo "========================================================="
     
+    # Execução do script (sem comentários no meio dos argumentos)
     ./run.sh \
         --clients 5 \
         --model clip \
@@ -18,7 +19,6 @@ do
         --strategy lora \
         --paca 12 \
         --prune 1 \
-        # --prune-freq 1 \
         --rank $current_rank
         
     echo "✅ Experimento com RANK = $current_rank finalizado."
@@ -26,4 +26,4 @@ do
     sleep 5
 done
 
-echo "🎉 Todos os experimentos de Rank 2 a 8 foram concluídos!"
+echo "🎉 Todos os experimentos de Rank 3 e 4 foram concluídos!"
