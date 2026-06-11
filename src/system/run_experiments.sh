@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Loop de 3 até 4
-for current_rank in {4..4}
+for current_rank in {6..7}
 do
     echo "========================================================="
     echo "🤖 INICIANDO EXPERIMENTO COM RANK = $current_rank"
