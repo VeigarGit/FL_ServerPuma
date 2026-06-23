@@ -35,6 +35,7 @@ if str(parent_dir) not in sys.path:
 from data_utils import read_client_data
 from prunning import prune_and_restructure
 from ALA import ALA
+from ALA_LoRA import ALA_LoRA
 from model import SimpleModel
 from utils.network_utils import send_data, recv_data
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
@@ -101,9 +102,13 @@ def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, r
     local_model = resize_model_to_pruned(model, state_dict)
     state = copy.deepcopy(local_model)
     
-    if alaarg == 0 and round_num == 2:
-        logger.info(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
-        local_initialization(ala, state, model)
+    if alaarg == 0:
+        if model_type == 'clip' and round_num >= 2:
+            logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
+            local_initialization(ala, state, model)
+        elif model_type != 'clip' and round_num == 2:
+            logger.info(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
+            local_initialization(ala, state, model)
         
     set_parameters(model, state)
     
@@ -215,8 +220,6 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
             correct += (predicted == y).sum().item()
             # print(f"[Teste D] sum().item() extraído! Batch concluído.\n")
             
-            # Parar no primeiro batch só para ver o que acontece
-            break 
 
     accuracy = 100 * correct / total
     average_loss = total_loss / len(data_loader)
@@ -243,7 +246,7 @@ def set_parameters(model, state_new):
     for new_param, old_param in zip(state_new.parameters(), model.parameters()):
         old_param.data = new_param.data.clone()
 
-def save_results(args, rs_test_acc, rs_test_loss, idx=0, argalgo=0):
+def save_results(args, rs_test_acc, rs_test_loss, rs_personalized_acc=None, idx=0, argalgo=0):
     b = "FedALA" if argalgo == 0 else "FedAVG"
     
     paca_val = args.paca if (args.paca is not None and args.paca > 0) else 0
@@ -259,6 +262,8 @@ def save_results(args, rs_test_acc, rs_test_loss, idx=0, argalgo=0):
     with h5py.File(file_path, 'w') as hf:
         hf.create_dataset('rs_test_acc', data=rs_test_acc)
         hf.create_dataset('rs_train_loss', data=rs_test_loss)
+        if rs_personalized_acc is not None:
+            hf.create_dataset('rs_personalized_acc', data=rs_personalized_acc)
 
 def local_initialization(ala, received_global_model, model, mask=None):
     ala.adaptive_local_aggregation(received_global_model, model, mask=mask)
@@ -390,6 +395,7 @@ def main():
     loss = nn.CrossEntropyLoss()
     acc = []
     losses = []
+    rs_personalized_acc = []
     
     try:
         is_clip_flag = (args.model == 'clip')
@@ -400,7 +406,11 @@ def main():
         logger.exception("Error loading data")
         sys.exit(1)
     
-    ala = ALA(args.client_idx, loss, train_loader, 32, 80, 2, 1.0, device)
+    if args.model == 'clip':
+        ala = ALA_LoRA(args.client_idx, loss, train_loader, 32, 80, 1.0, device)
+    else:
+        ala = ALA(args.client_idx, loss, train_loader, 32, 80, 2, 1.0, device)
+        
     time.sleep(10)
     
     # Colocar variavel de iteração para colocar o resultado médio de varias simulações e tirar média
@@ -431,8 +441,17 @@ def main():
                 ammount, _ = recv_data(s)
             
             if round_num + 1 >= 2:
+                if args.model == 'clip':
+                    old_local_weights = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
+
                 local = resize_model_to_pruned(model, global_state)
                 test_accuracy, test_loss = evaluate_model(local, test_loader)
+                
+                if args.model == 'clip':
+                    for n, p in model.named_parameters():
+                        if p.requires_grad and n in old_local_weights:
+                            if p.data.shape == old_local_weights[n].shape:
+                                p.data.copy_(old_local_weights[n])
             else:
                 test_accuracy, test_loss = evaluate_model(model, test_loader)
                 
@@ -452,6 +471,11 @@ def main():
                 model_type=args.model, 
                 run_config=run_config if args.model == 'clip' else None 
             )
+            
+            pers_acc, pers_loss = evaluate_model(model, test_loader)
+            rs_personalized_acc.append(pers_acc)
+            logger.info(f"Client {args.client_idx}: Personalized Acc: {pers_acc:.2f}% | Personalized Loss: {pers_loss:.4f}")
+            
             logger.info("Local training completed.")
 
             train_accuracy, train_loss = evaluate_model(model, train_loader)
@@ -470,7 +494,7 @@ def main():
                 logger.exception("Error waiting for server")
                 break
                 
-    save_results(args, acc, losses, idx=args.client_idx, argalgo=args.ala)
+    save_results(args, acc, losses, rs_personalized_acc, idx=args.client_idx, argalgo=args.ala)
     logger.info("\nTraining completed!")
 
 if __name__ == '__main__':

@@ -661,7 +661,7 @@ class FederatedLearningServer:
                     
                     aggregated_state = self.aggregate_models(client_updates, self.global_state, client_weights)
                     
-                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0:
+                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0 and self.prune == 0:
                         # Verifica se a rodada atual é múltipla da frequência desejada
                         if (round_num + 1) % self.args.prune_freq == 0:
                             logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")

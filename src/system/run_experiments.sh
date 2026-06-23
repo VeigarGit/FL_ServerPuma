@@ -1,29 +1,35 @@
 #!/bin/bash
 
-# Loop de 3 até 4
-for current_rank in {6..7}
+# Vamos iterar a flag --ala entre 1 (FedAVG padrão/Desligado) e 0 (FedALA/Ligado)
+for current_ala in 1 0
 do
+    if [ $current_ala -eq 0 ]; then
+        ala_name="FedALA (LIGADO)"
+    else
+        ala_name="FedAVG (DESLIGADO)"
+    fi
+    
     echo "========================================================="
-    echo "🤖 INICIANDO EXPERIMENTO COM RANK = $current_rank"
+    echo "🤖 INICIANDO EXPERIMENTO SORA RANK 8 | MODO: $ala_name"
     echo "========================================================="
     
-    # Execução do script (sem comentários no meio dos argumentos)
+    # Execução do script
     ./run.sh \
         --clients 5 \
         --model clip \
         --dataset OxfordPets \
         --rounds 30 \
         --num-classes 37 \
-        --ala 1 \
+        --ala $current_ala \
         --simulations 1 \
-        --strategy lora \
-        --paca 12 \
+        --strategy sora_no_schedule \
+        --paca 0 \
         --prune 1 \
-        --rank $current_rank
+        --rank 8
         
-    echo "✅ Experimento com RANK = $current_rank finalizado."
-    echo "Aguardando 5 segundos para esfriar antes do próximo..."
+    echo "✅ Experimento com MODO = $ala_name finalizado."
+    echo "Aguardando 5 segundos para limpar buffers da GPU antes do próximo..."
     sleep 5
 done
 
-echo "🎉 Todos os experimentos de Rank 3 e 4 foram concluídos!"
+echo "🎉 Ambos os experimentos (Com e Sem FedALA) foram concluídos!"
