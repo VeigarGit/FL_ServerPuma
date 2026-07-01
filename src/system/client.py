@@ -8,6 +8,7 @@ import os
 import sys
 import argparse
 import logging
+import random
 from pathlib import Path
 
 import torch
@@ -92,8 +93,12 @@ def map_sequential_to_simplemodel(state_dict):
 #             quantized_state_dict[k] = v
 #     return quantized_state_dict
 
-def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None, model_type='cnn', run_config=None):
-    state_dict = dequantization(state_dict)
+def local_training(model, state_dict, prune, train_loader, test_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None, model_type='cnn', run_config=None):
+    # Verifica se os pesos precisam ser desquantizados (se não forem tensores)
+    if state_dict and not isinstance(next(iter(state_dict.values())), torch.Tensor):
+        state_dict = dequantization(state_dict)
+    
+    personalized_acc = None  # Inicializa a variável que guardará a acurácia pós-ALA
     
     if round_num >= 2 and prune == 0:
         if model_type == 'cnn':
@@ -111,6 +116,12 @@ def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, r
             local_initialization(ala, state, model)
         
     set_parameters(model, state)
+    
+    # === AVALIAÇÃO PÓS-ALA (IMEDIATAMENTE APÓS A MISTURA) ===
+    if alaarg == 0 and round_num >= 2:
+        personalized_acc, _ = evaluate_model(model, test_loader)
+        logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
+    # =========================================================
     
     model.train()
     loss_fn = nn.CrossEntropyLoss()
@@ -161,73 +172,15 @@ def local_training(model, state_dict, prune, train_loader, learning_rate=0.01, r
     # --- 2. SELEÇÃO DOS PESOS QUE SERÃO ENVIADOS PARA O SERVIDOR ---
     if model_type == 'clip':
         from lora_clip.sora import get_trainable_state_dict
-        return get_trainable_state_dict(model) # Envia APENAS o LoRA e Head
+        return get_trainable_state_dict(model), personalized_acc # Envia APENAS o LoRA e Head, e a acuracia pos-ALA
     else:
-        return model.state_dict() # Envia tudo do CNN
+        return model.state_dict(), personalized_acc # Envia tudo do CNN, e a acuracia pos-ALA
 
-def evaluate_model(model: nn.Module, data_loader: DataLoader):
-    """Avalia o modelo e retorna (Acurácia, Loss Média)."""
-    model.eval()
-    correct = 0
-    total = 0
-    loss_fn = nn.CrossEntropyLoss()
-    total_loss = 0.0
-    device = next(model.parameters()).device
-    
-    #print(f"\n[DIAGNÓSTICO] Iniciando evaluate_model no device: {device}")
 
-    with torch.no_grad():
-        model_dtype = next(model.parameters()).dtype # Descobre a língua do modelo
-        for batch_idx, (x, y) in enumerate(data_loader):
-            #print(f"--- Processando Batch {batch_idx} ---")
-            
-            if x.is_floating_point():
-                x = x.to(device, dtype=model_dtype)
-            else:
-                x = x.to(device)
-            
-            y = y.to(device)
-            
-            # TESTE A: Verificando os Tipos de Dados (A Teoria do Conflito de Tipos)
-            # print(f"[Teste A] Tipo da imagem (x): {x.dtype} | Shape: {x.shape}")
-            # print(f"[Teste A] Tipo do parâmetro do modelo: {next(model.parameters()).dtype}")
-            
-            # TESTE B: Isolando o Forward Pass
-            # print(f"[Teste B] Iniciando model(x)...")
-            output = model(x)
-            # print(f"[Teste B] model(x) finalizado com sucesso!")
-            
-            if isinstance(output, dict):
-                output = output.get("logits", output)
-                
-            y = y.squeeze()
-            
-            # TESTE C: Verificando valores corrompidos (A Teoria da Divisão por Zero)
-            if torch.isnan(output).any():
-                print(f"[Teste C] ALERTA: A saída do modelo gerou NaNs (valores infinitos ou inválidos)!")
-                
-            loss = loss_fn(output, y)
-            
-            # TESTE D: Isolando a sincronização com a CPU
-            # print(f"[Teste D] Chamando loss.item()...")
-            total_loss += loss.item()
-            # print(f"[Teste D] loss.item() extraído!")
-            
-            _, predicted = torch.max(output, 1)
-            total += y.size(0)
-            
-            # print(f"[Teste D] Chamando sum().item()...")
-            correct += (predicted == y).sum().item()
-            # print(f"[Teste D] sum().item() extraído! Batch concluído.\n")
-            
-
-    accuracy = 100 * correct / total
-    average_loss = total_loss / len(data_loader)
-    return accuracy, average_loss
 
 import torchvision.transforms as T # Adicione isto no topo dos imports
 
-def load_data(dataset, client_idx, is_train=True, batch_size=32, is_clip=False):
+def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip=False):
     train_data = read_client_data(dataset, client_idx, is_train)
     X, y = zip(*train_data)
     X = torch.stack(X)
@@ -237,16 +190,16 @@ def load_data(dataset, client_idx, is_train=True, batch_size=32, is_clip=False):
         resize = T.Resize((224, 224), antialias=True)
         X = resize(X)
         
-    # Garante que o rótulo é inteiro longo (obrigatório para CrossEntropyLoss)
-    y = torch.tensor(y, dtype=torch.long)
+    # Garante que o rótulo é inteiro longo e move os dados INTEIROS para a GPU
+    X = X.to(device)
+    y = torch.tensor(y, dtype=torch.long).to(device)
+    
     dataset = torch.utils.data.TensorDataset(X, y)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-def set_parameters(model, state_new):
-    for new_param, old_param in zip(state_new.parameters(), model.parameters()):
-        old_param.data = new_param.data.clone()
 
-def save_results(args, rs_test_acc, rs_test_loss, rs_personalized_acc=None, idx=0, argalgo=0):
+
+def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0):
     b = "FedALA" if argalgo == 0 else "FedAVG"
     
     paca_val = args.paca if (args.paca is not None and args.paca > 0) else 0
@@ -260,10 +213,13 @@ def save_results(args, rs_test_acc, rs_test_loss, rs_personalized_acc=None, idx=
     logger.info(f"Salvando resultados em: {file_path}")
     
     with h5py.File(file_path, 'w') as hf:
-        hf.create_dataset('rs_test_acc', data=rs_test_acc)
-        hf.create_dataset('rs_train_loss', data=rs_test_loss)
-        if rs_personalized_acc is not None:
-            hf.create_dataset('rs_personalized_acc', data=rs_personalized_acc)
+        hf.create_dataset('rs_global_acc', data=rs_global_acc)
+        hf.create_dataset('rs_global_loss', data=rs_global_loss)
+        if rs_ala_acc is not None and len(rs_ala_acc) > 0:
+            hf.create_dataset('rs_ala_acc', data=rs_ala_acc)
+        hf.create_dataset('rs_local_acc', data=rs_local_acc)
+        hf.create_dataset('rs_train_acc', data=rs_train_acc)
+        hf.attrs['paca_used'] = paca_val
 
 def local_initialization(ala, received_global_model, model, mask=None):
     ala.adaptive_local_aggregation(received_global_model, model, mask=mask)
@@ -322,13 +278,19 @@ def parse_args():
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA') 
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas para a estratégia PaCA')
     
+    # --- PaCA Heterogêneo ---
+    parser.add_argument('--random-paca', action='store_true', help='Sorteia um valor de PaCA aleatório para este cliente')
+    parser.add_argument('--paca-min', type=int, default=1, help='Valor mínimo de PaCA no sorteio aleatório')
+    parser.add_argument('--paca-max', type=int, default=12, help='Valor máximo de PaCA no sorteio aleatório')
+    parser.add_argument('--paca-list', type=str, default=None, help='Lista de PaCAs pré-definidos por cliente (ex: "4,6,8,12"). O cliente usa o valor na posição client_idx %% len(lista)')
+    
     return parser.parse_args()
 
 def main():
     args = parse_args()
     
     # Controle contextual (evitar import os espalhado)
-    os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+    # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"  # Desativado: causa alto uso de CPU. Usar apenas para debug de erros CUDA.
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     if args.device == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA is not available. Falling back to CPU.")
@@ -336,10 +298,22 @@ def main():
     
     device = torch.device(args.device)
     
+    # --- Resolução do PaCA Heterogêneo ---
+    if args.paca_list is not None:
+        # Modo lista: valores pré-definidos por cliente (determinístico)
+        paca_values = [int(x.strip()) for x in args.paca_list.split(',')]
+        args.paca = paca_values[args.client_idx % len(paca_values)]
+        logger.info(f"PaCA Heterogêneo (lista): Cliente {args.client_idx} usando PaCA = {args.paca}")
+    elif args.random_paca:
+        # Modo aleatório: sorteia uma vez no início (seed baseada no client_idx + run_id para reprodutibilidade)
+        rng = random.Random(args.client_idx * 1000 + args.run_id)
+        args.paca = rng.randint(args.paca_min, args.paca_max)
+        logger.info(f"PaCA Heterogêneo (aleatório): Cliente {args.client_idx} sorteou PaCA = {args.paca} (intervalo [{args.paca_min}, {args.paca_max}])")
+    
     logger.info("=== Federated Learning Client ===")
     logger.info(f"Host: {args.host}:{args.port}")
     logger.info(f"Dataset: {args.dataset}")
-    logger.info(f"Client: {args.client_idx}")
+    logger.info(f"Client: {args.client_idx} | PaCA: {args.paca}")
     logger.info(f"Rounds: {args.rounds}")
     logger.info(f"Batch size: {args.batch_size} | LR: {args.learning_rate}")
     logger.info("=================================")
@@ -393,14 +367,16 @@ def main():
             
     model = model.to(device)
     loss = nn.CrossEntropyLoss()
-    acc = []
-    losses = []
-    rs_personalized_acc = []
+    rs_global_acc = []
+    rs_global_loss = []
+    rs_ala_acc = []
+    rs_local_acc = []
+    rs_train_acc = []
     
     try:
         is_clip_flag = (args.model == 'clip')
-        train_loader = load_data(args.dataset, args.client_idx, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag)
-        test_loader = load_data(args.dataset, args.client_idx, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag)
+        train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag)
+        test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag)
         logger.info(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
     except Exception as e:
         logger.exception("Error loading data")
@@ -455,31 +431,41 @@ def main():
             else:
                 test_accuracy, test_loss = evaluate_model(model, test_loader)
                 
-            logger.info(f"Client {args.client_idx}: Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
-            acc.append(test_accuracy)
-            losses.append(test_loss)
+            logger.info(f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
+            rs_global_acc.append(test_accuracy)
+            rs_global_loss.append(test_loss)
+
+         
             
-            updated_state = local_training(
+            updated_state, personalized_acc = local_training(
                 model=model, 
                 state_dict=global_state, 
                 prune=prune, 
                 train_loader=train_loader, 
+                test_loader=test_loader,
                 learning_rate=args.learning_rate, 
                 round_num=round_num + 1, 
                 alaarg=args.ala, 
                 ala=ala,
                 model_type=args.model, 
-                run_config=run_config if args.model == 'clip' else None 
+                run_config=run_config if args.model == 'clip' else None
             )
             
-            pers_acc, pers_loss = evaluate_model(model, test_loader)
-            rs_personalized_acc.append(pers_acc)
-            logger.info(f"Client {args.client_idx}: Personalized Acc: {pers_acc:.2f}% | Personalized Loss: {pers_loss:.4f}")
-            
+            # Se o FedALA calculou a acurácia, nós salvamos ela; se não (ex: round 1 ou ala desativado), salvamos 0.0 para manter o array com mesmo tamanho
+            if personalized_acc is not None:
+                rs_ala_acc.append(personalized_acc)
+            else:
+                rs_ala_acc.append(0.0)
+                        
             logger.info("Local training completed.")
 
-            train_accuracy, train_loss = evaluate_model(model, train_loader)
-            logger.info(f"Client {args.client_idx}: Training Accuracy: {train_accuracy:.2f}% | Training Loss: {train_loss:.4f}")
+            # Acurácia logo após o treinamento local (avaliado no conjunto de teste para comparação justa)
+            local_test_acc, local_test_loss = evaluate_model(model, test_loader)
+            rs_local_acc.append(local_test_acc)
+            
+            train_accuracy, train_loss = 0,0 #evaluate_model(model, train_loader)
+            rs_train_acc.append(train_accuracy)
+            logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
             
             updated_state = quantization(updated_state)
             send_data(s, updated_state)
@@ -494,7 +480,7 @@ def main():
                 logger.exception("Error waiting for server")
                 break
                 
-    save_results(args, acc, losses, rs_personalized_acc, idx=args.client_idx, argalgo=args.ala)
+    save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=args.client_idx, argalgo=args.ala)
     logger.info("\nTraining completed!")
 
 if __name__ == '__main__':

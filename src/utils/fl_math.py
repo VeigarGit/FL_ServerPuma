@@ -56,9 +56,8 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
             #print(f"[Teste A] Tipo do parâmetro do modelo: {next(model.parameters()).dtype}")
             
             # TESTE B: Isolando o Forward Pass
-            #print(f"[Teste B] Iniciando model(x)...")
-            output = model(x)
-            #print(f"[Teste B] model(x) finalizado com sucesso!")
+            with torch.autocast(device_type=device.type, dtype=torch.float16 if device.type == 'cuda' else torch.bfloat16):
+                output = model(x)
             
             if isinstance(output, dict):
                 output = output.get("logits", output)
@@ -82,9 +81,6 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
             #print(f"[Teste D] Chamando sum().item()...")
             correct += (predicted == y).sum().item()
             #print(f"[Teste D] sum().item() extraído! Batch concluído.\n")
-            
-            # Parar no primeiro batch só para ver o que acontece
-            break 
 
     accuracy = 100 * correct / total
     average_loss = total_loss / len(data_loader)

@@ -90,7 +90,7 @@ class ALA:
         rand_idx = random.randint(0, len(self.train_data)-rand_num)
         
 
-# Usar o dataset subjacente em vez do DataLoader
+        # Usar o dataset subjacente em vez do DataLoader
         dataset = self.train_data.dataset  # assumindo que self.train_data é um DataLoader
         subset = Subset(dataset, range(rand_idx, rand_idx + rand_num))
         rand_loader = DataLoader(subset, self.batch_size, drop_last=False)

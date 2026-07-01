@@ -74,6 +74,12 @@ class ALA_LoRA:
         # Deactivate ALA at the 1st communication iteration 
         # (check if difference between first trainable parameter is roughly zero)
         diff_sum = torch.sum(torch.abs(params_g_dict[trainable_names[0]].data - params_dict[trainable_names[0]].data))
+
+        print(f"\n[DEBUG FedALA] Rodada do Cliente {self.cid} | Diferença Local-Global: {diff_sum.item()}")
+
+        # Sobre aconselhamento de rafael veiga, o if estava comentado, 
+        # MAS isso causa um loop de 11 épocas inúteis porque os pesos nunca mudam.
+        # Desativar o ALA na rodada 1 é o comportamento padrão e correto do paper.
         if diff_sum == 0:
             return
 

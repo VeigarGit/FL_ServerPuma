@@ -509,8 +509,9 @@ class FederatedLearningServer:
             training_time = time.time() - start_time
             
             if updated_state is not None:
-                client_updates.append(updated_state)
-                client_weights.append(dataset_size)
+                with self.lock:
+                    client_updates.append(updated_state)
+                    client_weights.append(dataset_size)
                 
                 self.clients_info[client_id]['training_time'] = training_time
                 logger.info(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
@@ -659,7 +660,12 @@ class FederatedLearningServer:
                     logger.info(f"Round {round_num + 1}: Aggregating {len(client_updates)} updates")
                     self.aggregated_clients.append(len(client_updates))
                     
-                    aggregated_state = self.aggregate_models(client_updates, self.global_state, client_weights)
+                    # Garantir acesso seguro no momento de ler os updates!
+                    with self.lock:
+                        safe_client_updates = list(client_updates)
+                        safe_client_weights = list(client_weights)
+                    
+                    aggregated_state = self.aggregate_models(safe_client_updates, self.global_state, safe_client_weights)
                     
                     if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0 and self.prune == 0:
                         # Verifica se a rodada atual é múltipla da frequência desejada

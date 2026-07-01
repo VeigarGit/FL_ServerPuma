@@ -11,7 +11,7 @@ TEST_CLIENT_IDX=0
 NUM_CLASSES=100
 BATCH_SIZE=32
 MAX_CLIENTS=10
-PRUNE=0
+PRUNE=1
 ALA=1 
 DEVICE="cuda"
 DEVICE_ID="0"
@@ -22,9 +22,17 @@ CONFIG_FILE="lora_clip/train_config.yml"
 PRUNE_FREQ=1
 
 # --- NOVO: Valor padrão para a estratégia ---
+
+# todo acho que podemos resolver o 1 e 3, o 2 não, mas então o maior gargalo é o evaluet né? sugere alguma coisa ? novamente, deixe os sleeps como estão, a parte de do break e de usar a melhor gpu tudo bem.
 STRATEGY="lora" 
 PACA=12
 RANK=8
+
+# --- PaCA Heterogêneo ---
+RANDOM_PACA=0
+PACA_MIN=1
+PACA_MAX=12
+PACA_LIST=""
 
 WEIGHTS_DIR="saved_weights"
 SAVE_MODEL_FLAG=""
@@ -59,6 +67,12 @@ while [ $# -gt 0 ]; do
         # --- NOVO: Captura da flag strategy ---
         --strategy) STRATEGY="$2"; shift 2 ;;
         --rank) RANK="$2"; shift 2 ;;
+        
+        # --- PaCA Heterogêneo ---
+        --random-paca) RANDOM_PACA=1; shift 1 ;;
+        --paca-min) PACA_MIN="$2"; shift 2 ;;
+        --paca-max) PACA_MAX="$2"; shift 2 ;;
+        --paca-list) PACA_LIST="$2"; shift 2 ;;
         
         --save) 
             if [[ ! $2 =~ ^- ]] && [[ -n $2 ]]; then
@@ -99,6 +113,14 @@ else
 fi
 echo "  Device: $DEVICE ($DEVICE_ID) | Sessão TMUX: $SESSION_NAME"
 
+if [ "$RANDOM_PACA" -eq 1 ]; then
+    echo "  🎲 PaCA Heterogêneo: ATIVADO (aleatório entre $PACA_MIN e $PACA_MAX)"
+elif [ -n "$PACA_LIST" ]; then
+    echo "  🎲 PaCA Heterogêneo: ATIVADO (lista: $PACA_LIST)"
+else
+    echo "  PaCA: $PACA (fixo para todos)"
+fi
+
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
 echo "===================================="
@@ -129,12 +151,37 @@ for RUN in $(seq 1 $SIMULATIONS); do
     echo "🚀 INICIANDO SIMULAÇÃO $RUN DE $SIMULATIONS"
     echo "========================================================="
 
+    # --- Determinar PaCA do servidor: se heterogêneo, forçar o máximo ---
+    if [ "$RANDOM_PACA" -eq 1 ]; then
+        SERVER_PACA=$PACA_MAX
+    elif [ -n "$PACA_LIST" ]; then
+        # Encontrar o maior valor da lista para usar no servidor
+        SERVER_PACA=$(echo "$PACA_LIST" | tr ',' '\n' | sort -rn | head -1)
+    else
+        SERVER_PACA=$PACA
+    fi
+
     # --- NOVO: Adicionado --strategy $STRATEGY no comando do server.py ---
-    tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN ; echo 'Servidor Finalizado! Reiniciando em 3s...'; sleep 3; tmux kill-session -t $SESSION_NAME"
+    tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN ; echo 'Pressione ENTER nesta tela do servidor para fechar a sessão do tmux...'; read; tmux kill-session -t $SESSION_NAME"
     sleep 2
 
     for i in $(seq 0 $((CLIENT_COUNT-1))); do
-        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $PACA --config \"$CONFIG_FILE\" --run-id $RUN ; read"        
+        # --- Montar flags de PaCA heterogêneo para o cliente ---
+        PACA_FLAGS="--paca $PACA"
+        if [ "$RANDOM_PACA" -eq 1 ]; then
+            PACA_FLAGS="--random-paca --paca-min $PACA_MIN --paca-max $PACA_MAX"
+        elif [ -n "$PACA_LIST" ]; then
+            PACA_FLAGS="--paca-list $PACA_LIST"
+        fi
+
+        # --- Distribuição de clientes entre GPUs (round-robin) ---
+        if [ $((i % 2)) -eq 0 ]; then
+            CLIENT_DEVICE_ID="0"
+        else
+            CLIENT_DEVICE_ID="1"
+        fi
+
+        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN ; read"        
         if [ $((i % 3)) -eq 0 ]; then
             tmux split-window -h "$CLIENT_CMD"
         else
