@@ -103,26 +103,53 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
     if round_num >= 2 and prune == 0:
         if model_type == 'cnn':
             state_dict = map_sequential_to_simplemodel(state_dict)
-
-    local_model = resize_model_to_pruned(model, state_dict)
-    state = copy.deepcopy(local_model)
-    
-    if alaarg == 0:
-        if model_type == 'clip' and round_num >= 2:
-            logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
-            local_initialization(ala, state, model)
-        elif model_type != 'clip' and round_num == 2:
-            logger.info(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
-            local_initialization(ala, state, model)
+    # === CORREÇÃO ESTRUTURAL APENAS PARA O CLIP ===
+    if model_type == 'clip':
+        # 1. 'model' contém nossos pesos locais. 
+        # Criamos o 'global_model' copiando a estrutura atual.
+        global_model = copy.deepcopy(model)
         
-    set_parameters(model, state)
-    
-    # === AVALIAÇÃO PÓS-ALA (IMEDIATAMENTE APÓS A MISTURA) ===
-    if alaarg == 0 and round_num >= 2:
-        personalized_acc, _ = evaluate_model(model, test_loader)
-        logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
-    # =========================================================
-    
+        # 2. Injetamos os pesos do servidor (state_dict) APENAS no global_model
+        global_model = resize_model_to_pruned(global_model, state_dict)
+        
+        # 3. Agora temos os mundos perfeitamente isolados:
+        # model -> Possui os Pesos Locais
+        # global_model -> Possui os Pesos Globais
+        
+        if alaarg == 0 and round_num >= 2:
+            logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
+            
+            # O FedALA lê os dois modelos, calcula a proporção ideal 
+            # e salva o resultado da mistura DENTRO do 'model'
+            local_initialization(ala, global_model, model)
+            
+            # Avaliação imediata pós-ALA para ver se a mistura foi boa
+            personalized_acc, _ = evaluate_model(model, test_loader)
+            logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
+        else:
+            # Fluxo FedAvg Clássico (alaarg != 0) ou Rodada 1: 
+            # O modelo local apenas aceita os pesos globais para iniciar o treino
+            set_parameters(model, global_model)
+            
+        # Limpa o modelo global da memória para evitar Out Of Memory (OOM) na GPU
+        del global_model
+        
+    else:
+        # --- LÓGICA ANTIGA PARA CNN MANTIDA INTACTA ---
+        local_model = resize_model_to_pruned(model, state_dict)
+        state = copy.deepcopy(local_model)
+        
+        if alaarg == 0:
+            # Aviso: Este código da CNN continua bugado (round_num == 2)
+            if round_num == 2:
+                logger.info(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
+                local_initialization(ala, state, model)
+            
+        set_parameters(model, state)
+        
+        if alaarg == 0 and round_num >= 2:
+            personalized_acc, _ = evaluate_model(model, test_loader)
+            logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
     model.train()
     loss_fn = nn.CrossEntropyLoss()
     device = next(model.parameters()).device

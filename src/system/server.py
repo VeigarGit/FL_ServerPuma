@@ -182,40 +182,36 @@ class FederatedLearningServer:
         for key in global_model.keys():
             weighted_sum = None
             total_weight_for_key = 0.0
+            global_val = global_model[key]
             
             for idx, model_state in enumerate(model_list):
                 if key in model_state:
                     local_val = model_state[key]
-                    global_val = global_model[key]
                     
                     if self._are_compatible_with_pruning(local_val, global_val, key):
-                        # Conversões para Numpy
-                        if isinstance(local_val, torch.Tensor):
-                            local_np = local_val.detach().cpu().numpy()
+                        # GARANTINDO ALTA VELOCIDADE: Operações estritas na GPU/CPU via PyTorch (Fim do Numpy)
+                        if not isinstance(global_val, torch.Tensor):
+                            global_val = torch.tensor(global_val, device=self.args.device)
+                        
+                        if not isinstance(local_val, torch.Tensor):
+                            local_val = torch.tensor(local_val, device=global_val.device)
                         else:
-                            local_np = np.array(local_val)
-                            
-                        if isinstance(global_val, torch.Tensor):
-                            global_np = global_val.detach().cpu().numpy()
-                        else:
-                            global_np = np.array(global_val)
+                            local_val = local_val.to(global_val.device)
 
                         aligned_val = self._align_to_global_structure(
-                            local_np, global_np, key, model_state, idx
+                            local_val, global_val, key, model_state, idx
                         )
                         
                         weight = normalized_weights[idx]
                         
                         if weighted_sum is None:
-                            weighted_sum = np.zeros_like(aligned_val)
+                            weighted_sum = torch.zeros_like(aligned_val)
                         
                         weighted_sum += aligned_val * weight
                         total_weight_for_key += weight
             
             if weighted_sum is not None and total_weight_for_key > 0:
                 agg_state[key] = weighted_sum / total_weight_for_key
-                if isinstance(global_model[key], torch.Tensor):
-                    agg_state[key] = torch.from_numpy(agg_state[key]).to(global_model[key].device)
         
         return agg_state
     
@@ -257,7 +253,7 @@ class FederatedLearningServer:
         return local_val
     
     def _align_with_mask(self, local_val, global_val, mask_info):
-        aligned = np.zeros_like(global_val)
+        aligned = torch.zeros_like(global_val)
         if 'indices' in mask_info:
             indices = mask_info['indices']
             if len(indices) == len(local_val):
@@ -280,7 +276,7 @@ class FederatedLearningServer:
             logger.warning("Kernel size incompatível para convolução")
             return local_val
         
-        aligned = np.zeros_like(global_val)
+        aligned = torch.zeros_like(global_val)
         min_out = min(local_out, global_out)
         min_in = min(local_in, global_in)
         aligned[:min_out, :min_in, :, :] = local_val[:min_out, :min_in, :, :]
@@ -293,7 +289,7 @@ class FederatedLearningServer:
         local_out, local_in = local_val.shape
         global_out, global_in = global_val.shape
         
-        aligned = np.zeros_like(global_val)
+        aligned = torch.zeros_like(global_val)
         min_out = min(local_out, global_out)
         min_in = min(local_in, global_in)
         aligned[:min_out, :min_in] = local_val[:min_out, :min_in]
@@ -306,7 +302,7 @@ class FederatedLearningServer:
         local_len = local_val.shape[0]
         global_len = global_val.shape[0]
         
-        aligned = np.zeros_like(global_val)
+        aligned = torch.zeros_like(global_val)
         min_len = min(local_len, global_len)
         aligned[:min_len] = local_val[:min_len]
         return aligned
@@ -691,15 +687,13 @@ class FederatedLearningServer:
                         self.global_model.load_state_dict(self.global_state, strict=False)
                     
                     if self.test_loader is not None:
-                        acc, loss = [], []
-                        for i in self.client_idx:
-                            self.test_loader = self.load_test_data(self.args.dataset, i, self.args.batch_size)
-                            accuracy, avg_loss = evaluate_model(self.global_model, self.test_loader)
-                            acc.append(accuracy)
-                            loss.append(avg_loss)
-                            
-                        final_accuracy = sum(acc) / len(acc)
-                        final_loss = sum(loss) / len(loss)
+                        # CORREÇÃO 1: Avaliar APENAS no dataset de teste global (cliente principal)
+                        # Removemos o loop lento que iterava por todos os clientes (for i in self.client_idx)
+                        self.test_loader = self.load_test_data(self.args.dataset, self.args.test_client_idx, self.args.batch_size)
+                        accuracy, avg_loss = evaluate_model(self.global_model, self.test_loader)
+                        
+                        final_accuracy = accuracy
+                        final_loss = avg_loss
                         
                         self.rs_test_acc.append(final_accuracy)
                         self.rs_test_loss.append(final_loss)
