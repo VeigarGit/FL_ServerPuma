@@ -1,0 +1,105 @@
+import json
+
+with open('src/system/plot_results.ipynb', 'r', encoding='utf-8') as f:
+    nb = json.load(f)
+
+for cell in nb.get('cells', []):
+    if cell.get('cell_type') == 'code':
+        source = "".join(cell.get('source', []))
+        if 'RESULTS_DIR = "../results/"' in source:
+            new_source = (
+                "# Caminho padrão para a pasta de resultados (SERVIDOR)\n"
+                "SERVER_RESULTS_DIR = \"../results/\"\n"
+                "# Caminho para a pasta de resultados locais (CLIENTES)\n"
+                "CLIENT_RESULTS_DIR = \"./dados_compartilhados/\"\n"
+            )
+            cell['source'] = [line + '\n' for line in new_source.split('\n') if line]
+
+        if 'def load_strategy_results' in source:
+            new_source = (
+                "import os\n"
+                "import glob\n"
+                "import numpy as np\n"
+                "import h5py\n"
+                "\n"
+                "def load_strategy_results(dataset, strategy, paca=12, algo=\"FedALA\", prune=\"withou_Prune\", rank=8):\n"
+                "    if rank is not None:\n"
+                "        pattern = os.path.join(\n"
+                "            SERVER_RESULTS_DIR,\n"
+                "            f\"{dataset}_{strategy}_rank{rank}_paca{paca}_{prune}_{algo}_run*.h5\"\n"
+                "        )\n"
+                "    else:\n"
+                "        pattern = os.path.join(\n"
+                "            SERVER_RESULTS_DIR,\n"
+                "            f\"{dataset}_{strategy}_paca{paca}_{prune}_{algo}_run*.h5\"\n"
+                "        )\n"
+                "    files = glob.glob(pattern)\n"
+                "    \n"
+                "    if not files:\n"
+                "        print(f\"⚠️ Nenhum arquivo de SERVIDOR encontrado para: {pattern}\")\n"
+                "        return None\n"
+                "        \n"
+                "    print(f\"✅ Encontrados {len(files)} arquivos de SERVIDOR para o padrão: {dataset}_{strategy}_paca{paca}_{prune}_{algo}\")\n"
+                "    \n"
+                "    acc_runs, loss_runs, mb_runs, mb_bruto_runs, time_runs, params_runs, size_runs = [], [], [], [], [], [], []\n"
+                "    \n"
+                "    for f in files:\n"
+                "        with h5py.File(f, 'r') as hf:\n"
+                "            acc_runs.append(np.array(hf['rs_test_acc']))\n"
+                "            loss_runs.append(np.array(hf['rs_train_loss']))\n"
+                "            mb_runs.append(np.array(hf['sended_model_Mb']))\n"
+                "            mb_bruto_runs.append(np.array(hf['Sended_without_quant']))\n"
+                "            time_runs.append(np.array(hf['Round_time']))\n"
+                "            \n"
+                "            if 'Trainable_params' in hf:\n"
+                "                params_runs.append(np.array(hf['Trainable_params']))\n"
+                "            else:\n"
+                "                params_runs.append(np.zeros_like(np.array(hf['Round_time'])))\n"
+                "                \n"
+                "            if 'Model_size_per_round_Mb' in hf:\n"
+                "                size_runs.append(np.array(hf['Model_size_per_round_Mb']))\n"
+                "            else:\n"
+                "                size_runs.append(np.zeros_like(np.array(hf['Round_time'])))\n"
+                "            \n"
+                "    return {\n"
+                "        'acc_mean': np.mean(acc_runs, axis=0), 'acc_std': np.std(acc_runs, axis=0),\n"
+                "        'loss_mean': np.mean(loss_runs, axis=0), 'loss_std': np.std(loss_runs, axis=0),\n"
+                "        'mb_mean': np.mean(mb_runs, axis=0), 'mb_std': np.std(mb_runs, axis=0),\n"
+                "        'mb_bruto_mean': np.mean(mb_bruto_runs, axis=0), 'mb_bruto_std': np.std(mb_bruto_runs, axis=0),\n"
+                "        'time_mean': np.mean(time_runs, axis=0), 'time_std': np.std(time_runs, axis=0),\n"
+                "        'params_mean': np.mean(params_runs, axis=0), 'params_std': np.std(params_runs, axis=0),\n"
+                "        'size_mb_mean': np.mean(size_runs, axis=0), 'size_mb_std': np.std(size_runs, axis=0),\n"
+                "    }\n"
+                "\n"
+                "def load_client_results(dataset, strategy, rank=8, algo=\"FedALA\"):\n"
+                "    pattern = os.path.join(\n"
+                "        CLIENT_RESULTS_DIR,\n"
+                "        f\"{dataset}_{strategy}_rank{rank}_paca*_{algo}_client_*_run*.h5\"\n"
+                "    )\n"
+                "    files = glob.glob(pattern)\n"
+                "    if not files:\n"
+                "        print(f\"⚠️ Nenhum arquivo de CLIENTE encontrado para: {pattern}\")\n"
+                "        return None\n"
+                "    print(f\"✅ Encontrados {len(files)} arquivos de CLIENTES para o padrão: {dataset}_{strategy}\")\n"
+                "    \n"
+                "    global_acc_runs, global_loss_runs, ala_acc_runs, local_acc_runs, train_acc_runs = [], [], [], [], []\n"
+                "    for f in files:\n"
+                "        with h5py.File(f, 'r') as hf:\n"
+                "            global_acc_runs.append(np.array(hf['rs_global_acc']))\n"
+                "            global_loss_runs.append(np.array(hf['rs_global_loss']))\n"
+                "            if 'rs_ala_acc' in hf:\n"
+                "                ala_acc_runs.append(np.array(hf['rs_ala_acc']))\n"
+                "            local_acc_runs.append(np.array(hf['rs_local_acc']))\n"
+                "            train_acc_runs.append(np.array(hf['rs_train_acc']))\n"
+                "    return {\n"
+                "        'global_acc_mean': np.mean(global_acc_runs, axis=0), 'global_acc_std': np.std(global_acc_runs, axis=0),\n"
+                "        'global_loss_mean': np.mean(global_loss_runs, axis=0), 'global_loss_std': np.std(global_loss_runs, axis=0),\n"
+                "        'ala_acc_mean': np.mean(ala_acc_runs, axis=0) if ala_acc_runs else None,\n"
+                "        'local_acc_mean': np.mean(local_acc_runs, axis=0),\n"
+                "        'train_acc_mean': np.mean(train_acc_runs, axis=0)\n"
+                "    }\n"
+            )
+            cell['source'] = [line + '\n' for line in new_source.split('\n') if line]
+
+with open('src/system/plot_results.ipynb', 'w', encoding='utf-8') as f:
+    json.dump(nb, f, indent=1)

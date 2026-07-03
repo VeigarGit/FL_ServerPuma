@@ -412,7 +412,7 @@ class FederatedLearningServer:
     
     def handle_client(self, conn, client_updates, client_weights, round_num, client_id):
         bit_rate = []
-        self.masks = []
+        masks = []
         try:
             start_time = time.time()
             logger.info(f"Round {round_num}: Handling client {client_id}")
@@ -450,27 +450,29 @@ class FederatedLearningServer:
                     g_model_pruned = apply_mask(g_model_pruned, self.mask)
                     g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=0.0, size_fc=self.size_fc, data=self.args.dataset)
                 
-                self.masks.append(mask)
+                masks.append(mask)
                 self.client_masks[client_id] = mask
                 g_model_pruned = g_model_pruned.state_dict()
                 logger.info("--- SERVER: PRUNING COMPLETE ---")
 
             if round_num >= 2 and self.prune == 0 and self.args.model != 'clip':
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
-                self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                 g_model_pruned = quantization(g_model_pruned)
                 size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
-                self.sended_ammount.append(self.sended_ammount[-1] + size_after)
+                with self.lock:
+                    self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
+                    self.sended_ammount.append(self.sended_ammount[-1] + size_after)
                 
                 send_data(conn, g_model_pruned)
                 send_data(conn, self.prune)
                 send_data(conn, max_amount)
             else:
                 size_before = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
-                self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                 current_global_state = quantization(current_global_state)
                 size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
-                self.sended_ammount.append(self.sended_ammount[-1] + size_after)
+                with self.lock:
+                    self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
+                    self.sended_ammount.append(self.sended_ammount[-1] + size_after)
                 
                 send_data(conn, current_global_state)
                 send_data(conn, self.prune)
@@ -500,7 +502,8 @@ class FederatedLearningServer:
             media_rate = (sum(bit_rate) / len(bit_rate)) / 8 / (1024 * 1024)
             self.clients_info[client_id]['bandwidth'] = media_rate
             self.clients_info[client_id]['data'] = self.client_data[client_id]
-            self.bit.append(media_rate)
+            with self.lock:
+                self.bit.append(media_rate)
             
             training_time = time.time() - start_time
             
@@ -637,16 +640,16 @@ class FederatedLearningServer:
                     t.start()
                     threads.append(t)
                 
+                init_time = time.time()
                 if round_num == 1:
                     for t in threads: t.join()
                 else:
-                    init_time = time.time()
                     for t in threads: t.join(timeout=self.time_trashold)
                 
                 if round_num == 0:
                     self.set_trashold()
                     
-                round_duration = time.time() - (init_time if round_num != 1 else time.time())
+                round_duration = time.time() - init_time
                 self.round_time.append(round_duration)
                 
                 logger.info(f"Round {round_num + 1} duration: {round_duration:.2f} seconds")

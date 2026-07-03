@@ -38,6 +38,7 @@ WEIGHTS_DIR="saved_weights"
 SAVE_MODEL_FLAG=""
 LOAD_MODEL_FLAG=""
 SIMULATIONS=1
+AUTO_NEXT=0
 
 # 2. Processamento de Argumentos
 while [ $# -gt 0 ]; do
@@ -63,6 +64,7 @@ while [ $# -gt 0 ]; do
         --config) CONFIG_FILE="$2"; shift 2 ;;
         --prune-freq) PRUNE_FREQ="$2"; shift 2 ;;
         --simulations) SIMULATIONS="$2"; shift 2 ;; 
+        --auto-next) AUTO_NEXT=1; shift 1 ;;
         
         # --- NOVO: Captura da flag strategy ---
         --strategy) STRATEGY="$2"; shift 2 ;;
@@ -162,7 +164,12 @@ for RUN in $(seq 1 $SIMULATIONS); do
     fi
 
     # --- NOVO: Adicionado --strategy $STRATEGY no comando do server.py ---
-    tmux new-session -d -s "$SESSION_NAME" "uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN ; echo 'Pressione ENTER nesta tela do servidor para fechar a sessão do tmux...'; read; tmux kill-session -t $SESSION_NAME"
+    SERVER_CMD="uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN"
+    if [ "$AUTO_NEXT" -eq 1 ]; then
+        tmux new-session -d -s "$SESSION_NAME" "$SERVER_CMD"
+    else
+        tmux new-session -d -s "$SESSION_NAME" "$SERVER_CMD ; echo 'Pressione ENTER nesta tela do servidor para fechar a sessão do tmux...'; read; tmux kill-session -t $SESSION_NAME"
+    fi
     sleep 2
 
     for i in $(seq 0 $((CLIENT_COUNT-1))); do
@@ -181,7 +188,10 @@ for RUN in $(seq 1 $SIMULATIONS); do
             CLIENT_DEVICE_ID="1"
         fi
 
-        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN ; read"        
+        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN"
+        if [ "$AUTO_NEXT" -eq 0 ]; then
+            CLIENT_CMD="$CLIENT_CMD ; read"
+        fi
         if [ $((i % 3)) -eq 0 ]; then
             tmux split-window -h "$CLIENT_CMD"
         else

@@ -482,16 +482,18 @@ def main():
             if personalized_acc is not None:
                 rs_ala_acc.append(personalized_acc)
             else:
-                rs_ala_acc.append(0.0)
-                        
+                # Se o ALA não rodou, salvamos a acurácia global para a linha do gráfico não cair
+                rs_ala_acc.append(test_accuracy)
+
             logger.info("Local training completed.")
 
             # Acurácia logo após o treinamento local (avaliado no conjunto de teste para comparação justa)
             local_test_acc, local_test_loss = evaluate_model(model, test_loader)
             rs_local_acc.append(local_test_acc)
             
-            train_accuracy, train_loss = 0,0 #evaluate_model(model, train_loader)
+            train_accuracy, train_loss = evaluate_model(model, train_loader)
             rs_train_acc.append(train_accuracy)
+
             logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
             
             updated_state = quantization(updated_state)
