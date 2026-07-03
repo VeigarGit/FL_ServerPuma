@@ -80,7 +80,7 @@ while [ $# -gt 0 ]; do
             if [[ ! $2 =~ ^- ]] && [[ -n $2 ]]; then
                 SAVE_MODEL_PATH="$2"; shift 2
             else
-                SAVE_MODEL_PATH="$WEIGHTS_DIR/${MODEL}_${STRATEGY}_rank${RANK}_${DATASET}.pt"; shift 1 # <-- ALTERADO
+                SAVE_MODEL_PATH="$WEIGHTS_DIR/${MODEL}_${STRATEGY}_rank${RANK}_prune${PRUNE}_freq${PRUNE_FREQ}_${DATASET}.pt"; shift 1 # <-- ALTERADO
             fi
             SAVE_MODEL_FLAG="--save-model $SAVE_MODEL_PATH"
             ;;
@@ -88,7 +88,7 @@ while [ $# -gt 0 ]; do
             if [[ ! $2 =~ ^- ]] && [[ -n $2 ]]; then
                 LOAD_MODEL_PATH="$2"; shift 2
             else
-                LOAD_MODEL_PATH="$WEIGHTS_DIR/${MODEL}_${STRATEGY}_rank${RANK}_${DATASET}.pt"; shift 1 # <-- ALTERADO
+                LOAD_MODEL_PATH="$WEIGHTS_DIR/${MODEL}_${STRATEGY}_rank${RANK}_prune${PRUNE}_freq${PRUNE_FREQ}_${DATASET}.pt"; shift 1 # <-- ALTERADO
             fi
             LOAD_MODEL_FLAG="--load-model $LOAD_MODEL_PATH"
             ;;

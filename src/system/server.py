@@ -559,7 +559,7 @@ class FederatedLearningServer:
         b = "FedALA" if getattr(self, 'argalgo', 0) == 0 else "FedAVG"
         
         paca_val = self.args.paca if (self.args.paca is not None and self.args.paca > 0) else 0
-        algo = f"{self.args.dataset}_{self.args.strategy}_rank{self.args.rank}_paca{paca_val}_{a}_{b}_run{self.args.run_id}"
+        algo = f"{self.args.dataset}_{self.args.strategy}_rank{self.args.rank}_paca{paca_val}_{a}_freq{self.args.prune_freq}_{b}_run{self.args.run_id}"
         # O Descarte Definitivo da Biblioteca os.path na Gestão Relacional 
         result_path = Path("..") / "results"
         result_path.mkdir(parents=True, exist_ok=True)
