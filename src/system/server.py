@@ -561,10 +561,11 @@ class FederatedLearningServer:
         paca_val = self.args.paca if (self.args.paca is not None and self.args.paca > 0) else 0
         algo = f"{self.args.dataset}_{self.args.strategy}_rank{self.args.rank}_paca{paca_val}_{a}_freq{self.args.prune_freq}_{b}_run{self.args.run_id}"
         # O Descarte Definitivo da Biblioteca os.path na Gestão Relacional 
-        result_path = Path("..") / "results"
+        result_path = Path("..") / "results" / self.args.exp_name
         result_path.mkdir(parents=True, exist_ok=True)
         
-        file_path = result_path / f"{algo}.h5"
+        # Padronizando com o prefixo 'server_' para não misturar com o client
+        file_path = result_path / f"server_{algo}.h5"
         
         with h5py.File(file_path, 'w') as hf:
             hf.create_dataset('rs_test_acc', data=self.rs_test_acc)
@@ -776,6 +777,7 @@ def parse_args():
     parser.add_argument('--load-model', type=str, default=None, help='Caminho para carregar pesos pré-treinados (.pt)')
     
     parser.add_argument('--run-id', type=int, default=1, help='ID da simulação atual')
+    parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão com timestamp')
     parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA')
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')

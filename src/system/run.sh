@@ -148,6 +148,10 @@ if [ -n "$SAVE_MODEL_FLAG" ]; then
 fi
 
 # 5. Loop de Simulações
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+EXP_NAME="${SESSION_NAME}_${TIMESTAMP}"
+echo "📁 Diretório de Resultados: ../results/$EXP_NAME"
+
 for RUN in $(seq 1 $SIMULATIONS); do
     echo "========================================================="
     echo "🚀 INICIANDO SIMULAÇÃO $RUN DE $SIMULATIONS"
@@ -164,7 +168,7 @@ for RUN in $(seq 1 $SIMULATIONS); do
     fi
 
     # --- NOVO: Adicionado --strategy $STRATEGY no comando do server.py ---
-    SERVER_CMD="uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN"
+    SERVER_CMD="uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME"
     if [ "$AUTO_NEXT" -eq 1 ]; then
         tmux new-session -d -s "$SESSION_NAME" "$SERVER_CMD"
     else
@@ -188,7 +192,7 @@ for RUN in $(seq 1 $SIMULATIONS); do
             CLIENT_DEVICE_ID="1"
         fi
 
-        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN"
+        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN --exp-name $EXP_NAME"
         if [ "$AUTO_NEXT" -eq 0 ]; then
             CLIENT_CMD="$CLIENT_CMD ; read"
         fi

@@ -72,16 +72,30 @@ class ALA_LoRA:
             return
 
         # Deactivate ALA at the 1st communication iteration 
-        # (check if difference between first trainable parameter is roughly zero)
-        diff_sum = torch.sum(torch.abs(params_g_dict[trainable_names[0]].data - params_dict[trainable_names[0]].data))
+        # (check if difference between ALL trainable parameters is roughly zero)
+        diff_sum = 0.0
+        for n in trainable_names:
+            diff_sum += torch.sum(torch.abs(params_g_dict[n].data - params_dict[n].data)).item()
 
-        print(f"\n[DEBUG FedALA] Rodada do Cliente {self.cid} | Diferença Local-Global: {diff_sum.item()}")
+        print(f"\n[DEBUG FedALA] Rodada do Cliente {self.cid} | Diferença Local-Global: {diff_sum:.4f}")
 
         # Sobre aconselhamento de rafael veiga, o if estava comentado, 
         # MAS isso causa um loop de 11 épocas inúteis porque os pesos nunca mudam.
         # Desativar o ALA na rodada 1 é o comportamento padrão e correto do paper.
-        if diff_sum == 0:
+        if diff_sum == 0.0:
             return
+
+        # Verifica se as dimensões do modelo mudaram (ex: devido a pruning pelo SoRA).
+        # Se os pesos do ALA já foram inicializados, mas o shape atual da camada é 
+        # diferente do shape guardado no FedALA, significa que o modelo foi podado.
+        # Nesse caso, resetamos os pesos de agregação para reiniciar o FedALA corretamente.
+        if self.weights is not None:
+            for n in trainable_names:
+                if n in self.weights and self.weights[n].shape != params_dict[n].data.shape:
+                    print(f"\n[ALA_LoRA] Pruning detectado em {n}. Reinicializando pesos do FedALA.")
+                    self.weights = None
+                    self.start_phase = True
+                    break
 
         # Initialize the weights to all ones in the beginning
         if self.weights is None:
