@@ -26,6 +26,7 @@ PRUNE_FREQ=1
 # todo acho que podemos resolver o 1 e 3, o 2 não, mas então o maior gargalo é o evaluet né? sugere alguma coisa ? novamente, deixe os sleeps como estão, a parte de do break e de usar a melhor gpu tudo bem.
 STRATEGY="lora" 
 PACA=12
+ADAPTIVE_PACA=0
 RANK=8
 
 # --- PaCA Heterogêneo ---
@@ -69,6 +70,7 @@ while [ $# -gt 0 ]; do
         # --- NOVO: Captura da flag strategy ---
         --strategy) STRATEGY="$2"; shift 2 ;;
         --rank) RANK="$2"; shift 2 ;;
+        --adaptive-paca) ADAPTIVE_PACA=1; shift 1 ;;
         
         # --- PaCA Heterogêneo ---
         --random-paca) RANDOM_PACA=1; shift 1 ;;
@@ -120,7 +122,11 @@ if [ "$RANDOM_PACA" -eq 1 ]; then
 elif [ -n "$PACA_LIST" ]; then
     echo "  🎲 PaCA Heterogêneo: ATIVADO (lista: $PACA_LIST)"
 else
-    echo "  PaCA: $PACA (fixo para todos)"
+    if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+        echo "  PaCA: $PACA (MÁXIMO) | ⚡ PaCA Adaptativo (Server): ATIVADO"
+    else
+        echo "  PaCA: $PACA (fixo para todos)"
+    fi
 fi
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
@@ -169,6 +175,9 @@ for RUN in $(seq 1 $SIMULATIONS); do
 
     # --- NOVO: Adicionado --strategy $STRATEGY no comando do server.py ---
     SERVER_CMD="uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME"
+    if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --adaptive-paca"
+    fi
     if [ "$AUTO_NEXT" -eq 1 ]; then
         tmux new-session -d -s "$SESSION_NAME" "$SERVER_CMD"
     else

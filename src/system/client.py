@@ -128,8 +128,10 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
             logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
         else:
             # Fluxo FedAvg Clássico (alaarg != 0) ou Rodada 1: 
-            # O modelo local apenas aceita os pesos globais para iniciar o treino
-            set_parameters(model, global_model)
+            # ATENÇÃO: Nunca use set_parameters(model, global_model) aqui se o shape puder mudar (SoRA).
+            # set_parameters troca o ponteiro de .data e corrompe o grafo do otimizador/CUDA.
+            # O resize_model_to_pruned recria o nn.Parameter com segurança via setattr se o shape mudar.
+            resize_model_to_pruned(model, state_dict)
             
         # Limpa o modelo global da memória para evitar Out Of Memory (OOM) na GPU
         del global_model

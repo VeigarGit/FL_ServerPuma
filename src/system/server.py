@@ -144,6 +144,7 @@ class FederatedLearningServer:
         self.prune = args.prune
         self.sended_ammount = [0]
         self.sended_withouquant = [0]
+        self.rs_client_paca = []
         self.aggregated_clients = []
         self.round_time = []
         self.model_size_per_round = []
@@ -162,6 +163,13 @@ class FederatedLearningServer:
         logger.info(f"Calculado: {len(alpha_list)} camadas")
         logger.info(f"Total α: {sum(alpha_list):,} parâmetros")
         logger.info(f"Total β: {sum(beta_list):,} FLOPs")
+        
+        # Detectar total de encoder layers dinamicamente (para PaCA)
+        if hasattr(self.global_model, 'vision_model') and hasattr(self.global_model.vision_model, 'encoder'):
+            self.total_encoder_layers = len(self.global_model.vision_model.encoder.layers)
+        else:
+            self.total_encoder_layers = self.args.paca  # fallback
+        logger.info(f"Total encoder layers detectado: {self.total_encoder_layers}")
         
         # Dicionário para armazenar máscaras por cliente
         self.client_masks = {}
@@ -382,6 +390,130 @@ class FederatedLearningServer:
         logger.debug(f"Calculated pruning rate para {client_id}: {pruning_rate:.3f}")
         return pruning_rate
 
+    def calculate_adaptive_paca(self, client_id):
+        """
+        Calcula o PaCA ideal para um cliente baseado em dois critérios:
+        
+        1. LATÊNCIA: Se o cliente é gargalo (training_time > threshold), reduz PaCA.
+        2. ACURÁCIA: Se a acurácia estabilizou (plateau), reduz PaCA porque as camadas
+           extras não estão contribuindo — menos camadas = menos comunicação de graça.
+        
+        Proteções:
+        - Se a acurácia caiu após redução de PaCA, reverte (sobe de volta).
+        - Mínimo 25% das camadas.
+        - Máximo ±2 camadas de mudança por round.
+        """
+        try:
+            client_info = self.clients_info[client_id]
+        except KeyError:
+            return self.args.paca
+
+        bandwidth = client_info.get('bandwidth')
+        training_time = client_info.get('training_time')
+        current_paca = client_info.get('current_paca', self.args.paca)
+        max_paca = self.args.paca  # O máximo possível (definido na CLI)
+        paca_min = max(max_paca // 2, 4)  # Mínimo 50% das camadas (ex: 6 de 12)
+
+        # Sem dados suficientes, mantém o atual
+        if bandwidth is None or training_time is None:
+            return current_paca
+
+        target_latency = getattr(self, 'time_trashold', 60.0)
+        
+        # --- CRITÉRIO 2: ACURÁCIA (verificado primeiro, é global) ---
+        accuracy_signal = self._check_accuracy_signal(client_id, current_paca, paca_min, max_paca)
+        if accuracy_signal is not None:
+            return accuracy_signal
+
+        # --- CRITÉRIO 1: LATÊNCIA (per-client) ---
+        # Se o cliente completou dentro do threshold, pode manter ou subir
+        if training_time <= target_latency:
+            if training_time < target_latency * 0.7 and current_paca < max_paca:
+                new_paca = min(current_paca + 1, max_paca)
+                logger.debug(f"PaCA adaptativo {client_id}: subindo {current_paca} -> {new_paca} "
+                             f"(tempo={training_time:.1f}s << threshold={target_latency:.1f}s)")
+                return new_paca
+            return current_paca
+
+        # Cliente está lento: calcular quantas camadas cabem no budget
+        time_per_paca_layer = training_time / max(current_paca, 1)
+        ideal_paca = int(target_latency / time_per_paca_layer) if time_per_paca_layer > 0 else current_paca
+
+        ideal_paca = max(paca_min, min(max_paca, ideal_paca))
+
+        # Suavização: não mudar mais que 2 camadas por round
+        if abs(ideal_paca - current_paca) > 2:
+            ideal_paca = current_paca - 2 if ideal_paca < current_paca else current_paca + 2
+
+        logger.info(f"PaCA adaptativo {client_id}: {current_paca} -> {ideal_paca} "
+                    f"(bw={bandwidth:.2f} MB/s, time={training_time:.1f}s, target={target_latency:.1f}s)")
+        return ideal_paca
+
+    def _check_accuracy_signal(self, client_id, current_paca, paca_min, max_paca):
+        """
+        Verifica se a acurácia indica que o PaCA pode ser ajustado.
+        
+        Retorna:
+            int: novo PaCA se a acurácia motivou uma mudança
+            None: se a acurácia não é conclusiva (deixa a latência decidir)
+        """
+        acc_history = self.rs_test_acc
+        window = 5  # Janela de rounds para análise
+        
+        # Precisa de pelo menos 'window' rounds de histórico
+        if len(acc_history) < window:
+            return None
+        
+        recent = acc_history[-window:]
+        mean_acc = sum(recent) / len(recent)
+        std_acc = (sum((x - mean_acc) ** 2 for x in recent) / len(recent)) ** 0.5
+        
+        # --- COOLDOWN: respeitar intervalo mínimo entre reduções ---
+        last_reduction_round = self.clients_info[client_id].get('last_paca_reduction_round', 0)
+        current_round = len(acc_history)
+        cooldown_rounds = 3
+        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
+        
+        # --- SEGURANÇA: acurácia caiu após redução? Reverte com +2. ---
+        paca_before_last_change = self.clients_info[client_id].get('paca_before_change')
+        if paca_before_last_change is not None and paca_before_last_change > current_paca:
+            # PaCA foi reduzido. Verificar se a acurácia caiu.
+            acc_before_window = acc_history[-(window + 1):-1] if len(acc_history) > window else acc_history[:window]
+            mean_before = sum(acc_before_window) / len(acc_before_window)
+            
+            if mean_acc < mean_before - 2.0:  # Caiu mais de 2 pontos percentuais
+                new_paca = min(current_paca + 2, max_paca)  # Reversão forte: +2
+                logger.info(f"PaCA adaptativo {client_id}: REVERTENDO {current_paca} -> {new_paca} "
+                            f"(acurácia caiu: {mean_before:.1f}% -> {mean_acc:.1f}%)")
+                self.clients_info[client_id]['paca_before_change'] = current_paca
+                return new_paca
+        
+        # --- PLATEAU: acurácia estabilizou? Tenta reduzir (com proteções). ---
+        # Condições: desvio < 0.5%, fora do cooldown, e acurácia acima de 85%
+        if (std_acc < 0.5 
+                and current_paca > paca_min 
+                and not in_cooldown 
+                and mean_acc >= 85.0):
+            new_paca = current_paca - 1
+            logger.info(f"PaCA adaptativo {client_id}: reduzindo {current_paca} -> {new_paca} "
+                        f"(acurácia estável: {mean_acc:.1f}% ± {std_acc:.2f}%, camadas extras desnecessárias)")
+            self.clients_info[client_id]['paca_before_change'] = current_paca
+            self.clients_info[client_id]['last_paca_reduction_round'] = current_round
+            return new_paca
+        
+        return None  # Acurácia não é conclusiva, deixa latência decidir
+
+
+    def _is_excluded_by_paca(self, key, min_layer_idx):
+        """Retorna True se a chave pertence a uma camada ABAIXO do PaCA mínimo."""
+        if "encoder.layers." not in key:
+            return False  # Head de classificação etc. sempre incluída
+        try:
+            layer_idx = int(key.split("encoder.layers.")[1].split(".")[0])
+            return layer_idx < min_layer_idx
+        except (ValueError, IndexError):
+            return False
+
     def _fallback_prune_calculation(self, client_id):
         try:
             client_info = self.clients_info[client_id]
@@ -423,6 +555,24 @@ class FederatedLearningServer:
                     current_global_state = get_trainable_state_dict(self.global_model)
                 else:
                     current_global_state = self.global_state.copy()
+            
+            # --- PaCA DINÂMICO (só para CLIP, a partir do round 2, se ativado) ---
+            if self.args.model == 'clip' and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+                ideal_paca = self.calculate_adaptive_paca(client_id)
+                self.clients_info[client_id]['current_paca'] = ideal_paca
+                
+                # Filtra: remove chaves de camadas fora do PaCA ideal
+                min_layer = self.total_encoder_layers - ideal_paca
+                if min_layer > 0:
+                    keys_before = len(current_global_state)
+                    current_global_state = {
+                        k: v for k, v in current_global_state.items()
+                        if not self._is_excluded_by_paca(k, min_layer)
+                    }
+                    keys_after = len(current_global_state)
+                    if keys_before != keys_after:
+                        logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
+                                    f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
             
             if round_num >= 2 and self.prune == 0 and self.args.model != 'clip':
                 logger.info("--- SERVER: PRUNING START (Round 2) ---")
@@ -502,9 +652,17 @@ class FederatedLearningServer:
             media_rate = (sum(bit_rate) / len(bit_rate)) / 8 / (1024 * 1024)
             self.clients_info[client_id]['bandwidth'] = media_rate
             self.clients_info[client_id]['data'] = self.client_data[client_id]
-            with self.lock:
-                self.bit.append(media_rate)
             
+            # --- PaCA DINÂMICO: Remove chaves devolvidas que o cliente NÃO treinou ---
+            if self.args.model == 'clip' and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+                ideal_paca = self.clients_info[client_id].get('current_paca', self.args.paca)
+                min_layer = self.total_encoder_layers - ideal_paca
+                if min_layer > 0 and updated_state is not None:
+                    updated_state = {
+                        k: v for k, v in updated_state.items()
+                        if not self._is_excluded_by_paca(k, min_layer)
+                    }
+
             training_time = time.time() - start_time
             
             if updated_state is not None:
@@ -576,6 +734,7 @@ class FederatedLearningServer:
             hf.create_dataset('Round_time', data=self.round_time)
             hf.create_dataset('Model_size_per_round_Mb', data=self.model_size_per_round)
             hf.create_dataset('Trainable_params', data=self.trainable_params_per_round)
+            hf.create_dataset('rs_client_paca', data=self.rs_client_paca)
             
     def run_server(self, times):
         logger.info("=== Federated Learning Server ===")
@@ -612,7 +771,8 @@ class FederatedLearningServer:
                     'data_size': None,
                     'last_flops': None,
                     'last_params': None,
-                    'dataset_size': 1.0 
+                    'dataset_size': 1.0,
+                    'current_paca': self.args.paca,  # PaCA atual do cliente (dinâmico)
                 }
                 
                 logger.info(f"Client {len(self.client_connections) + 1} connected: {addr}")
@@ -710,6 +870,9 @@ class FederatedLearningServer:
                     self.model_size_per_round.append(size_trainable_mb)
                     self.trainable_params_per_round.append(num_trainable_params)
                     
+                    paca_list = [self.clients_info[cid].get('current_paca', self.args.paca) for cid in sorted(self.clients_info.keys())]
+                    self.rs_client_paca.append(paca_list)
+                    
                     successful_notifications = 0
                     for conn in self.client_connections:
                         try:
@@ -781,6 +944,7 @@ def parse_args():
     parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA')
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')
+    parser.add_argument('--adaptive-paca', action='store_true', help='Ativa PaCA dinâmico: servidor ajusta automaticamente o número de camadas por cliente baseado em latência')
     return parser.parse_args()
 
 def main():
