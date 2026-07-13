@@ -17,7 +17,7 @@ def count_flops(model, input_size=(1, 3, 32, 32), verbose=False):
         total_flops: Total de FLOPs (operações de ponto flutuante)
         breakdown: Dicionário com FLOPs por camada
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = next(model.parameters()).device
     x = torch.randn(input_size).to(device)
     
     # Dicionários para armazenar informações

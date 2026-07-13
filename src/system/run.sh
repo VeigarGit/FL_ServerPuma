@@ -4,11 +4,11 @@
 CLIENT_COUNT=2
 HOST="localhost"
 PORT=9500
-DATASET="Cifar100"
+DATASET="MNIST"
 SESSION_NAME="myapp"
 ROUNDS=5
 TEST_CLIENT_IDX=0
-NUM_CLASSES=100
+NUM_CLASSES=10
 BATCH_SIZE=32
 MAX_CLIENTS=10
 PRUNE=1
@@ -40,6 +40,7 @@ SAVE_MODEL_FLAG=""
 LOAD_MODEL_FLAG=""
 SIMULATIONS=1
 AUTO_NEXT=0
+USE_CPU=0
 
 # 2. Processamento de Argumentos
 while [ $# -gt 0 ]; do
@@ -66,6 +67,7 @@ while [ $# -gt 0 ]; do
         --prune-freq) PRUNE_FREQ="$2"; shift 2 ;;
         --simulations) SIMULATIONS="$2"; shift 2 ;; 
         --auto-next) AUTO_NEXT=1; shift 1 ;;
+        --cpu) USE_CPU=1; shift 1 ;;
         
         # --- NOVO: Captura da flag strategy ---
         --strategy) STRATEGY="$2"; shift 2 ;;
@@ -97,6 +99,15 @@ while [ $# -gt 0 ]; do
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
 done
+
+# --- Auto-detecção de GPU / Fallback para CPU ---
+NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+if [ "$USE_CPU" -eq 1 ] || [ "$NUM_GPUS" -eq 0 ]; then
+    DEVICE="cpu"
+    NUM_GPUS=0
+else
+    DEVICE="cuda"
+fi
 
 # 3. Validação e Exibição da Configuração
 if [ "$MODEL" = "clip" ] && [ -z "$CONFIG_FILE" ]; then
@@ -194,11 +205,11 @@ for RUN in $(seq 1 $SIMULATIONS); do
             PACA_FLAGS="--paca-list $PACA_LIST"
         fi
 
-        # --- Distribuição de clientes entre GPUs (round-robin) ---
-        if [ $((i % 2)) -eq 0 ]; then
-            CLIENT_DEVICE_ID="0"
+        # --- Distribuição de clientes entre GPUs (round-robin dinâmico) ---
+        if [ "$NUM_GPUS" -gt 0 ]; then
+            CLIENT_DEVICE_ID=$((i % NUM_GPUS))
         else
-            CLIENT_DEVICE_ID="1"
+            CLIENT_DEVICE_ID="0"
         fi
 
         CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN --exp-name $EXP_NAME"
