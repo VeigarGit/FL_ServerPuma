@@ -296,7 +296,7 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--random-client', action='store_true')
-    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument("--ala", type=int, default=0)
     parser.add_argument("--model", type=str, default="cnn")
@@ -319,12 +319,29 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # Controle contextual (evitar import os espalhado)
-    # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"  # Desativado: causa alto uso de CPU. Usar apenas para debug de erros CUDA.
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
-    if args.device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA is not available. Falling back to CPU.")
-        args.device = "cpu"
+    # Configuração inteligente de device: MPS > CUDA > CPU
+    if args.device == "mps":
+        if torch.backends.mps.is_available():
+            logger.info("Using Metal Performance Shaders (MPS) for MacBook GPU acceleration.")
+        else:
+            logger.warning("MPS is not available. Falling back to CUDA if available, otherwise CPU.")
+            if torch.cuda.is_available():
+                args.device = "cuda"
+            else:
+                args.device = "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            logger.warning("CUDA is not available. Checking for MPS...")
+            if torch.backends.mps.is_available():
+                logger.info("Falling back to Metal Performance Shaders (MPS).")
+                args.device = "mps"
+            else:
+                logger.warning("CUDA and MPS not available. Using CPU.")
+                args.device = "cpu"
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
+    
+    logger.info(f"Device set to: {args.device}")
     
     device = torch.device(args.device)
     

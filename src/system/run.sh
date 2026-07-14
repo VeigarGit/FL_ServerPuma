@@ -100,11 +100,33 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# --- Auto-detecção de GPU / Fallback para CPU ---
+# --- Auto-detecção de GPU / Fallback para CPU / MPS ---
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
-if [ "$USE_CPU" -eq 1 ] || [ "$NUM_GPUS" -eq 0 ]; then
+MPS_AVAILABLE=0
+if [ "$(uname)" = "Darwin" ]; then
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_CMD=python
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_CMD=python3
+    fi
+    if [ -n "$PYTHON_CMD" ]; then
+        MPS_AVAILABLE=$($PYTHON_CMD -c 'import torch, sys
+print(int(getattr(torch.backends.mps, "is_available", lambda: False)()))' 2>/dev/null || echo 0)
+    fi
+fi
+MPS_AVAILABLE=${MPS_AVAILABLE:-0}
+
+if [ "$USE_CPU" -eq 1 ]; then
     DEVICE="cpu"
     NUM_GPUS=0
+elif [ "$DEVICE" = "mps" ] && [ "$MPS_AVAILABLE" -eq 1 ]; then
+    NUM_GPUS=0
+elif [ "$NUM_GPUS" -eq 0 ]; then
+    if [ "$MPS_AVAILABLE" -eq 1 ]; then
+        DEVICE="mps"
+    else
+        DEVICE="cpu"
+    fi
 else
     DEVICE="cuda"
 fi

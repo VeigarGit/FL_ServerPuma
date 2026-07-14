@@ -928,7 +928,7 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--max-clients', type=int, default=10)
     parser.add_argument('--prune', type=int, default=0)
-    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"])
     parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('--experiments', type=int, default=1)
@@ -950,13 +950,29 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # Substituir os.environ por um controle interno (caso se aplique futuramente, mas mantido torch contextually)
-    import os 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
+    # Configuração inteligente de device: MPS > CUDA > CPU
+    if args.device == "mps":
+        if torch.backends.mps.is_available():
+            logger.info("Using Metal Performance Shaders (MPS) for MacBook GPU acceleration.")
+        else:
+            logger.warning("MPS is not available. Falling back to CUDA if available, otherwise CPU.")
+            if torch.cuda.is_available():
+                args.device = "cuda"
+            else:
+                args.device = "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            logger.warning("CUDA is not available. Checking for MPS...")
+            if torch.backends.mps.is_available():
+                logger.info("Falling back to Metal Performance Shaders (MPS).")
+                args.device = "mps"
+            else:
+                logger.warning("CUDA and MPS not available. Using CPU.")
+                args.device = "cpu"
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     
-    if args.device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA is not available. Falling back to CPU.")
-        args.device = "cpu"
+    logger.info(f"Device set to: {args.device}")
     
     for i in range(args.experiments):
         logger.info(f"\n=== Iniciando Experimento {i+1}/{args.experiments} ===")
