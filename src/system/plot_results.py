@@ -368,6 +368,61 @@ def plot_comparative_comm_cost_per_round(experiments, output_dir):
     print(f"  📊 {path}")
 
 
+def plot_comparative_discrete_comm_cost_per_round(experiments, output_dir):
+    """Custo de Comunicação por Rodada (Não Acumulado) - comparativo."""
+    fig, ax = plt.subplots(figsize=(12, 7))
+    has_valid_data = False
+    
+    for i, exp in enumerate(experiments):
+        s = STYLES[i % len(STYLES)]
+        d = exp['server']
+        
+        num_rounds = len(d['time_mean'])
+        total_envios = len(d['mb_mean'])
+        
+        if num_rounds == 0 or total_envios == 0:
+            continue
+            
+        clients_per_round = max(1, total_envios // num_rounds)
+        
+        # Coleta o acumulado no final de cada rodada
+        # Como o array inicia com 0 (len = 501 para 50 rounds e 10 clientes), 
+        # o fim do round 1 está no índice 10.
+        indices = [min(total_envios - 1, r * clients_per_round) for r in range(1, num_rounds + 1)]
+        mb_accumulated = [d['mb_mean'][idx] for idx in indices]
+        
+        # Calcula a diferença para obter o custo de cada rodada individual (ida e volta = x 2)
+        mb_discrete = []
+        for r in range(len(mb_accumulated)):
+            if r == 0:
+                mb_round = mb_accumulated[r]
+            else:
+                mb_round = max(0, mb_accumulated[r] - mb_accumulated[r-1])
+            
+            # Multiplicamos por 2 porque o .h5 só salva o envio do servidor para o cliente.
+            # Como o cliente devolve exatamente os mesmos tensores de volta, o upload é igual ao download.
+            mb_discrete.append(mb_round * 2.0)
+                
+        x = range(1, num_rounds + 1)
+        ax.plot(x, mb_discrete, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(mb_discrete)), linestyle=s['ls'],
+                label=exp['label'])
+        has_valid_data = True
+
+    if not has_valid_data:
+        plt.close(fig)
+        return
+
+    ax.set_title("Banda Trafegada por Rodada (Upload + Download)")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Trafegados na Rodada")
+    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    path = os.path.join(output_dir, "09_banda_por_rodada.pdf")
+    fig.savefig(path, dpi=150); plt.close(fig)
+    print(f"  📊 {path}")
+
+
+
 def plot_comparative_params(experiments, output_dir):
     """Parâmetros Treináveis - comparativo."""
     has_data = any(not np.all(e['server']['params_mean'] == 0) for e in experiments)
@@ -445,7 +500,7 @@ def plot_comparative_client_local_vs_train(experiments, output_dir):
                 markevery=_mark_every(len(d['train_acc_mean'])), linestyle=':',
                 alpha=0.6, label=f"{exp['label']} (treino)")
 
-    ax.set_title("Acurácia Local vs Treino (Clientes)")
+    ax.set_title("Efeito Overfitting: Acurácia de Treino vs Teste Local (Clientes)")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
     ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -600,6 +655,7 @@ def main():
     plot_comparative_client_local_vs_train(experiments, output_dir)
     plot_comparative_client_loss(experiments, output_dir)
     plot_comparative_summary_bar(experiments, output_dir)
+    plot_comparative_discrete_comm_cost_per_round(experiments, output_dir)
 
     print(f"\n✅ {len(experiments)} experimento(s) plotados com sucesso em: {output_dir}")
 
