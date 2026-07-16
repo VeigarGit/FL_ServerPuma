@@ -145,6 +145,8 @@ class FederatedLearningServer:
         self.prune = args.prune
         self.sended_ammount = [0]
         self.sended_withouquant = [0]
+        self.received_ammount = [0]
+        self.total_transmitted_per_round = []
         self.rs_client_paca = []
         self.aggregated_clients = []
         self.round_time = []
@@ -634,6 +636,10 @@ class FederatedLearningServer:
             
             updated_state, rate = recv_data(conn)
             bit_rate.append(rate)
+            if updated_state is not None:
+                recv_size_mb = sys.getsizeof(pickle.dumps(updated_state)) / (1024 * 1024)
+                with self.lock:
+                    self.received_ammount.append(self.received_ammount[-1] + recv_size_mb)
             
             if updated_state is None:
                 logger.warning(f"Round {round_num}: Cliente {client_id} falhou/desconectou. Abortando thread.")
@@ -736,6 +742,8 @@ class FederatedLearningServer:
             hf.create_dataset('Model_size_per_round_Mb', data=self.model_size_per_round)
             hf.create_dataset('Trainable_params', data=self.trainable_params_per_round)
             hf.create_dataset('rs_client_paca', data=self.rs_client_paca)
+            hf.create_dataset('received_from_clients_Mb', data=self.received_ammount)
+            hf.create_dataset('total_transmitted_per_round_Mb', data=self.total_transmitted_per_round)
             
     def run_server(self, times):
         logger.info("=== Federated Learning Server ===")
@@ -870,6 +878,11 @@ class FederatedLearningServer:
                     logger.info(f'Size Trainable Adapters: {size_trainable_mb:.2f} MB | Trainable Params: {num_trainable_params:,}')
                     self.model_size_per_round.append(size_trainable_mb)
                     self.trainable_params_per_round.append(num_trainable_params)
+                    
+                    # Total transmitido neste round: (server→clients) + (clients→server)
+                    sent_this_round = self.sended_ammount[-1] - (self.sended_ammount[-len(client_updates)-1] if len(self.sended_ammount) > len(client_updates) else 0)
+                    recv_this_round = self.received_ammount[-1] - (self.received_ammount[-len(client_updates)-1] if len(self.received_ammount) > len(client_updates) else 0)
+                    self.total_transmitted_per_round.append(sent_this_round + recv_this_round)
                     
                     paca_list = [self.clients_info[cid].get('current_paca', self.args.paca) for cid in sorted(self.clients_info.keys())]
                     self.rs_client_paca.append(paca_list)
