@@ -28,6 +28,7 @@ model:
     lambda_num: 2
     schedule_epochs: 1
     pre_prune_ratio: 0.25   # 50% dos ranks serão removidos antes do treino
+    min_rank: 2              # Rank mínimo por módulo SoRA (evita over-pruning)
   
 training:
   batch_size: 32

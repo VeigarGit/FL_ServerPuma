@@ -433,6 +433,12 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     
     device = next(model.parameters()).device
 
+    # Ativa o schedule linear de lambda (ex: 3e-4 → 7e-4) para aumentar a pressão
+    # de esparsidade. No FL, o otimizador é recriado a cada rodada, então avançamos
+    # o schedule imediatamente para usar o lambda mais forte.
+    if sparse_optimizer is not None and hasattr(sparse_optimizer, 'step_lambda'):
+        sparse_optimizer.step_lambda()
+
     for pixel_values, labels in tqdm(loader, desc="train", leave=False):
         pixel_values = pixel_values.to(device, dtype=next(model.parameters()).dtype)
         labels = labels.to(device)

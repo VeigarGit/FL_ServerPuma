@@ -10,7 +10,7 @@ ROUNDS=5
 TEST_CLIENT_IDX=0
 NUM_CLASSES=10
 BATCH_SIZE=32
-MAX_CLIENTS=10
+MAX_CLIENTS=22
 PRUNE=1
 ALA=1 
 DEVICE="cuda"
@@ -40,6 +40,8 @@ WEIGHTS_DIR="saved_weights"
 SAVE_MODEL_FLAG=""
 LOAD_MODEL_FLAG=""
 SIMULATIONS=1
+START_RUN=1
+EXP_NAME_OVERRIDE=""
 AUTO_NEXT=0
 USE_CPU=0
 
@@ -67,6 +69,8 @@ while [ $# -gt 0 ]; do
         --config) CONFIG_FILE="$2"; shift 2 ;;
         --prune-freq) PRUNE_FREQ="$2"; shift 2 ;;
         --simulations) SIMULATIONS="$2"; shift 2 ;; 
+        --start-run) START_RUN="$2"; shift 2 ;;
+        --exp-name) EXP_NAME_OVERRIDE="$2"; shift 2 ;;
         --auto-next) AUTO_NEXT=1; shift 1 ;;
         --cpu) USE_CPU=1; shift 1 ;;
         
@@ -189,14 +193,19 @@ fi
 
 # 5. Loop de Simulações
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-if [ "$ADAPTIVE_PACA" -eq 1 ]; then
-    EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca_${TIMESTAMP}"
+if [ -n "$EXP_NAME_OVERRIDE" ]; then
+    EXP_NAME="$EXP_NAME_OVERRIDE"
 else
-    EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_${TIMESTAMP}"
+    if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca_${TIMESTAMP}"
+    else
+        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_${TIMESTAMP}"
+    fi
 fi
 echo "📁 Diretório de Resultados: ../results/$EXP_NAME"
 
-for RUN in $(seq 1 $SIMULATIONS); do
+END_RUN=$((START_RUN + SIMULATIONS - 1))
+for RUN in $(seq $START_RUN $END_RUN); do
     echo "========================================================="
     echo "🚀 INICIANDO SIMULAÇÃO $RUN DE $SIMULATIONS"
     echo "========================================================="
