@@ -5,16 +5,17 @@ CLIENT_COUNT=2
 HOST="localhost"
 PORT=9500
 DATASET="MNIST"
-SESSION_NAME="myapp"
+SESSION_NAME="david"
 ROUNDS=5
 TEST_CLIENT_IDX=0
 NUM_CLASSES=10
 BATCH_SIZE=32
-MAX_CLIENTS=10
+MAX_CLIENTS=22
 PRUNE=1
 ALA=1 
 DEVICE="cuda"
 DEVICE_ID="0"
+CUSTOM_DID=0
 IN_FEATURES=3
 DIM=1600
 MODEL="cnn"
@@ -39,6 +40,8 @@ WEIGHTS_DIR="saved_weights"
 SAVE_MODEL_FLAG=""
 LOAD_MODEL_FLAG=""
 SIMULATIONS=1
+START_RUN=1
+EXP_NAME_OVERRIDE=""
 AUTO_NEXT=0
 USE_CPU=0
 
@@ -61,11 +64,13 @@ while [ $# -gt 0 ]; do
         --prune) PRUNE="$2"; shift 2 ;;
         --ala) ALA="$2"; shift 2 ;;
         --device) DEVICE="$2"; shift 2 ;;
-        --device-id) DEVICE_ID="$2"; shift 2 ;;
+        -did|--device-id) DEVICE_ID="$2"; CUSTOM_DID=1; shift 2 ;;
         -m|--model) MODEL="$2"; shift 2 ;;
         --config) CONFIG_FILE="$2"; shift 2 ;;
         --prune-freq) PRUNE_FREQ="$2"; shift 2 ;;
         --simulations) SIMULATIONS="$2"; shift 2 ;; 
+        --start-run) START_RUN="$2"; shift 2 ;;
+        --exp-name) EXP_NAME_OVERRIDE="$2"; shift 2 ;;
         --auto-next) AUTO_NEXT=1; shift 1 ;;
         --cpu) USE_CPU=1; shift 1 ;;
         
@@ -100,11 +105,33 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# --- Auto-detecção de GPU / Fallback para CPU ---
+# --- Auto-detecção de GPU / Fallback para CPU / MPS ---
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
-if [ "$USE_CPU" -eq 1 ] || [ "$NUM_GPUS" -eq 0 ]; then
+MPS_AVAILABLE=0
+if [ "$(uname)" = "Darwin" ]; then
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_CMD=python
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_CMD=python3
+    fi
+    if [ -n "$PYTHON_CMD" ]; then
+        MPS_AVAILABLE=$($PYTHON_CMD -c 'import torch, sys
+print(int(getattr(torch.backends.mps, "is_available", lambda: False)()))' 2>/dev/null || echo 0)
+    fi
+fi
+MPS_AVAILABLE=${MPS_AVAILABLE:-0}
+
+if [ "$USE_CPU" -eq 1 ]; then
     DEVICE="cpu"
     NUM_GPUS=0
+elif [ "$DEVICE" = "mps" ] && [ "$MPS_AVAILABLE" -eq 1 ]; then
+    NUM_GPUS=0
+elif [ "$NUM_GPUS" -eq 0 ]; then
+    if [ "$MPS_AVAILABLE" -eq 1 ]; then
+        DEVICE="mps"
+    else
+        DEVICE="cpu"
+    fi
 else
     DEVICE="cuda"
 fi
@@ -166,10 +193,19 @@ fi
 
 # 5. Loop de Simulações
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-EXP_NAME="${SESSION_NAME}_${TIMESTAMP}"
+if [ -n "$EXP_NAME_OVERRIDE" ]; then
+    EXP_NAME="$EXP_NAME_OVERRIDE"
+else
+    if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca_${TIMESTAMP}"
+    else
+        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_${TIMESTAMP}"
+    fi
+fi
 echo "📁 Diretório de Resultados: ../results/$EXP_NAME"
 
-for RUN in $(seq 1 $SIMULATIONS); do
+END_RUN=$((START_RUN + SIMULATIONS - 1))
+for RUN in $(seq $START_RUN $END_RUN); do
     echo "========================================================="
     echo "🚀 INICIANDO SIMULAÇÃO $RUN DE $SIMULATIONS"
     echo "========================================================="
@@ -185,7 +221,7 @@ for RUN in $(seq 1 $SIMULATIONS); do
     fi
 
     # --- NOVO: Adicionado --strategy $STRATEGY no comando do server.py ---
-    SERVER_CMD="uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME"
+    SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME"
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-paca"
     fi
@@ -206,24 +242,23 @@ for RUN in $(seq 1 $SIMULATIONS); do
         fi
 
         # --- Distribuição de clientes entre GPUs (round-robin dinâmico) ---
-        if [ "$NUM_GPUS" -gt 0 ]; then
+        if [ "$CUSTOM_DID" -eq 1 ]; then
+            CLIENT_DEVICE_ID=$DEVICE_ID
+        elif [ "$NUM_GPUS" -gt 0 ]; then
             CLIENT_DEVICE_ID=$((i % NUM_GPUS))
         else
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN --exp-name $EXP_NAME"
+        LOG_DIR="../results/$EXP_NAME/logs/sim_$RUN"
+        mkdir -p "$LOG_DIR"
+        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN --exp-name $EXP_NAME 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
             CLIENT_CMD="$CLIENT_CMD ; read"
         fi
-        if [ $((i % 3)) -eq 0 ]; then
-            tmux split-window -h "$CLIENT_CMD"
-        else
-            tmux split-window -v "$CLIENT_CMD"
-        fi
+        # Para evitar erros de layout quando há muitos clientes, cada cliente ganha sua própria janela (aba)
+        tmux new-window -t "$SESSION_NAME" -n "Client-$i" "$CLIENT_CMD"
     done
-
-    tmux select-layout -t "$SESSION_NAME" tiled
     
     echo "⏳ Aguardando a simulação $RUN terminar em segundo plano..."
     # Loop que verifica a cada 5 segundos se a sessão do tmux ainda está ativa

@@ -100,7 +100,7 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
     
     personalized_acc = None  # Inicializa a variável que guardará a acurácia pós-ALA
     
-    if round_num >= 2 and prune == 0:
+    if round_num >= 2 and prune == 1:
         if model_type == 'cnn':
             state_dict = map_sequential_to_simplemodel(state_dict)
     # === CORREÇÃO ESTRUTURAL APENAS PARA O CLIP ===
@@ -296,7 +296,7 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--learning-rate', type=float, default=0.01)
     parser.add_argument('--random-client', action='store_true')
-    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument("--ala", type=int, default=0)
     parser.add_argument("--model", type=str, default="cnn")
@@ -319,12 +319,29 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # Controle contextual (evitar import os espalhado)
-    # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"  # Desativado: causa alto uso de CPU. Usar apenas para debug de erros CUDA.
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
-    if args.device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA is not available. Falling back to CPU.")
-        args.device = "cpu"
+    # Configuração inteligente de device: MPS > CUDA > CPU
+    if args.device == "mps":
+        if torch.backends.mps.is_available():
+            logger.info("Using Metal Performance Shaders (MPS) for MacBook GPU acceleration.")
+        else:
+            logger.warning("MPS is not available. Falling back to CUDA if available, otherwise CPU.")
+            if torch.cuda.is_available():
+                args.device = "cuda"
+            else:
+                args.device = "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            logger.warning("CUDA is not available. Checking for MPS...")
+            if torch.backends.mps.is_available():
+                logger.info("Falling back to Metal Performance Shaders (MPS).")
+                args.device = "mps"
+            else:
+                logger.warning("CUDA and MPS not available. Using CPU.")
+                args.device = "cpu"
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
+    
+    logger.info(f"Device set to: {args.device}")
     
     device = torch.device(args.device)
     
@@ -421,17 +438,34 @@ def main():
     
     # Colocar variavel de iteração para colocar o resultado médio de varias simulações e tirar média
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.connect((args.host, args.port))
-            send_data(s, args.client_idx)
-            logger.info(f"Connected to server {args.host}:{args.port}")
-        except OSError as e:
-            logger.exception("Connection failed")
+        connected = False
+        for attempt in range(10):
+            try:
+                s.connect((args.host, args.port))
+                connected = True
+                break
+            except OSError as e:
+                logger.warning(f"Connection failed, retrying in 5 seconds... (Attempt {attempt+1}/10)")
+                time.sleep(5)
+                
+        if not connected:
+            logger.exception("Connection failed after multiple attempts")
             sys.exit(1)
-        
+            
+        send_data(s, args.client_idx)
+        logger.info(f"Connected to server {args.host}:{args.port}")
         for round_num in range(args.rounds):
             logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
             
+            # --- Problema #4: Recebe PaCA dinâmico do servidor (apenas para CLIP) ---
+            if args.model == 'clip':
+                server_paca, _ = recv_data(s)
+                if server_paca is not None and server_paca != args.paca:
+                    logger.info(f"PaCA adaptativo: servidor ajustou {args.paca} -> {server_paca}")
+                    args.paca = server_paca
+                    # Atualiza o run_config para que o treino use o novo PaCA
+                    run_config["model"]["paca"]["upper_layers"] = server_paca
+
             global_state, _ = recv_data(s)
             prune, _ = recv_data(s)
             
@@ -443,7 +477,7 @@ def main():
             global_state = dequantization(global_state)
             
             
-            if round_num + 1 >= 2 and prune == 0 and args.model != 'clip':
+            if round_num + 1 >= 2 and prune == 1 and args.model != 'clip':
                 ammount, _ = recv_data(s)
             
             if round_num + 1 >= 2:
@@ -467,6 +501,8 @@ def main():
 
          
             
+            # --- Problema #1: Mede o tempo puro de treino do cliente ---
+            train_start = time.time()
             updated_state, personalized_acc = local_training(
                 model=model, 
                 state_dict=global_state, 
@@ -480,6 +516,7 @@ def main():
                 model_type=args.model, 
                 run_config=run_config if args.model == 'clip' else None
             )
+            client_training_time = time.time() - train_start
             
             # Se o FedALA calculou a acurácia, nós salvamos ela; se não (ex: round 1 ou ala desativado), salvamos 0.0 para manter o array com mesmo tamanho
             if personalized_acc is not None:
@@ -488,7 +525,7 @@ def main():
                 # Se o ALA não rodou, salvamos a acurácia global para a linha do gráfico não cair
                 rs_ala_acc.append(test_accuracy)
 
-            logger.info("Local training completed.")
+            logger.info(f"Local training completed in {client_training_time:.2f}s.")
 
             # Acurácia logo após o treinamento local (avaliado no conjunto de teste para comparação justa)
             local_test_acc, local_test_loss = evaluate_model(model, test_loader)
@@ -503,6 +540,7 @@ def main():
             send_data(s, updated_state)
             send_data(s, len(train_loader))
             send_data(s, args.ala)
+            send_data(s, client_training_time)  # Problema #1: Envia tempo de treino puro
             logger.info("Client update sent.")
             
             try:

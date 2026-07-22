@@ -66,12 +66,13 @@ class SoRAWrappedLinear(nn.Module):
         return self.original(x) + self.sora(x)
 
 @torch.no_grad()
-def prune_sora_to_lora_and_report(model):
+def prune_sora_to_lora_and_report(model, min_rank=2):
     """
     Poda Estrutural Pós-Treino.
     Analisa os 'gates' do SoRA, remove as dimensões do rank que foram zeradas pelo 
     SparseAdamW e absorve os gates restantes na matriz B. Converte o SoRA em um 
     LoRA estático extremamente compacto e eficiente para inferência.
+    Respeita um rank mínimo (min_rank) por módulo para evitar over-pruning.
     """
     import sys
     import pickle
@@ -89,17 +90,18 @@ def prune_sora_to_lora_and_report(model):
         sora = module.sora
         gate = sora.gate.data.squeeze(0)
         
-        # Identifica quais dimensões manter (onde gate > 1e-8)
-        mask = torch.abs(gate) > 1e-8
+        # Identifica quais dimensões manter (onde gate > 1e-4)
+        mask = torch.abs(gate) > 1e-4
         keep_idx = torch.where(mask)[0]
         r_new = len(keep_idx)
         r_original = len(gate)
 
-        # Garante que o rank não seja zero (mantém ao menos 1 dimensão)
-        if r_new == 0:
-            keep_idx = torch.topk(gate.abs(), k=1).indices
-            r_new = 1
-            print(f"    {name:<50} → Rank zerado forçado para 1")
+        # Garante que o rank não caia abaixo de min_rank
+        effective_min = min(min_rank, r_original)
+        if r_new < effective_min:
+            keep_idx = torch.topk(gate.abs(), k=effective_min).indices
+            r_new = len(keep_idx)
+            print(f"    {name:<50} → Rank forçado para {r_new} (min_rank={min_rank})")
 
         # Compacta as matrizes A e B e absorve o gate na matriz B
         A_pruned = sora.lora_A.data[keep_idx, :]
@@ -132,11 +134,12 @@ def prune_sora_to_lora_and_report(model):
     return model
 
 @torch.no_grad()
-def prune_sora_iterative(model):
+def prune_sora_iterative(model, min_rank=2):
     """
     Poda Iterativa (Intermediária) para Aprendizado Federado.
     Reduz o tamanho das matrizes A, B e do gate, MAS MANTÉM o gate vivo
     para que o modelo continue a aprender esparsidade nas próximas rodadas.
+    Respeita um rank mínimo (min_rank) por módulo para evitar over-pruning.
     """
     total_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
     sora_modules = 0
@@ -152,17 +155,18 @@ def prune_sora_iterative(model):
         sora = module.sora
         gate = sora.gate.data.squeeze(0)
         
-        # Identifica quais dimensões manter (onde gate > 1e-8)
-        mask = torch.abs(gate) > 1e-8
+        # Identifica quais dimensões manter (onde gate > 1e-4)
+        mask = torch.abs(gate) > 1e-4
         keep_idx = torch.where(mask)[0]
         r_new = len(keep_idx)
         r_original = len(gate)
 
-        # Garante que o rank não seja zero (mantém ao menos 1 dimensão)
-        if r_new == 0:
-            keep_idx = torch.topk(gate.abs(), k=1).indices
-            r_new = 1
-            print(f"    {name:<50} → Rank zerado forçado para 1")
+        # Garante que o rank não caia abaixo de min_rank
+        effective_min = min(min_rank, r_original)
+        if r_new < effective_min:
+            keep_idx = torch.topk(gate.abs(), k=effective_min).indices
+            r_new = len(keep_idx)
+            print(f"    {name:<50} → Rank forçado para {r_new} (min_rank={min_rank})")
 
         # Se o rank não diminuiu nesta camada, não fazemos nada
         if r_new == r_original:

@@ -62,7 +62,7 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
             if isinstance(output, dict):
                 output = output.get("logits", output)
                 
-            y = y.squeeze()
+            y = y.view(-1)
             
             # TESTE C: Verificando valores corrompidos (A Teoria da Divisão por Zero)
             if torch.isnan(output).any():

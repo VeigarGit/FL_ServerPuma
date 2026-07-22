@@ -6,6 +6,7 @@ import copy
 import time
 import argparse
 import sys
+import os
 import logging
 from pathlib import Path
 
@@ -144,7 +145,10 @@ class FederatedLearningServer:
         self.prune = args.prune
         self.sended_ammount = [0]
         self.sended_withouquant = [0]
+        self.received_ammount = [0]
+        self.total_transmitted_per_round = []
         self.rs_client_paca = []
+        self.rs_client_training_time = []
         self.aggregated_clients = []
         self.round_time = []
         self.model_size_per_round = []
@@ -325,7 +329,7 @@ class FederatedLearningServer:
             data += packet
         return data
     
-    def set_trashold(self):
+    def set_threshold(self):
         tot_time = 0
         clients_with_time = 0
         for info in self.clients_info.values():
@@ -338,8 +342,8 @@ class FederatedLearningServer:
             return
 
         mean_time = tot_time / clients_with_time
-        self.time_trashold = 0.9 * mean_time
-        logger.debug(f'time_trashold: {self.time_trashold}s')
+        self.time_threshold = 0.9 * mean_time
+        logger.debug(f'time_threshold: {self.time_threshold}s')
     
     def new_set_amount_prune(self, client_id):
         # Filosofia EAFP: Tenta acessar direto e falha limpo
@@ -362,7 +366,7 @@ class FederatedLearningServer:
         client_info.setdefault('last_flops', total_beta)
         client_info.setdefault('last_params', total_alpha)
         
-        target_latency = getattr(self, 'time_trashold', 60.0)
+        target_latency = getattr(self, 'time_threshold', 60.0)
         
         time_per_flop = (training_time / (dataset_size * total_beta)) if (training_time > 0 and total_beta > 0) else 1e-6
         bytes_per_param = 1
@@ -400,7 +404,7 @@ class FederatedLearningServer:
         
         Proteções:
         - Se a acurácia caiu após redução de PaCA, reverte (sobe de volta).
-        - Mínimo 25% das camadas.
+        - Mínimo 50% das camadas (nunca abaixo de 4).
         - Máximo ±2 camadas de mudança por round.
         """
         try:
@@ -418,7 +422,7 @@ class FederatedLearningServer:
         if bandwidth is None or training_time is None:
             return current_paca
 
-        target_latency = getattr(self, 'time_trashold', 60.0)
+        target_latency = getattr(self, 'time_threshold', 60.0)
         
         # --- CRITÉRIO 2: ACURÁCIA (verificado primeiro, é global) ---
         accuracy_signal = self._check_accuracy_signal(client_id, current_paca, paca_min, max_paca)
@@ -490,10 +494,12 @@ class FederatedLearningServer:
         
         # --- PLATEAU: acurácia estabilizou? Tenta reduzir (com proteções). ---
         # Condições: desvio < 0.5%, fora do cooldown, e acurácia acima de 85%
+        best_acc = max(acc_history) if acc_history else 0.0
+        min_acc_for_plateau = best_acc * 0.90  # 90% da melhor acurácia observada
         if (std_acc < 0.5 
                 and current_paca > paca_min 
                 and not in_cooldown 
-                and mean_acc >= 85.0):
+                and mean_acc >= min_acc_for_plateau):
             new_paca = current_paca - 1
             logger.info(f"PaCA adaptativo {client_id}: reduzindo {current_paca} -> {new_paca} "
                         f"(acurácia estável: {mean_acc:.1f}% ± {std_acc:.2f}%, camadas extras desnecessárias)")
@@ -539,7 +545,7 @@ class FederatedLearningServer:
         last_training_time = client_info.get('last_training_time', training_time)
         client_info['last_training_time'] = training_time
         
-        adjustment = 0.05 if training_time > last_training_time * 1.5 else (0.03 if training_time > getattr(self, 'time_trashold', 0) * 1.2 else 0.0)
+        adjustment = 0.05 if training_time > last_training_time * 1.5 else (0.03 if training_time > getattr(self, 'time_threshold', 0) * 1.2 else 0.0)
         return max(0.2, min(0.85, base_pruning_rate + adjustment))
     
     def handle_client(self, conn, client_updates, client_weights, round_num, client_id):
@@ -574,7 +580,12 @@ class FederatedLearningServer:
                         logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
                                     f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
             
-            if round_num >= 2 and self.prune == 0 and self.args.model != 'clip':
+            # --- Problema #4: Envia PaCA dinâmico para que o cliente treine apenas as camadas necessárias ---
+            if self.args.model == 'clip':
+                client_paca = self.clients_info[client_id].get('current_paca', self.args.paca) if getattr(self.args, 'adaptive_paca', False) else self.args.paca
+                send_data(conn, client_paca)
+
+            if round_num >= 2 and self.prune == 1 and self.args.model != 'clip':
                 logger.info("--- SERVER: PRUNING START (Round 2) ---")
                 if self.clients_info[client_id]['original_model_size'] is None:
                     max_amount = self.new_set_amount_prune(client_id)
@@ -605,7 +616,7 @@ class FederatedLearningServer:
                 g_model_pruned = g_model_pruned.state_dict()
                 logger.info("--- SERVER: PRUNING COMPLETE ---")
 
-            if round_num >= 2 and self.prune == 0 and self.args.model != 'clip':
+            if round_num >= 2 and self.prune == 1 and self.args.model != 'clip':
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
                 g_model_pruned = quantization(g_model_pruned)
                 size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
@@ -633,6 +644,10 @@ class FederatedLearningServer:
             
             updated_state, rate = recv_data(conn)
             bit_rate.append(rate)
+            if updated_state is not None:
+                recv_size_mb = sys.getsizeof(pickle.dumps(updated_state)) / (1024 * 1024)
+                with self.lock:
+                    self.received_ammount.append(self.received_ammount[-1] + recv_size_mb)
             
             if updated_state is None:
                 logger.warning(f"Round {round_num}: Cliente {client_id} falhou/desconectou. Abortando thread.")
@@ -649,6 +664,10 @@ class FederatedLearningServer:
             logger.debug(f"Client {client_id} dataset size: {dataset_size}")
             
             self.argalgo, rate = recv_data(conn)
+            
+            # --- Problema #1: Recebe tempo de treino puro medido pelo cliente ---
+            client_training_time, rate = recv_data(conn)
+            
             media_rate = (sum(bit_rate) / len(bit_rate)) / 8 / (1024 * 1024)
             self.clients_info[client_id]['bandwidth'] = media_rate
             self.clients_info[client_id]['data'] = self.client_data[client_id]
@@ -663,7 +682,9 @@ class FederatedLearningServer:
                         if not self._is_excluded_by_paca(k, min_layer)
                     }
 
-            training_time = time.time() - start_time
+            handle_time = time.time() - start_time
+            # Usa o tempo de treino reportado pelo cliente (mais preciso, exclui overhead de rede)
+            training_time = client_training_time if isinstance(client_training_time, (int, float)) else handle_time
             
             if updated_state is not None:
                 with self.lock:
@@ -671,7 +692,7 @@ class FederatedLearningServer:
                     client_weights.append(dataset_size)
                 
                 self.clients_info[client_id]['training_time'] = training_time
-                logger.info(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f} seconds")
+                logger.info(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f}s (handle_time={handle_time:.2f}s)")
             else:
                 logger.warning(f"Round {round_num}: No update received from client {client_id}")
                 self.clients_info[client_id]['training_time'] = training_time
@@ -713,7 +734,7 @@ class FederatedLearningServer:
     
     def save_results(self, i: int):
         i_str = str(i)
-        a = "prune" if self.args.prune == 0 else "withou_Prune"
+        a = "prune" if self.args.prune == 1 else "withou_Prune"
         b = "FedALA" if getattr(self, 'argalgo', 0) == 0 else "FedAVG"
         
         paca_val = self.args.paca if (self.args.paca is not None and self.args.paca > 0) else 0
@@ -735,6 +756,9 @@ class FederatedLearningServer:
             hf.create_dataset('Model_size_per_round_Mb', data=self.model_size_per_round)
             hf.create_dataset('Trainable_params', data=self.trainable_params_per_round)
             hf.create_dataset('rs_client_paca', data=self.rs_client_paca)
+            hf.create_dataset('rs_client_training_time', data=self.rs_client_training_time)
+            hf.create_dataset('received_from_clients_Mb', data=self.received_ammount)
+            hf.create_dataset('total_transmitted_per_round_Mb', data=self.total_transmitted_per_round)
             
     def run_server(self, times):
         logger.info("=== Federated Learning Server ===")
@@ -744,7 +768,7 @@ class FederatedLearningServer:
         logger.info(f"Total rounds: {self.args.rounds}")
         logger.info("=======================================")
         
-        self.time_trashold = 100
+        self.time_threshold = 100
         
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -805,10 +829,10 @@ class FederatedLearningServer:
                 if round_num == 1:
                     for t in threads: t.join()
                 else:
-                    for t in threads: t.join(timeout=self.time_trashold)
+                    for t in threads: t.join(timeout=self.time_threshold)
                 
                 if round_num == 0:
-                    self.set_trashold()
+                    self.set_threshold()
                     
                 round_duration = time.time() - init_time
                 self.round_time.append(round_duration)
@@ -827,18 +851,30 @@ class FederatedLearningServer:
                     
                     aggregated_state = self.aggregate_models(safe_client_updates, self.global_state, safe_client_weights)
                     
-                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0 and self.prune == 0:
+                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0 and self.prune == 1:
                         # Verifica se a rodada atual é múltipla da frequência desejada
                         if (round_num + 1) % self.args.prune_freq == 0:
                             logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")
                             
-                            pruned_state, before, after, ranks_info = reduce_sora_state_dict_rank(aggregated_state)
+                            # Decaimento adaptativo: threshold sobe de 1e-4 → ~1e-3 ao longo das rodadas
+                            # Isso torna a poda progressivamente mais difícil (mais conservadora)
+                            progress = (round_num + 1) / self.args.rounds  # 0.0 → 1.0
+                            decay_factor = 1.0 + progress * 9.0  # 1x → 10x
+                            adaptive_threshold = 1e-4 * decay_factor
+                            logger.info(f"   Adaptive threshold: {adaptive_threshold:.6f} (progress={progress:.2f})")
                             
-                            if before > 0 and after < before:
+                            pruned_state, before, after, ranks_info = reduce_sora_state_dict_rank(
+                                aggregated_state,
+                                threshold=adaptive_threshold,
+                                min_rank=self.args.min_rank
+                            )
+                            
+                            if before > 0:
                                 reduction = (1 - after/before) * 100
                                 logger.info(f"   SoRA Params: {before:,} -> {after:,} ({reduction:.2f}% reduzido)")
-                                for info in ranks_info[:5]: # Mostra apenas as 5 primeiras para não poluir
-                                    logger.info(f"   - {info}")
+                                if after < before:
+                                    for info in ranks_info[:5]: # Mostra apenas as 5 primeiras para não poluir
+                                        logger.info(f"   - {info}")
                                 
                                 # Atualiza o estado agregado com as matrizes reduzidas
                                 aggregated_state = pruned_state
@@ -870,8 +906,16 @@ class FederatedLearningServer:
                     self.model_size_per_round.append(size_trainable_mb)
                     self.trainable_params_per_round.append(num_trainable_params)
                     
+                    # Total transmitido neste round: (server→clients) + (clients→server)
+                    sent_this_round = self.sended_ammount[-1] - (self.sended_ammount[-len(client_updates)-1] if len(self.sended_ammount) > len(client_updates) else 0)
+                    recv_this_round = self.received_ammount[-1] - (self.received_ammount[-len(client_updates)-1] if len(self.received_ammount) > len(client_updates) else 0)
+                    self.total_transmitted_per_round.append(sent_this_round + recv_this_round)
+                    
                     paca_list = [self.clients_info[cid].get('current_paca', self.args.paca) for cid in sorted(self.clients_info.keys())]
                     self.rs_client_paca.append(paca_list)
+                    
+                    training_time_list = [self.clients_info[cid].get('training_time', 0.0) for cid in sorted(self.clients_info.keys())]
+                    self.rs_client_training_time.append(training_time_list)
                     
                     successful_notifications = 0
                     for conn in self.client_connections:
@@ -928,7 +972,7 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--max-clients', type=int, default=10)
     parser.add_argument('--prune', type=int, default=0)
-    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"])
     parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('--experiments', type=int, default=1)
@@ -945,18 +989,35 @@ def parse_args():
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA')
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')
     parser.add_argument('--adaptive-paca', action='store_true', help='Ativa PaCA dinâmico: servidor ajusta automaticamente o número de camadas por cliente baseado em latência')
+    parser.add_argument('--min-rank', type=int, default=2, help='Rank mínimo permitido por módulo SoRA durante poda iterativa')
     return parser.parse_args()
 
 def main():
     args = parse_args()
     
-    # Substituir os.environ por um controle interno (caso se aplique futuramente, mas mantido torch contextually)
-    import os 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
+    # Configuração inteligente de device: MPS > CUDA > CPU
+    if args.device == "mps":
+        if torch.backends.mps.is_available():
+            logger.info("Using Metal Performance Shaders (MPS) for MacBook GPU acceleration.")
+        else:
+            logger.warning("MPS is not available. Falling back to CUDA if available, otherwise CPU.")
+            if torch.cuda.is_available():
+                args.device = "cuda"
+            else:
+                args.device = "cpu"
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            logger.warning("CUDA is not available. Checking for MPS...")
+            if torch.backends.mps.is_available():
+                logger.info("Falling back to Metal Performance Shaders (MPS).")
+                args.device = "mps"
+            else:
+                logger.warning("CUDA and MPS not available. Using CPU.")
+                args.device = "cpu"
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
     
-    if args.device == "cuda" and not torch.cuda.is_available():
-        logger.warning("CUDA is not available. Falling back to CPU.")
-        args.device = "cpu"
+    logger.info(f"Device set to: {args.device}")
     
     for i in range(args.experiments):
         logger.info(f"\n=== Iniciando Experimento {i+1}/{args.experiments} ===")

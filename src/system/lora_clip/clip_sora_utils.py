@@ -1,10 +1,11 @@
 import torch
 import copy
 
-def reduce_sora_state_dict_rank(state_dict, threshold=1e-8):
+def reduce_sora_state_dict_rank(state_dict, threshold=1e-4, min_rank=2):
     """
     Analisa o state_dict e reduz iterativamente o rank das matrizes SoRA
     removendo as dimensões onde o gate está zerado, mantendo-as treináveis.
+    Respeita um rank mínimo (min_rank) por módulo para evitar over-pruning.
     """
     new_state_dict = copy.deepcopy(state_dict)
     gate_keys = [k for k in new_state_dict.keys() if "sora.gate" in k]
@@ -28,8 +29,10 @@ def reduce_sora_state_dict_rank(state_dict, threshold=1e-8):
         mask = torch.abs(gate_tensor) > threshold
         keep_idx = torch.where(mask)[0]
         
-        if len(keep_idx) == 0:
-            keep_idx = torch.topk(gate_tensor.abs(), k=1).indices
+        # Garante que o rank não caia abaixo de min_rank
+        effective_min = min(min_rank, r_original)
+        if len(keep_idx) < effective_min:
+            keep_idx = torch.topk(gate_tensor.abs(), k=effective_min).indices
             
         r_new = len(keep_idx)
         
