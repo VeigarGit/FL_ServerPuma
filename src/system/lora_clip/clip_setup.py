@@ -454,11 +454,11 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
         sparse_loss_val = 0.0
         if sparse_optimizer is not None and sparse_lambda > 0:
             gate_params = [p for n, p in model.named_parameters() if "sora" in n and "gate" in n]
-            sparse_loss = sum(torch.sum(torch.abs(p)) for p in gate_params)
-            p_total = sum(p.numel() for p in gate_params)
-            if p_total > 0:
-                sparse_loss_val = sparse_loss.item() / p_total
-                loss = ce_loss + sparse_lambda * sparse_loss / p_total
+            with torch.no_grad():
+                sparse_loss = sum(torch.sum(torch.abs(p)) for p in gate_params)
+                p_total = sum(p.numel() for p in gate_params)
+                if p_total > 0:
+                    sparse_loss_val = sparse_loss.item() / p_total
 
         loss.backward()
         optimizer.step()

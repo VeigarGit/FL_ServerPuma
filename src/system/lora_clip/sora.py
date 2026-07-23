@@ -301,11 +301,12 @@ class SparseAdamW(torch.optim.AdamW):
         loss = super().step(closure)
 
         for group in self.param_groups:
+            # O threshold verdadeiro de Proximal Gradient é scaled pelo learning rate
+            lr = group.get("lr", 1.0)
+            threshold = self.sparse_lambda * lr
             for p in group["params"]:
-                if self.sparse_lambda > 0:
-                    # Aplica Soft-Thresholding: p = sign(p) * max(0, |p| - lambda)
-                    p.data[p.data > self.sparse_lambda] -= self.sparse_lambda
-                    p.data[p.data < -self.sparse_lambda] += self.sparse_lambda
-                    p.data[abs(p.data) < self.sparse_lambda] = 0.0
+                if threshold > 0:
+                    # Aplica Soft-Thresholding vetorizado nativo (extremamente mais rápido)
+                    p.data = torch.nn.functional.softshrink(p.data, threshold)
 
         return loss

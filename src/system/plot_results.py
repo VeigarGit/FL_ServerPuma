@@ -697,9 +697,9 @@ def plot_comparative_acc_vs_time(experiments, output_dir):
 # Experimentos para plotar (Adicione ou remova itens desta lista)
 # ==============================================================================
 EXPERIMENTOS_PARA_PLOTAR = [
-    "david_clip_lora_prune1_ala1_20260716_173830",
-    "sora_rankminimo_v2",   
-    "david_v2_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260718_155430"
+    "david_clip_lora_prune1_ala1_20260723_101317",
+    "sora_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260723_102730",   
+    # "david_v2_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260718_155430"
     # Adicione outras pastas de experimentos abaixo, por exemplo:
     # "david_clip_sora_prune0_ala0_20260715_100000",
 ]
