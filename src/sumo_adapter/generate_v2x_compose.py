@@ -11,12 +11,11 @@ def generate(
     output_path: Path,
 ) -> str:
     """
-    Gera um docker-compose.yml customizado contendo APENAS os clientes
-    que estão dentro do cluster V2X neste momento.
+    Gera um docker-compose.yml customizado contendo APENAS os clientes (veículos)
+    para o modo V2X descentralizado.
     
     Retorna o caminho do arquivo gerado.
     """
-    num_clients = len(client_indices)
     
     template = f"""
 x-client-template: &client
@@ -41,8 +40,6 @@ x-client-template: &client
           - driver: nvidia
             count: all
             capabilities: [gpu]
-  depends_on:
-    - server
   networks:
     - docker-tc
   labels:
@@ -50,37 +47,6 @@ x-client-template: &client
     - "com.docker-tc.loss=10%"
 
 services:
-  server:
-    build:
-      context: .
-      dockerfile: dockerfile.server
-      args:
-        - NO_CACHE=true
-    container_name: fl-server-v2x
-    restart: 'no'
-    working_dir: /app/src/system
-    environment: 
-      - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app/src/system:/app/src
-    volumes:
-      - ./src/dataset:/app/src/dataset
-      - ./src/results:/app/src/results
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    ports:
-      - "9091:9000"
-    command: ["python", "server.py", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}", "--rounds", "{rounds}", "--prune", "{prune}"]
-    networks:
-      - docker-tc
-    labels:
-      - "com.docker-tc.enabled=1"
-      - "com.docker-tc.limit=1mbit"
-      - "com.docker-tc.delay=100ms"
 """
 
     for i, client_idx in enumerate(client_indices):
@@ -88,7 +54,7 @@ services:
   client-v2x-{i}:
     <<: *client
     container_name: fl-client-v2x-{i}
-    command: ["python", "client.py", "--client-idx", "{client_idx}", "--host", "fl-server-v2x", "--dataset", "{dataset}", "--rounds", "{rounds}", "--ala", "{ala}"]
+    command: ["python", "client.py", "--mode", "decentralized", "--client-idx", "{client_idx}", "--dataset", "{dataset}", "--rounds", "{rounds}", "--ala", "{ala}"]
 """
 
     template += """
