@@ -51,7 +51,7 @@ Regardless of the execution method, the environment must be synced and the parti
 
 ---
 
-## 🚀 Method 1: Docker Execution (Recommended)
+## 🚀 Method 1: Docker Execution
 
 This method containerizes the server and clients using highly optimized Multi-stage builds, automatically applying network constraints and mounting local volumes to save results persistently.
 
@@ -85,9 +85,12 @@ docker compose -f docker-compose.generated.yml down
 
 ## 🚀 Method 2: Tmux Automation Script (Local)
 
-This script automates the setup on the host machine using `tmux` to manage multiple processes in a visually split terminal session. The script safely encapsulates all runs using `uv run`.
+This script automates the setup on the host machine using `tmux` to manage multiple processes, assigning a separate Tmux window (tab) for the Server and each Client. The script safely encapsulates all runs using `uv run`.
 
 ```bash
+# Navigate to the system directory where the script is located
+cd src/system/
+
 # Make the script executable (only needed once)
 chmod +x run.sh
 
@@ -99,15 +102,20 @@ chmod +x run.sh
 ```
 
 ### 🖥️ Tmux Layout & Cheat Sheet
-The script creates a layout with the Server on the left and Clients stacked on the right. Once inside the tmux session, use these commands:
+The script runs the session in the background (detached). To view the live logs, open a new terminal and attach to the session (by default named `david`, or the name passed to `--session`):
+```bash
+tmux attach -t david
+```
+
+The script assigns each process to its own window (tab) to prevent layout issues. Once inside the tmux session, use these commands:
 
 | Command | Action |
 |---------|--------|
-| `Ctrl+b ↑↓←→` | Navigate between panes |
+| `Ctrl+b n` | Go to next window (tab) |
+| `Ctrl+b p` | Go to previous window (tab) |
+| `Ctrl+b w` | List all windows to choose from |
 | `Ctrl+b d` | Detach from session (keeps running in background) |
-| `Ctrl+b "` | Split pane horizontally |
-| `Ctrl+b %` | Split pane vertically |
-| `Ctrl+c` | Kill the current pane's process |
+| `Ctrl+c` | Kill the current window's process |
 
 ---
 
@@ -138,6 +146,8 @@ uv run client.py --client-idx 1 --dataset Cifar100 --rounds 5 --ala 0
 
 ## 📊 Results & Outputs
 
-After the simulation completes, performance metrics (Accuracy, Loss, Model Size variations) are exported as `.h5` files.
+After the simulation completes, performance metrics (Accuracy, Loss, Model Size variations) and logs are generated.
 
-Aggregated results are saved in the `src/system/dados_compartilhados/` directory.
+- **Logs & Results**: Saved in the `src/results/<experiment_name>/` directory.
+- **Model Weights**: Saved in the `src/system/saved_weights/` directory (if saving is enabled).
+- **Aggregated Data**: May also be exported to `src/system/dados_compartilhados/`.
