@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <input>
+        <net-file value="grid.net.xml"/>
+        <route-files value="grid.rou.xml"/>
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="300"/>
+        <step-length value="1.0"/>
+    </time>
+    <processing>
+        <collision.action value="warn"/>
+    </processing>
+</configuration>

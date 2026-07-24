@@ -313,6 +313,7 @@ def parse_args():
     parser.add_argument('--paca-min', type=int, default=1, help='Valor mínimo de PaCA no sorteio aleatório')
     parser.add_argument('--paca-max', type=int, default=12, help='Valor máximo de PaCA no sorteio aleatório')
     parser.add_argument('--paca-list', type=str, default=None, help='Lista de PaCAs pré-definidos por cliente (ex: "4,6,8,12"). O cliente usa o valor na posição client_idx %% len(lista)')
+    parser.add_argument('--mode', type=str, default='centralized', choices=['centralized', 'decentralized'])
     
     return parser.parse_args()
 
@@ -436,122 +437,237 @@ def main():
         
     time.sleep(10)
     
-    # Colocar variavel de iteração para colocar o resultado médio de varias simulações e tirar média
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        connected = False
-        for attempt in range(10):
-            try:
-                s.connect((args.host, args.port))
-                connected = True
-                break
-            except OSError as e:
-                logger.warning(f"Connection failed, retrying in 5 seconds... (Attempt {attempt+1}/10)")
-                time.sleep(5)
+    if args.mode == 'centralized':
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            connected = False
+            for attempt in range(10):
+                try:
+                    s.connect((args.host, args.port))
+                    connected = True
+                    break
+                except OSError as e:
+                    logger.warning(f"Connection failed, retrying in 5 seconds... (Attempt {attempt+1}/10)")
+                    time.sleep(5)
+                    
+            if not connected:
+                logger.exception("Connection failed after multiple attempts")
+                sys.exit(1)
                 
-        if not connected:
-            logger.exception("Connection failed after multiple attempts")
-            sys.exit(1)
+            send_data(s, args.client_idx)
+            logger.info(f"Connected to server {args.host}:{args.port}")
+            for round_num in range(args.rounds):
+                logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
+                
+                # --- Problema #4: Recebe PaCA dinâmico do servidor (apenas para CLIP) ---
+                if args.model == 'clip':
+                    server_paca, _ = recv_data(s)
+                    if server_paca is not None and server_paca != args.paca:
+                        logger.info(f"PaCA adaptativo: servidor ajustou {args.paca} -> {server_paca}")
+                        args.paca = server_paca
+                        # Atualiza o run_config para que o treino use o novo PaCA
+                        run_config["model"]["paca"]["upper_layers"] = server_paca
+
+                global_state, _ = recv_data(s)
+                prune, _ = recv_data(s)
+                
+                if global_state is None:
+                    logger.warning("Failed to receive global model. Connection may be closed.")
+                    break
+                    
+                logger.info("Received global model.")
+                global_state = dequantization(global_state)
+                
+                
+                if round_num + 1 >= 2 and prune == 1 and args.model != 'clip':
+                    ammount, _ = recv_data(s)
+                
+                if round_num + 1 >= 2:
+                    if args.model == 'clip':
+                        old_local_weights = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
+
+                    local = resize_model_to_pruned(model, global_state)
+                    test_accuracy, test_loss = evaluate_model(local, test_loader)
+                    
+                    if args.model == 'clip':
+                        for n, p in model.named_parameters():
+                            if p.requires_grad and n in old_local_weights:
+                                if p.data.shape == old_local_weights[n].shape:
+                                    p.data.copy_(old_local_weights[n])
+                else:
+                    test_accuracy, test_loss = evaluate_model(model, test_loader)
+                    
+                logger.info(f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
+                rs_global_acc.append(test_accuracy)
+                rs_global_loss.append(test_loss)
+
             
-        send_data(s, args.client_idx)
-        logger.info(f"Connected to server {args.host}:{args.port}")
-        for round_num in range(args.rounds):
-            logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
+                
+                # --- Problema #1: Mede o tempo puro de treino do cliente ---
+                train_start = time.time()
+                updated_state, personalized_acc = local_training(
+                    model=model, 
+                    state_dict=global_state, 
+                    prune=prune, 
+                    train_loader=train_loader, 
+                    test_loader=test_loader,
+                    learning_rate=args.learning_rate, 
+                    round_num=round_num + 1, 
+                    alaarg=args.ala, 
+                    ala=ala,
+                    model_type=args.model, 
+                    run_config=run_config if args.model == 'clip' else None
+                )
+                client_training_time = time.time() - train_start
+                
+                # Se o FedALA calculou a acurácia, nós salvamos ela; se não (ex: round 1 ou ala desativado), salvamos 0.0 para manter o array com mesmo tamanho
+                if personalized_acc is not None:
+                    rs_ala_acc.append(personalized_acc)
+                else:
+                    # Se o ALA não rodou, salvamos a acurácia global para a linha do gráfico não cair
+                    rs_ala_acc.append(test_accuracy)
+
+                logger.info(f"Local training completed in {client_training_time:.2f}s.")
+
+                # Acurácia logo após o treinamento local (avaliado no conjunto de teste para comparação justa)
+                local_test_acc, local_test_loss = evaluate_model(model, test_loader)
+                rs_local_acc.append(local_test_acc)
+                
+                train_accuracy, train_loss = evaluate_model(model, train_loader)
+                rs_train_acc.append(train_accuracy)
+
+                logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
+                
+                updated_state = quantization(updated_state)
+                send_data(s, updated_state)
+                send_data(s, len(train_loader))
+                send_data(s, args.ala)
+                send_data(s, client_training_time)  # Problema #1: Envia tempo de treino puro
+                logger.info("Client update sent.")
+                
+                try:
+                    s.recv(3)
+                    logger.info("Ready for next round...")
+                except OSError as e:
+                    logger.exception("Error waiting for server")
+                    break
+                    
+        save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=args.client_idx, argalgo=args.ala)
+        logger.info("\nTraining completed!")
+
+    elif args.mode == 'decentralized':
+        import json
+        logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
+        last_processed_encounter = 0
+        encounters_dir = Path(__file__).resolve().parents[1] / "results" / "encounters"
+        
+        epoch = 1
+        while True:
+            logger.info(f"\n--- [D-PSGD] Iniciando Epoca {epoch} ---")
             
-            # --- Problema #4: Recebe PaCA dinâmico do servidor (apenas para CLIP) ---
             if args.model == 'clip':
-                server_paca, _ = recv_data(s)
-                if server_paca is not None and server_paca != args.paca:
-                    logger.info(f"PaCA adaptativo: servidor ajustou {args.paca} -> {server_paca}")
-                    args.paca = server_paca
-                    # Atualiza o run_config para que o treino use o novo PaCA
-                    run_config["model"]["paca"]["upper_layers"] = server_paca
-
-            global_state, _ = recv_data(s)
-            prune, _ = recv_data(s)
-            
-            if global_state is None:
-                logger.warning("Failed to receive global model. Connection may be closed.")
-                break
-                
-            logger.info("Received global model.")
-            global_state = dequantization(global_state)
-            
-            
-            if round_num + 1 >= 2 and prune == 1 and args.model != 'clip':
-                ammount, _ = recv_data(s)
-            
-            if round_num + 1 >= 2:
-                if args.model == 'clip':
-                    old_local_weights = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
-
-                local = resize_model_to_pruned(model, global_state)
-                test_accuracy, test_loss = evaluate_model(local, test_loader)
-                
-                if args.model == 'clip':
-                    for n, p in model.named_parameters():
-                        if p.requires_grad and n in old_local_weights:
-                            if p.data.shape == old_local_weights[n].shape:
-                                p.data.copy_(old_local_weights[n])
+                dummy_state = get_trainable_state_dict(model)
             else:
-                test_accuracy, test_loss = evaluate_model(model, test_loader)
+                dummy_state = model.state_dict()
                 
-            logger.info(f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
-            rs_global_acc.append(test_accuracy)
-            rs_global_loss.append(test_loss)
-
-         
-            
-            # --- Problema #1: Mede o tempo puro de treino do cliente ---
             train_start = time.time()
             updated_state, personalized_acc = local_training(
                 model=model, 
-                state_dict=global_state, 
-                prune=prune, 
+                state_dict=dummy_state, 
+                prune=args.prune, 
                 train_loader=train_loader, 
                 test_loader=test_loader,
                 learning_rate=args.learning_rate, 
-                round_num=round_num + 1, 
+                round_num=1,
                 alaarg=args.ala, 
                 ala=ala,
                 model_type=args.model, 
                 run_config=run_config if args.model == 'clip' else None
             )
             client_training_time = time.time() - train_start
+            logger.info(f"Client {args.client_idx}: Treino local finalizado em {client_training_time:.2f}s.")
             
-            # Se o FedALA calculou a acurácia, nós salvamos ela; se não (ex: round 1 ou ala desativado), salvamos 0.0 para manter o array com mesmo tamanho
-            if personalized_acc is not None:
-                rs_ala_acc.append(personalized_acc)
-            else:
-                # Se o ALA não rodou, salvamos a acurácia global para a linha do gráfico não cair
-                rs_ala_acc.append(test_accuracy)
-
-            logger.info(f"Local training completed in {client_training_time:.2f}s.")
-
-            # Acurácia logo após o treinamento local (avaliado no conjunto de teste para comparação justa)
-            local_test_acc, local_test_loss = evaluate_model(model, test_loader)
-            rs_local_acc.append(local_test_acc)
-            
-            train_accuracy, train_loss = evaluate_model(model, train_loader)
-            rs_train_acc.append(train_accuracy)
-
-            logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
-            
-            updated_state = quantization(updated_state)
-            send_data(s, updated_state)
-            send_data(s, len(train_loader))
-            send_data(s, args.ala)
-            send_data(s, client_training_time)  # Problema #1: Envia tempo de treino puro
-            logger.info("Client update sent.")
-            
-            try:
-                s.recv(3)
-                logger.info("Ready for next round...")
-            except OSError as e:
-                logger.exception("Error waiting for server")
-                break
+            if encounters_dir.exists():
+                encounter_files = list(encounters_dir.glob("encounter_*.json"))
                 
-    save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=args.client_idx, argalgo=args.ala)
-    logger.info("\nTraining completed!")
+                def extract_id(f):
+                    try:
+                        with open(f, "r") as json_f:
+                            return json.load(json_f).get("encounter_id", 0)
+                    except:
+                        return 0
+                        
+                encounter_files.sort(key=extract_id)
+                
+                for ef in encounter_files:
+                    try:
+                        with open(ef, "r") as f:
+                            data = json.load(f)
+                        enc_id = data.get("encounter_id", 0)
+                        clients_in_encounter = data.get("clients", [])
+                        
+                        if enc_id > last_processed_encounter and args.client_idx in clients_in_encounter:
+                            logger.info(f"Client {args.client_idx}: Encontro {enc_id} detectado! Iniciando D-PSGD.")
+                            
+                            my_weights_file = encounters_dir / f"client_{args.client_idx}_enc_{enc_id}.pt"
+                            torch.save(updated_state, my_weights_file)
+                            
+                            other_clients = [c for c in clients_in_encounter if c != args.client_idx]
+                            other_states = []
+                            all_received = False
+                            
+                            logger.info(f"Client {args.client_idx}: Aguardando vizinhos {other_clients}...")
+                            for _ in range(60):
+                                all_received = True
+                                other_states = []
+                                for c in other_clients:
+                                    other_file = encounters_dir / f"client_{c}_enc_{enc_id}.pt"
+                                    if not other_file.exists():
+                                        all_received = False
+                                        break
+                                    try:
+                                        state = torch.load(other_file, map_location=device, weights_only=True)
+                                        other_states.append(state)
+                                    except:
+                                        all_received = False
+                                        break
+                                if all_received:
+                                    break
+                                time.sleep(1)
+                                
+                            if all_received:
+                                logger.info(f"Client {args.client_idx}: Pesos dos vizinhos recebidos! Aplicando consenso (Media).")
+                                avg_state = {}
+                                for key in updated_state.keys():
+                                    avg_state[key] = updated_state[key].clone()
+                                    for os_dict in other_states:
+                                        avg_state[key] += os_dict[key].to(device)
+                                    avg_state[key] = avg_state[key] / (1 + len(other_states))
+                                
+                                if args.model == 'clip':
+                                    resize_model_to_pruned(model, avg_state)
+                                else:
+                                    model.load_state_dict(avg_state, strict=False)
+                                
+                                logger.info(f"Client {args.client_idx}: Agregacao P2P do encontro {enc_id} concluida.")
+                            else:
+                                logger.warning(f"Client {args.client_idx}: Timeout aguardando vizinhos no encontro {enc_id}.")
+                            
+                            last_processed_encounter = enc_id
+                            
+                    except Exception as e:
+                        logger.error(f"Erro processando encontro {ef}: {e}")
+                        
+            local_test_acc, local_test_loss = evaluate_model(model, test_loader)
+            train_accuracy, train_loss = evaluate_model(model, train_loader)
+            
+            rs_local_acc.append(local_test_acc)
+            rs_train_acc.append(train_accuracy)
+            
+            logger.info(f"Client {args.client_idx} | Pos-Epoca {epoch} | Test Acc: {local_test_acc:.2f}% | Train Acc: {train_accuracy:.2f}%")
+            
+            save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=args.client_idx, argalgo=args.ala)
+            
+            epoch += 1
 
 if __name__ == '__main__':
     main()

@@ -1,0 +1,79 @@
+x-client-template: &client
+  build:
+    context: .
+    dockerfile: dockerfile.client
+    args:
+      - NO_CACHE=true
+  image: fl-client-image
+  restart: 'no'
+  working_dir: /app/src/system
+  environment:
+    - PYTHONUNBUFFERED=1
+    - PYTHONPATH=/app/src/system:/app/src
+  volumes:
+    - ./src/dataset:/app/src/dataset
+    - ./src/results:/app/src/results
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [ gpu ]
+  depends_on:
+    - server
+  networks:
+    - docker-tc
+  labels:
+    - "com.docker-tc.enabled=1"
+    - "com.docker-tc.loss=10%"
+    - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
+    - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: dockerfile.server
+      args:
+        - NO_CACHE=true
+    container_name: fl-server-v2x
+    restart: 'no'
+    working_dir: /app/src/system
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app/src/system:/app/src
+    volumes:
+      - ./src/dataset:/app/src/dataset
+      - ./src/results:/app/src/results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    ports:
+      - "9091:9000"
+    command: [ "python", "server.py", "--dataset", "MNIST", "--clients-per-round", "2", "--rounds", "3", "--prune", "1" ]
+    networks:
+      - docker-tc
+    labels:
+      - "com.docker-tc.enabled=1"
+      - "com.docker-tc.loss=10%" # Introduz 10% de perda de pacotes
+      - "com.docker-tc.limit=1mbit" # Limita a banda para 1 Mbit/s
+      - "com.docker-tc.delay=100ms" # Adiciona um atraso de 100ms
+
+  client-v2x-0:
+    <<: *client
+    container_name: fl-client-v2x-0
+    command: [ "python", "client.py", "--client-idx", "1", "--host", "fl-server-v2x", "--dataset", "MNIST", "--rounds", "3", "--ala", "1" ]
+
+  client-v2x-1:
+    <<: *client
+    container_name: fl-client-v2x-1
+    command: [ "python", "client.py", "--client-idx", "0", "--host", "fl-server-v2x", "--dataset", "MNIST", "--rounds", "3", "--ala", "1" ]
+
+networks:
+  docker-tc:
+    driver: bridge
