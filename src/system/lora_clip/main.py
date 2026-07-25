@@ -58,7 +58,12 @@ def main():
         # 4. Inicializa otimizadores e schedulers
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
         scheduler = build_scheduler(optimizer, run_config)
-        sparse_scheduler = build_scheduler(sparse_optimizer, run_config) if sparse_optimizer else None
+        # GateSparsifier (FL otimizado) não é um torch.optim.Optimizer, então não suporta StepLR.
+        # O SparseAdamW original suporta. GateSparsifier gerencia seu próprio lambda via step_lambda().
+        try:
+            sparse_scheduler = build_scheduler(sparse_optimizer, run_config) if sparse_optimizer else None
+        except (TypeError, AttributeError):
+            sparse_scheduler = None
         
         is_sora = run_mode in run_config["model"].get("sora_modes", ["with_sora_no_schedule", "with_sora_schedule"])
 

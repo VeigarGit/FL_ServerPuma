@@ -21,11 +21,11 @@ model:
     upper_layers: null    # se quiser desabilitar
   sora:
     sparse_lambda: 0.001
-    sparse_lambda_2: 0.01    # Conservador (escalado pelo LR)
+    sparse_lambda_2: 0.05    # Aumentado de 0.01 (5x mais pressão de esparsidade)
     sparse_lr: null
     lambda_schedule: linear
-    max_lambda: 0.05
-    lambda_num: 2
+    max_lambda: 0.1          # Aumentado de 0.05
+    lambda_num: 10           # Aumentado de 2 (progressão mais suave e longa)
     schedule_epochs: 1
     pre_prune_ratio: 0.25   # 50% dos ranks serão removidos antes do treino
     min_rank: 2              # Rank mínimo por módulo SoRA (evita over-pruning)

@@ -418,7 +418,7 @@ class FederatedLearningServer:
         training_time = client_info.get('training_time')
         current_paca = client_info.get('current_paca', self.args.paca)
         max_paca = self.args.paca  # O máximo possível (definido na CLI)
-        paca_min = 2  # Mínimo definido pelo usuário: 2 camadas
+        paca_min = getattr(self.args, 'adaptive_paca_min', 2)  # Mínimo configurável (padrão: 2)
 
         # Sem dados suficientes, mantém o atual
         if bandwidth is None or training_time is None:
@@ -426,13 +426,27 @@ class FederatedLearningServer:
 
         target_latency = getattr(self, 'time_threshold', 60.0)
         
+        # --- COOLDOWN UNIFICADO: nenhuma redução dentro de 5 rounds ---
+        # Alinhado com a janela de acurácia (window=5) para garantir que o
+        # impacto de uma redução seja observável antes de reduzir novamente.
+        last_reduction_round = client_info.get('last_paca_any_reduction_round', 0)
+        current_round = len(self.rs_test_acc)
+        cooldown_rounds = 5
+        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
+        
         # --- CRITÉRIO 2: ACURÁCIA (verificado primeiro, é global) ---
-        accuracy_signal = self._check_accuracy_signal(client_id, current_paca, paca_min, max_paca)
+        # Reversão por queda de acurácia SEMPRE permitida (mesmo em cooldown).
+        # Redução por plateau APENAS fora do cooldown.
+        accuracy_signal = self._check_accuracy_signal(
+            client_id, current_paca, paca_min, max_paca, in_cooldown
+        )
         if accuracy_signal is not None:
+            if accuracy_signal < current_paca:
+                client_info['last_paca_any_reduction_round'] = current_round
             return accuracy_signal
 
         # --- CRITÉRIO 1: LATÊNCIA (per-client) ---
-        # Se o cliente completou dentro do threshold, pode manter ou subir
+        # Subir PaCA é sempre permitido (mesmo em cooldown).
         if training_time <= target_latency:
             if training_time < target_latency * 0.7 and current_paca < max_paca:
                 new_paca = min(current_paca + 1, max_paca)
@@ -441,23 +455,32 @@ class FederatedLearningServer:
                 return new_paca
             return current_paca
 
+        # Em cooldown: não reduzir por latência
+        if in_cooldown:
+            return current_paca
+
         # Cliente está lento: calcular quantas camadas cabem no budget
         time_per_paca_layer = training_time / max(current_paca, 1)
         ideal_paca = int(target_latency / time_per_paca_layer) if time_per_paca_layer > 0 else current_paca
 
         ideal_paca = max(paca_min, min(max_paca, ideal_paca))
 
-        # Suavização: não mudar mais que 2 camadas por round
-        if abs(ideal_paca - current_paca) > 2:
-            ideal_paca = current_paca - 2 if ideal_paca < current_paca else current_paca + 2
+        # Suavização: não reduzir mais que 1 camada por round (evita cascata destrutiva)
+        if ideal_paca < current_paca:
+            ideal_paca = max(ideal_paca, current_paca - 1)
+            client_info['last_paca_any_reduction_round'] = current_round
 
         logger.info(f"PaCA adaptativo {client_id}: {current_paca} -> {ideal_paca} "
                     f"(bw={bandwidth:.2f} MB/s, time={training_time:.1f}s, target={target_latency:.1f}s)")
         return ideal_paca
 
-    def _check_accuracy_signal(self, client_id, current_paca, paca_min, max_paca):
+    def _check_accuracy_signal(self, client_id, current_paca, paca_min, max_paca, in_cooldown=False):
         """
         Verifica se a acurácia indica que o PaCA pode ser ajustado.
+        
+        - Reversão: SEMPRE ativa (mesmo em cooldown). Se a acurácia caiu >2pp
+          após uma redução de PaCA, reverte +2 como rede de segurança.
+        - Plateau: APENAS fora do cooldown. Se a acurácia estabilizou, reduz -1.
         
         Retorna:
             int: novo PaCA se a acurácia motivou uma mudança
@@ -474,13 +497,8 @@ class FederatedLearningServer:
         mean_acc = sum(recent) / len(recent)
         std_acc = (sum((x - mean_acc) ** 2 for x in recent) / len(recent)) ** 0.5
         
-        # --- COOLDOWN: respeitar intervalo mínimo entre reduções ---
-        last_reduction_round = self.clients_info[client_id].get('last_paca_reduction_round', 0)
-        current_round = len(acc_history)
-        cooldown_rounds = 3
-        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
-        
         # --- SEGURANÇA: acurácia caiu após redução? Reverte com +2. ---
+        # (SEMPRE ativo, mesmo em cooldown — é uma rede de segurança)
         paca_before_last_change = self.clients_info[client_id].get('paca_before_change')
         if paca_before_last_change is not None and paca_before_last_change > current_paca:
             # PaCA foi reduzido. Verificar se a acurácia caiu.
@@ -494,19 +512,20 @@ class FederatedLearningServer:
                 self.clients_info[client_id]['paca_before_change'] = current_paca
                 return new_paca
         
-        # --- PLATEAU: acurácia estabilizou? Tenta reduzir (com proteções). ---
-        # Condições: desvio < 0.5%, fora do cooldown, e acurácia acima de 85%
+        # --- PLATEAU: acurácia estabilizou? Tenta reduzir. ---
+        # (APENAS fora do cooldown — respeita o tempo de observação)
+        if in_cooldown:
+            return None
+            
         best_acc = max(acc_history) if acc_history else 0.0
         min_acc_for_plateau = best_acc * 0.90  # 90% da melhor acurácia observada
         if (std_acc < 0.5 
                 and current_paca > paca_min 
-                and not in_cooldown 
                 and mean_acc >= min_acc_for_plateau):
             new_paca = current_paca - 1
             logger.info(f"PaCA adaptativo {client_id}: reduzindo {current_paca} -> {new_paca} "
                         f"(acurácia estável: {mean_acc:.1f}% ± {std_acc:.2f}%, camadas extras desnecessárias)")
             self.clients_info[client_id]['paca_before_change'] = current_paca
-            self.clients_info[client_id]['last_paca_reduction_round'] = current_round
             return new_paca
         
         return None  # Acurácia não é conclusiva, deixa latência decidir
@@ -863,14 +882,14 @@ class FederatedLearningServer:
                     
                     aggregated_state = self.aggregate_models(safe_client_updates, self.global_state, safe_client_weights)
                     
-                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0 and self.prune == 1:
+                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0 and getattr(self.args, 'sora_prune', False):
                         # Verifica se a rodada atual é múltipla da frequência desejada
                         if (round_num + 1) % self.args.prune_freq == 0:
                             logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")
                             
                             sora_prune_start = time.time()
-                            # Decaimento adaptativo: threshold sobe de 1e-4 → ~1e-3 ao longo das rodadas
-                            # Isso torna a poda progressivamente mais difícil (mais conservadora)
+                            # Threshold adaptativo: sobe de 1e-4 → ~1e-3 ao longo das rodadas
+                            # Threshold MAIOR = poda mais AGRESSIVA (mais gates considerados "zerados")
                             progress = (round_num + 1) / self.args.rounds  # 0.0 → 1.0
                             decay_factor = 1.0 + progress * 9.0  # 1x → 10x
                             adaptive_threshold = 1e-4 * decay_factor
@@ -1010,7 +1029,9 @@ def parse_args():
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA')
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')
     parser.add_argument('--adaptive-paca', action='store_true', help='Ativa PaCA dinâmico: servidor ajusta automaticamente o número de camadas por cliente baseado em latência')
+    parser.add_argument('--adaptive-paca-min', type=int, default=2, help='Número mínimo de camadas que o PaCA adaptativo pode alcançar')
     parser.add_argument('--min-rank', type=int, default=2, help='Rank mínimo permitido por módulo SoRA durante poda iterativa')
+    parser.add_argument('--sora-prune', action='store_true', help='Ativa poda iterativa de rank do SoRA (independente do --prune CNN)')
     return parser.parse_args()
 
 def main():

@@ -21,6 +21,7 @@ DIM=1600
 MODEL="cnn"
 CONFIG_FILE="lora_clip/train_config.yml"
 PRUNE_FREQ=1
+SORA_PRUNE=0
 
 # --- NOVO: Valor padrão para a estratégia ---
 
@@ -68,6 +69,7 @@ while [ $# -gt 0 ]; do
         -m|--model) MODEL="$2"; shift 2 ;;
         --config) CONFIG_FILE="$2"; shift 2 ;;
         --prune-freq) PRUNE_FREQ="$2"; shift 2 ;;
+        --sora-prune) SORA_PRUNE=1; shift 1 ;;
         --simulations) SIMULATIONS="$2"; shift 2 ;; 
         --start-run) START_RUN="$2"; shift 2 ;;
         --exp-name) EXP_NAME_OVERRIDE="$2"; shift 2 ;;
@@ -224,6 +226,9 @@ for RUN in $(seq $START_RUN $END_RUN); do
     SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME"
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-paca"
+    fi
+    if [ "$SORA_PRUNE" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --sora-prune"
     fi
     if [ "$AUTO_NEXT" -eq 1 ]; then
         tmux new-session -d -s "$SESSION_NAME" "$SERVER_CMD"

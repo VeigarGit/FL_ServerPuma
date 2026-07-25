@@ -156,6 +156,10 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
     loss_fn = nn.CrossEntropyLoss()
     device = next(model.parameters()).device
     
+    # --- DIAGNÓSTICO: Contagem de parâmetros treináveis ---
+    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"[DIAG] Parâmetros treináveis neste round: {trainable_count:,}")
+    
     # --- 1. SELEÇÃO DE OTIMIZADOR ---
     if model_type == 'clip':
         from lora_clip.clip_setup import build_optimizer, train_epoch

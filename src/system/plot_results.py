@@ -119,6 +119,8 @@ def parse_experiment(exp_name, results_base="../results"):
 def _load_server_h5(files):
     acc, loss, mb, mb_bruto, time_, params, size_, paca = [], [], [], [], [], [], [], []
     client_training_time = []
+    client_comm_time = []
+    server_pruning_time = []
     for f in files:
         with h5py.File(f, 'r') as hf:
             acc.append(np.array(hf['rs_test_acc']))
@@ -138,6 +140,16 @@ def _load_server_h5(files):
                 client_training_time.append(np.array(hf['rs_client_training_time']))
             else:
                 client_training_time.append(None)
+                
+            if 'rs_client_comm_time' in hf:
+                client_comm_time.append(np.array(hf['rs_client_comm_time']))
+            else:
+                client_comm_time.append(None)
+                
+            if 'server_pruning_time' in hf:
+                server_pruning_time.append(np.array(hf['server_pruning_time']))
+            else:
+                server_pruning_time.append(None)
 
     paca_mean = None
     if all(p is not None for p in paca):
@@ -150,6 +162,20 @@ def _load_server_h5(files):
         valid_client_training_time = [t[:min_len] for t in valid_client_training_time]
         client_training_time_mean = np.mean(valid_client_training_time, axis=0)
 
+    valid_client_comm_time = [t for t in client_comm_time if t is not None]
+    client_comm_time_mean = None
+    if valid_client_comm_time:
+        min_len = min(len(t) for t in valid_client_comm_time)
+        valid_client_comm_time = [t[:min_len] for t in valid_client_comm_time]
+        client_comm_time_mean = np.mean(valid_client_comm_time, axis=0)
+
+    valid_server_pruning_time = [t for t in server_pruning_time if t is not None]
+    server_pruning_time_mean = None
+    if valid_server_pruning_time:
+        min_len = min(len(t) for t in valid_server_pruning_time)
+        valid_server_pruning_time = [t[:min_len] for t in valid_server_pruning_time]
+        server_pruning_time_mean = np.mean(valid_server_pruning_time, axis=0)
+
     return {
         'acc_mean': np.mean(acc, axis=0), 'acc_std': np.std(acc, axis=0),
         'loss_mean': np.mean(loss, axis=0), 'loss_std': np.std(loss, axis=0),
@@ -160,6 +186,8 @@ def _load_server_h5(files):
         'size_mb_mean': np.mean(size_, axis=0), 'size_mb_std': np.std(size_, axis=0),
         'paca_mean': paca_mean,
         'client_training_time_mean': client_training_time_mean,
+        'client_comm_time_mean': client_comm_time_mean,
+        'server_pruning_time_mean': server_pruning_time_mean,
         'num_runs': len(files),
     }
 
@@ -323,6 +351,103 @@ def plot_comparative_client_training_time(experiments, output_dir):
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     path = os.path.join(output_dir, "12_tempo_treinamento_clientes.pdf")
+    fig.savefig(path, dpi=150); plt.close(fig)
+    print(f"  📊 {path}")
+
+
+def plot_comparative_client_comm_time(experiments, output_dir):
+    """Tempo de Comunicação dos Clientes por Rodada - comparativo."""
+    import pandas as pd
+    
+    has_data = any(e['server'].get('client_comm_time_mean') is not None for e in experiments)
+    if not has_data:
+        print("  ⚠️ Sem dados de tempo de comunicação dos clientes, pulando.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    has_valid_data = False
+    for i, exp in enumerate(experiments):
+        d = exp['server']
+        t_mean = d.get('client_comm_time_mean')
+        if t_mean is None:
+            continue
+        has_valid_data = True
+        s = STYLES[i % len(STYLES)]
+        
+        if t_mean.ndim > 1:
+            time_per_round = np.mean(t_mean, axis=1)
+            time_std_per_round = np.std(t_mean, axis=1)
+        else:
+            time_per_round = t_mean
+            time_std_per_round = np.zeros_like(t_mean)
+            
+        # Aplica média móvel para estabilizar o gráfico
+        time_per_round = pd.Series(time_per_round).rolling(window=10, min_periods=1).mean().values
+        
+        x = range(1, len(time_per_round) + 1)
+        ax.plot(x, time_per_round, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(time_per_round)), linestyle=s['ls'],
+                label=f"{exp['label']} (μ={np.mean(time_per_round):.1f}s)")
+        
+        if np.any(time_std_per_round > 0):
+            ax.fill_between(x, time_per_round - time_std_per_round, time_per_round + time_std_per_round,
+                             color=s['color'], alpha=0.1)
+
+    if not has_valid_data:
+        plt.close(fig)
+        return
+
+    ax.set_title("Tempo Médio de Comunicação dos Clientes por Rodada (Média Móvel=10)")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
+    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    path = os.path.join(output_dir, "13_tempo_comunicacao_clientes.pdf")
+    fig.savefig(path, dpi=150); plt.close(fig)
+    print(f"  📊 {path}")
+
+
+def plot_comparative_server_pruning_time(experiments, output_dir):
+    """Tempo de Pruning do Servidor por Rodada - comparativo."""
+    has_data = any(e['server'].get('server_pruning_time_mean') is not None for e in experiments)
+    if not has_data:
+        print("  ⚠️ Sem dados de tempo de pruning do servidor, pulando.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    has_valid_data = False
+    for i, exp in enumerate(experiments):
+        d = exp['server']
+        t_mean = d.get('server_pruning_time_mean')
+        if t_mean is None:
+            continue
+        has_valid_data = True
+        s = STYLES[i % len(STYLES)]
+        
+        if t_mean.ndim > 1:
+            time_per_round = np.mean(t_mean, axis=1)
+            time_std_per_round = np.std(t_mean, axis=1)
+        else:
+            time_per_round = t_mean
+            time_std_per_round = np.zeros_like(t_mean)
+        
+        x = range(1, len(time_per_round) + 1)
+        ax.plot(x, time_per_round, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(time_per_round)), linestyle=s['ls'],
+                label=f"{exp['label']} (μ={np.mean(time_per_round):.1f}s)")
+        
+        if np.any(time_std_per_round > 0):
+            ax.fill_between(x, time_per_round - time_std_per_round, time_per_round + time_std_per_round,
+                             color=s['color'], alpha=0.1)
+
+    if not has_valid_data:
+        plt.close(fig)
+        return
+
+    ax.set_title("Tempo Médio de Pruning do Servidor por Rodada")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
+    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    path = os.path.join(output_dir, "14_tempo_pruning_servidor.pdf")
     fig.savefig(path, dpi=150); plt.close(fig)
     print(f"  📊 {path}")
 
@@ -649,6 +774,36 @@ def plot_comparative_summary_bar(experiments, output_dir):
     print(f"  📊 {path}")
 
 
+def plot_comparative_server_acc_vs_time(experiments, output_dir):
+    """Acurácia Global (Servidor) vs Tempo Acumulado - comparativo."""
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for i, exp in enumerate(experiments):
+        s = STYLES[i % len(STYLES)]
+        d = exp['server']
+        
+        # O tempo salvo é por rodada no servidor. Calculamos o tempo acumulado somando a cada rodada.
+        accumulated_time = np.cumsum(d['time_mean'])
+        
+        ax.plot(accumulated_time, d['acc_mean'], color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(d['acc_mean'])), linestyle=s['ls'],
+                label=exp['label'])
+        
+        ax.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'], 
+                         d['acc_mean'] + d['acc_std'],
+                         color=s['color'], alpha=0.1)
+
+    ax.set_title("Acurácia Global (Servidor) vs Tempo Acumulado")
+    ax.set_xlabel("Tempo Acumulado (s)")
+    ax.set_ylabel("Acurácia (%)")
+    ax.legend()
+    ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    path = os.path.join(output_dir, "15_acuracia_servidor_vs_tempo.pdf")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  📊 {path}")
+
+
 def plot_comparative_acc_vs_time(experiments, output_dir):
     """Acurácia Global (Clientes) vs Tempo Acumulado - comparativo."""
     has_data = any(e['client'] is not None for e in experiments)
@@ -697,8 +852,8 @@ def plot_comparative_acc_vs_time(experiments, output_dir):
 # Experimentos para plotar (Adicione ou remova itens desta lista)
 # ==============================================================================
 EXPERIMENTOS_PARA_PLOTAR = [
-    "david_clip_lora_prune1_ala1_20260723_101317",
-    "sora_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260723_102730",   
+    "sora_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260724_103928",
+    "david_clip_lora_prune1_ala1_20260724_100831",   
     # "david_v2_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260718_155430"
     # Adicione outras pastas de experimentos abaixo, por exemplo:
     # "david_clip_sora_prune0_ala0_20260715_100000",
@@ -757,7 +912,10 @@ def main():
     plot_comparative_summary_bar(experiments, output_dir)
     plot_comparative_discrete_comm_cost_per_round(experiments, output_dir)
     plot_comparative_acc_vs_time(experiments, output_dir)
+    plot_comparative_server_acc_vs_time(experiments, output_dir)
     plot_comparative_client_training_time(experiments, output_dir)
+    plot_comparative_client_comm_time(experiments, output_dir)
+    plot_comparative_server_pruning_time(experiments, output_dir)
 
     print(f"\n✅ {len(experiments)} experimento(s) plotados com sucesso em: {output_dir}")
 
