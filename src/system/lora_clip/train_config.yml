@@ -14,6 +14,7 @@ model:
       - k_proj
       - v_proj
       - out_proj
+
   paca:                     # ← NOVO
     enabled: true
     #Testar para todas as camadas com fine tuning
@@ -21,8 +22,8 @@ model:
     upper_layers: null    # se quiser desabilitar
   sora:
     sparse_lambda: 0.001
-    sparse_lambda_2: 0.05    # Aumentado de 0.01 (5x mais pressão de esparsidade)
-    sparse_lr: null
+    sparse_lambda_2: 0.15    # Aumentado de 0.05 (mais pressão de esparsidade)
+    sparse_lr: 0.01
     lambda_schedule: linear
     max_lambda: 0.1          # Aumentado de 0.05
     lambda_num: 10           # Aumentado de 2 (progressão mais suave e longa)

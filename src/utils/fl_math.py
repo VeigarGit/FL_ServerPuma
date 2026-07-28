@@ -99,8 +99,8 @@ def resize_model_to_pruned(model, pruned_dict):
                 pruned_weight = pruned_dict[name]
                 
                 if param.shape != pruned_weight.shape:
-                    print(f"Redimensionando {name}: {param.shape} -> {pruned_weight.shape}")
-                    new_param = nn.Parameter(pruned_weight.to(param.device))
+                    print(f"Redimensionando {name}: {param.shape} -> {pruned_weight.shape}", flush=True)
+                    new_param = nn.Parameter(pruned_weight.to(param.device), requires_grad=param.requires_grad)
                     
                     if '.' in name:
                         parts = name.split('.')

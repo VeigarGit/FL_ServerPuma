@@ -156,13 +156,25 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
     loss_fn = nn.CrossEntropyLoss()
     device = next(model.parameters()).device
     
-    # --- DIAGNÓSTICO: Contagem de parâmetros treináveis ---
-    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"[DIAG] Parâmetros treináveis neste round: {trainable_count:,}")
-    
     # --- 1. SELEÇÃO DE OTIMIZADOR ---
     if model_type == 'clip':
-        from lora_clip.clip_setup import build_optimizer, train_epoch
+        from lora_clip.clip_setup import build_optimizer, train_epoch, update_paca_runtime
+        
+        # --- PaCA RUNTIME UPDATE ---
+        # Atualiza o boundary de gradientes e congela/descongela adaptadores
+        # ANTES de construir o optimizer, garantindo que apenas os parâmetros
+        # dentro do PaCA atual sejam incluídos nos param_groups.
+        # Deve rodar APÓS resize_model_to_pruned (que pode recriar nn.Parameter).
+        paca_config = run_config["model"].get("paca", {})
+        if paca_config.get("enabled"):
+            update_paca_runtime(model, paca_config.get("upper_layers"))
+        
+        # --- DIAGNÓSTICO: Contagem de parâmetros treináveis (após PaCA update) ---
+        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if not hasattr(model, '_last_trainable_count') or model._last_trainable_count != trainable_count:
+            logger.info(f"[DIAG] Parâmetros treináveis neste round: {trainable_count:,}")
+            model._last_trainable_count = trainable_count
+        
         # O build_optimizer já sabe se é LoRA ou SoRA lendo o run_config. 
         # Como é só LoRA, sparse_optimizer será None.
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
@@ -175,6 +187,12 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
         
         logger.info(f"Métricas do Treino Local - CE Loss: {metrics['ce_loss']:.4f} | Sparse Loss: {metrics['sparse_loss']:.4f}")
     else:
+        # --- DIAGNÓSTICO: Contagem de parâmetros treináveis ---
+        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if not hasattr(model, '_last_trainable_count') or model._last_trainable_count != trainable_count:
+            logger.info(f"[DIAG] Parâmetros treináveis neste round: {trainable_count:,}")
+            model._last_trainable_count = trainable_count
+        
         optimizer = optim.SGD(model.parameters(), lr=learning_rate)
         sparse_optimizer = None
 
@@ -312,6 +330,10 @@ def parse_args():
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA') 
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas para a estratégia PaCA')
     
+    # --- Parâmetros de Sparsidade (SoRA) ---
+    parser.add_argument('--sparse-lr', type=float, default=None, help='Taxa de aprendizado para a poda (Softshrink)')
+    parser.add_argument('--max-lambda', type=float, default=None, help='Força máxima da penalidade L1 (max_lambda)')
+    
     # --- PaCA Heterogêneo ---
     parser.add_argument('--random-paca', action='store_true', help='Sorteia um valor de PaCA aleatório para este cliente')
     parser.add_argument('--paca-min', type=int, default=1, help='Valor mínimo de PaCA no sorteio aleatório')
@@ -392,6 +414,7 @@ def main():
                 config["model"]["lora"]["mode"] = "with_sora_schedule"
             elif args.strategy == 'sora_no_schedule':
                 config["model"]["lora"]["mode"] = "with_sora_no_schedule"
+
                 
             if "paca" not in config["model"]:
                 config["model"]["paca"] = {}
@@ -542,17 +565,22 @@ def main():
                 logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
                 
                 updated_state = quantization(updated_state)
-                send_data(s, updated_state)
-                send_data(s, len(train_loader))
-                send_data(s, args.ala)
-                send_data(s, client_training_time)  # Problema #1: Envia tempo de treino puro
-                logger.info("Client update sent.")
-                
                 try:
+                    send_data(s, updated_state)
+                    send_data(s, len(train_loader))
+                    send_data(s, args.ala)
+                    send_data(s, client_training_time)  # Problema #1: Envia tempo de treino puro
+                    
+                    # NOVO: Envia as métricas do modelo global calculadas no cliente
+                    send_data(s, test_accuracy)
+                    send_data(s, test_loss)
+                    
+                    logger.info("Client update sent.")
+                    
                     s.recv(3)
                     logger.info("Ready for next round...")
-                except OSError as e:
-                    logger.exception("Error waiting for server")
+                except (OSError, BrokenPipeError, ConnectionResetError) as e:
+                    logger.warning("Conexão fechada pelo servidor (provável limite de tempo atingido ou fim do treinamento).")
                     break
                     
         save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=args.client_idx, argalgo=args.ala)

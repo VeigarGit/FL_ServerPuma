@@ -258,7 +258,7 @@ class FederatedLearningServer:
         
         if 'conv' in key and 'weight' in key and local_val.ndim == 4:
             return self._align_conv_weights(local_val, global_val)
-        elif 'weight' in key and local_val.ndim == 2:
+        elif ('weight' in key or 'lora_' in key or 'gate' in key) and local_val.ndim == 2:
             return self._align_linear_weights(local_val, global_val)
         elif 'bias' in key and local_val.ndim == 1:
             return self._align_bias(local_val, global_val)
@@ -569,9 +569,13 @@ class FederatedLearningServer:
         adjustment = 0.05 if training_time > last_training_time * 1.5 else (0.03 if training_time > getattr(self, 'time_threshold', 0) * 1.2 else 0.0)
         return max(0.2, min(0.85, base_pruning_rate + adjustment))
     
-    def handle_client(self, conn, client_updates, client_weights, round_num, client_id):
+    def handle_client(self, conn, client_updates, client_weights, round_num, client_id, client_accuracies, client_losses):
         bit_rate = []
         masks = []
+        if 'socket_lock' not in self.clients_info[client_id]:
+            self.clients_info[client_id]['socket_lock'] = threading.Lock()
+            
+        self.clients_info[client_id]['socket_lock'].acquire()
         try:
             start_time = time.time()
             logger.info(f"Round {round_num}: Handling client {client_id}")
@@ -693,6 +697,14 @@ class FederatedLearningServer:
             # --- Problema #1: Recebe tempo de treino puro medido pelo cliente ---
             client_training_time, rate = recv_data(conn)
             
+            client_test_acc, _ = recv_data(conn)
+            client_test_loss, _ = recv_data(conn)
+            
+            if client_test_acc is not None:
+                with self.lock:
+                    client_accuracies.append(client_test_acc)
+                    client_losses.append(client_test_loss)
+            
             media_rate = (sum(bit_rate) / len(bit_rate)) / 8 / (1024 * 1024)
             self.clients_info[client_id]['bandwidth'] = media_rate
             self.clients_info[client_id]['data'] = self.client_data[client_id]
@@ -727,9 +739,11 @@ class FederatedLearningServer:
                 
         # Tratamento Exato de Exceções de Rede e Pickle 
         except (OSError, pickle.PickleError, struct.error) as e:
-            logger.exception(f"Round {round_num}: Network/Serialization error handling client {client_id}")
+            logger.warning(f"Round {round_num}: Cliente {client_id} excedeu o timeout ou desconectou.")
         except Exception as e:
             logger.exception(f"Round {round_num}: Critical error handling client {client_id}")
+        finally:
+            self.clients_info[client_id]['socket_lock'].release()
 
     def load_test_data(self, dataset, client_idx, batch_size=32):
         try:
@@ -843,6 +857,8 @@ class FederatedLearningServer:
                 
                 client_updates = []
                 client_weights = []
+                client_accuracies = []
+                client_losses = []
                 threads = []
                 self.stop_event = threading.Event()
                 round_pruning_time = 0.0
@@ -851,7 +867,7 @@ class FederatedLearningServer:
                     t = threading.Thread(
                         target=self.handle_client, 
                         daemon=True, 
-                        args=(conn, client_updates, client_weights, round_num + 1, clientsid[i])
+                        args=(conn, client_updates, client_weights, round_num + 1, clientsid[i], client_accuracies, client_losses)
                     )
                     t.start()
                     threads.append(t)
@@ -882,7 +898,7 @@ class FederatedLearningServer:
                     
                     aggregated_state = self.aggregate_models(safe_client_updates, self.global_state, safe_client_weights)
                     
-                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0 and getattr(self.args, 'sora_prune', False):
+                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0:
                         # Verifica se a rodada atual é múltipla da frequência desejada
                         if (round_num + 1) % self.args.prune_freq == 0:
                             logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")
@@ -892,7 +908,7 @@ class FederatedLearningServer:
                             # Threshold MAIOR = poda mais AGRESSIVA (mais gates considerados "zerados")
                             progress = (round_num + 1) / self.args.rounds  # 0.0 → 1.0
                             decay_factor = 1.0 + progress * 9.0  # 1x → 10x
-                            adaptive_threshold = 1e-4 * decay_factor
+                            adaptive_threshold = 2e-3 * decay_factor
                             logger.info(f"   Adaptive threshold: {adaptive_threshold:.6f} (progress={progress:.2f})")
                             
                             pruned_state, before, after, ranks_info = reduce_sora_state_dict_rank(
@@ -921,20 +937,15 @@ class FederatedLearningServer:
                         self.global_state = aggregated_state
                         self.global_model.load_state_dict(self.global_state, strict=False)
                     
-                    if self.test_loader is not None:
-                        # CORREÇÃO 1: Avaliar APENAS no dataset de teste global (cliente principal)
-                        # Removemos o loop lento que iterava por todos os clientes (for i in self.client_idx)
-                        self.test_loader = self.load_test_data(self.args.dataset, self.args.test_client_idx, self.args.batch_size)
-                        accuracy, avg_loss = evaluate_model(self.global_model, self.test_loader)
-                        
-                        final_accuracy = accuracy
-                        final_loss = avg_loss
+                    if client_accuracies:
+                        final_accuracy = sum(client_accuracies) / len(client_accuracies)
+                        final_loss = sum(client_losses) / len(client_losses)
                         
                         self.rs_test_acc.append(final_accuracy)
                         self.rs_test_loss.append(final_loss)
-                        logger.info(f"Round {round_num + 1}: Test Acc: {final_accuracy:.2f}% | Loss: {final_loss:.4f}")
+                        logger.info(f"Round {round_num + 1}: Global Acc (from clients): {final_accuracy:.2f}% | Loss: {final_loss:.4f}")
                     else:
-                        logger.info(f"Round {round_num + 1}: Model aggregated (no test data)")
+                        logger.info(f"Round {round_num + 1}: Model aggregated (no client accuracies received)")
                     
                     size_trainable_mb, num_trainable_params = get_trainable_size_and_params(self.global_model)
                     logger.info(f'Size Trainable Adapters: {size_trainable_mb:.2f} MB | Trainable Params: {num_trainable_params:,}')

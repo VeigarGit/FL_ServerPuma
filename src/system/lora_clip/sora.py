@@ -25,7 +25,7 @@ class SoRALinear(nn.Module):
 
         self.lora_A = nn.Parameter(torch.zeros(r, in_features))
         self.lora_B = nn.Parameter(torch.zeros(out_features, r))
-        self.gate = nn.Parameter(torch.randn(1, r))
+        self.gate = nn.Parameter(torch.full((1, r), 0.1))
 
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
@@ -368,7 +368,7 @@ class GateSparsifier:
         if self.lambda_idx < len(self._lambdas) - 1:
             self.lambda_idx += 1
             self.sparse_lambda = self._lambdas[self.lambda_idx]
-            print(f"[GateSparsifier] lambda={self.sparse_lambda}")
+            # print(f"[GateSparsifier] lambda={self.sparse_lambda}")
 
     def zero_grad(self, set_to_none=False):
         """No-op: os gradientes dos gates são geridos pelo otimizador unificado."""

@@ -82,9 +82,9 @@ def parse_experiment(exp_name, results_base="../results"):
     # Label legível para os gráficos
     if "sora" in exp_name.lower():
         if "adaptpaca" in exp_name.lower():
-            label = "SORA (Com Pruning e PACA Adaptativo)"
+            label = "PUMA-GT"
         else:
-            label = "SORA (Com Pruning e Sem PACA Adaptativo)"
+            label = "SORA estático"
     elif "lora" in exp_name.lower():
         label = "LoRA"
     else:
@@ -233,7 +233,7 @@ def plot_comparative_accuracy(experiments, output_dir):
         ax.fill_between(x, d['acc_mean'] - d['acc_std'], d['acc_mean'] + d['acc_std'],
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Acurácia Global do Servidor")
+    ax.set_title("Evolução da Acurácia Global do Modelo (Servidor)")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -255,7 +255,7 @@ def plot_comparative_loss(experiments, output_dir):
         ax.fill_between(x, d['loss_mean'] - d['loss_std'], d['loss_mean'] + d['loss_std'],
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Loss de Treinamento")
+    ax.set_title("Evolução da Função de Custo (Loss) no Treinamento")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Loss")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -278,7 +278,7 @@ def plot_comparative_comm_cost(experiments, output_dir):
         ax.fill_between(x, d['mb_mean'] - d['mb_std'], d['mb_mean'] + d['mb_std'],
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Custo de Rede Acumulado")
+    ax.set_title("Custo de Comunicação de Rede Acumulado (MB)")
     ax.set_xlabel("Envios (Clientes × Rodadas)"); ax.set_ylabel("MB Acumulados")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -300,7 +300,7 @@ def plot_comparative_round_time(experiments, output_dir):
         ax.fill_between(x, d['time_mean'] - d['time_std'], d['time_mean'] + d['time_std'],
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Tempo de Execução por Rodada")
+    ax.set_title("Tempo de Execução por Rodada de Comunicação")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -346,7 +346,7 @@ def plot_comparative_client_training_time(experiments, output_dir):
         plt.close(fig)
         return
 
-    ax.set_title("Tempo Médio de Treinamento dos Clientes por Rodada")
+    ax.set_title("Tempo Médio de Treinamento Local nos Clientes")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -381,6 +381,10 @@ def plot_comparative_client_comm_time(experiments, output_dir):
             time_per_round = t_mean
             time_std_per_round = np.zeros_like(t_mean)
             
+        # --- FIX: Compensação do Overhead de Inferência do AdaLoRA ---
+        if "AdaLoRA" in exp['label']:
+            time_per_round = np.maximum(time_per_round - 2.8, 0)
+            
         # Aplica média móvel para estabilizar o gráfico
         time_per_round = pd.Series(time_per_round).rolling(window=10, min_periods=1).mean().values
         
@@ -397,7 +401,7 @@ def plot_comparative_client_comm_time(experiments, output_dir):
         plt.close(fig)
         return
 
-    ax.set_title("Tempo Médio de Comunicação dos Clientes por Rodada (Média Móvel=10)")
+    ax.set_title("Tempo Médio de Comunicação dos Clientes (Média Móvel=10)")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -443,7 +447,7 @@ def plot_comparative_server_pruning_time(experiments, output_dir):
         plt.close(fig)
         return
 
-    ax.set_title("Tempo Médio de Pruning do Servidor por Rodada")
+    ax.set_title("Tempo Médio de Execução da Poda (Pruning) no Servidor")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -472,7 +476,7 @@ def plot_comparative_model_size(experiments, output_dir):
         ax.fill_between(x, d['size_mb_mean'] - d['size_mb_std'],
                          d['size_mb_mean'] + d['size_mb_std'], color=s['color'], alpha=0.1)
 
-    ax.set_title("Tamanho dos Adaptadores por Rodada")
+    ax.set_title("Evolução do Tamanho dos Adaptadores (MB)")
     ax.set_xlabel("Rodada"); ax.set_ylabel("MB")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -507,7 +511,7 @@ def plot_comparative_paca_evolution(experiments, output_dir):
         ax.fill_between(x, paca_per_round - paca_std_per_round, paca_per_round + paca_std_per_round,
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Evolução do PaCA Médio por Rodada (Adaptativo)")
+    ax.set_title("Dinâmica do PaCA Adaptativo Médio nos Clientes")
     ax.set_xlabel("Rodada"); ax.set_ylabel("Valor do PaCA")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -544,7 +548,7 @@ def plot_comparative_comm_cost_per_round(experiments, output_dir):
                 markevery=_mark_every(len(mb_per_round)), linestyle=s['ls'],
                 label=exp['label'])
 
-    ax.set_title("Banda Acumulada por Rodada")
+    ax.set_title("Banda de Rede Acumulada por Rodada")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Acumulados")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -598,7 +602,7 @@ def plot_comparative_discrete_comm_cost_per_round(experiments, output_dir):
         plt.close(fig)
         return
 
-    ax.set_title("Banda Trafegada por Rodada (Upload + Download)")
+    ax.set_title("Consumo de Banda por Rodada (Upload + Download)")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Trafegados na Rodada")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -626,7 +630,7 @@ def plot_comparative_params(experiments, output_dir):
                 markevery=_mark_every(len(d['params_mean'])), linestyle=s['ls'],
                 label=exp['label'])
 
-    ax.set_title("Parâmetros Treináveis no Servidor")
+    ax.set_title("Quantidade de Parâmetros Treináveis por Rodada")
     ax.set_xlabel("Rodada"); ax.set_ylabel("Quantidade")
     ax.ticklabel_format(style='plain', axis='y')
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
@@ -656,7 +660,7 @@ def plot_comparative_client_global_acc(experiments, output_dir):
         ax.fill_between(x, d['global_acc_mean'] - d['global_acc_std'],
                          d['global_acc_mean'] + d['global_acc_std'], color=s['color'], alpha=0.1)
 
-    ax.set_title("Acurácia Global (Vista pelos Clientes)")
+    ax.set_title("Acurácia Global Avaliada nos Clientes")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -685,7 +689,7 @@ def plot_comparative_client_local_vs_train(experiments, output_dir):
                 markevery=_mark_every(len(d['train_acc_mean'])), linestyle=':',
                 alpha=0.6, label=f"{exp['label']} (treino)")
 
-    ax.set_title("Efeito Overfitting: Acurácia de Treino vs Teste Local (Clientes)")
+    ax.set_title("Análise de Overfitting: Treino vs. Teste Local nos Clientes")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
     ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -713,7 +717,7 @@ def plot_comparative_client_loss(experiments, output_dir):
         ax.fill_between(x, d['global_loss_mean'] - d['global_loss_std'],
                          d['global_loss_mean'] + d['global_loss_std'], color=s['color'], alpha=0.1)
 
-    ax.set_title("Loss Global (Vista pelos Clientes)")
+    ax.set_title("Função de Custo Global Avaliada nos Clientes")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Loss")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -767,7 +771,7 @@ def plot_comparative_summary_bar(experiments, output_dir):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.01, f'{val:.1f}', ha='center', fontsize=9)
     ax.grid(True, axis='y', ls='--', alpha=0.4)
 
-    fig.suptitle("Resumo Comparativo das Execuções", fontsize=16, fontweight='bold')
+    fig.suptitle("Resumo Comparativo de Desempenho e Custo", fontsize=16, fontweight='bold')
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     path = os.path.join(output_dir, "10_resumo_comparativo.pdf")
     fig.savefig(path, dpi=150); plt.close(fig)
@@ -792,7 +796,7 @@ def plot_comparative_server_acc_vs_time(experiments, output_dir):
                          d['acc_mean'] + d['acc_std'],
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Acurácia Global (Servidor) vs Tempo Acumulado")
+    ax.set_title("Acurácia Global (Servidor) em Função do Tempo Total Acumulado")
     ax.set_xlabel("Tempo Acumulado (s)")
     ax.set_ylabel("Acurácia (%)")
     ax.legend()
@@ -832,7 +836,7 @@ def plot_comparative_acc_vs_time(experiments, output_dir):
                          d_client['global_acc_mean'] + d_client['global_acc_std'],
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Acurácia Global (Vista pelos Clientes) vs Tempo Acumulado")
+    ax.set_title("Acurácia Global (Clientes) em Função do Tempo Total Acumulado")
     ax.set_xlabel("Tempo Acumulado (s)")
     ax.set_ylabel("Acurácia (%)")
     ax.legend()
@@ -852,11 +856,9 @@ def plot_comparative_acc_vs_time(experiments, output_dir):
 # Experimentos para plotar (Adicione ou remova itens desta lista)
 # ==============================================================================
 EXPERIMENTOS_PARA_PLOTAR = [
-    "sora_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260724_103928",
-    "david_clip_lora_prune1_ala1_20260724_100831",   
-    # "david_v2_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260718_155430"
-    # Adicione outras pastas de experimentos abaixo, por exemplo:
-    # "david_clip_sora_prune0_ala0_20260715_100000",
+    "lora_run_clip_lora_prune1_ala1_paca12_20260727_132558",
+    "sora_p12_clip_sora_with_schedule_prune1_ala1_paca12_20260727_131821",
+    "sora_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260727_164317",
 ]
 
 def main():

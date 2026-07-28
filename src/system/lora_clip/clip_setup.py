@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import yaml
 from datasets import ClassLabel, load_dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, AdaLoraConfig, get_peft_model
 from sklearn.metrics import accuracy_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
@@ -281,6 +281,90 @@ def _apply_paca_gradient_boundary(model, upper_k):
           f"(economia de ~{(boundary_idx + 1) / total_layers * 100:.0f}% no backward pass)")
 
 
+def update_paca_runtime(model, new_upper_k):
+    """
+    Atualiza o PaCA em runtime sem reconstruir o modelo.
+
+    Chamado pelo cliente quando o servidor ajusta o PaCA adaptativamente.
+    Garante que a economia computacional reflita o novo valor de PaCA,
+    atualizando tanto o corte de gradientes quanto o estado dos adaptadores.
+
+    Operações:
+      1. Remove os forward hooks de gradiente existentes (_paca_hooks)
+      2. Registra novo hook de boundary na posição correta
+      3. Congela adaptadores (SoRA/LoRA) em camadas fora do novo PaCA
+      4. Descongela adaptadores dentro do novo PaCA (necessário quando PaCA sobe)
+
+    Referência teórica: PaCA (Partial Calibration) restringe o fine-tuning
+    às últimas upper_k camadas do encoder. Camadas abaixo do boundary não
+    precisam de gradientes, e seus adaptadores não devem ser atualizados.
+
+    Args:
+        model: O modelo CLIPForClassification com adaptadores injetados.
+        new_upper_k: Número de camadas superiores a treinar (novo valor PaCA).
+                     Se None, todas as camadas ficam ativas.
+    """
+    encoder_layers = _get_encoder_layers(model)
+    total_layers = len(encoder_layers)
+
+    # --- 1. REMOVE HOOKS ANTIGOS ---
+    # Os hooks são armazenados em model._paca_hooks pelo _apply_paca_gradient_boundary.
+    # Remover antes de registrar novos evita hooks duplicados ou conflitantes.
+    if hasattr(model, '_paca_hooks'):
+        for handle in model._paca_hooks:
+            handle.remove()
+        model._paca_hooks = []
+
+    # --- 2. REGISTRA NOVO HOOK NA POSIÇÃO CORRETA ---
+    # _apply_paca_gradient_boundary já lida com o caso upper_k >= total_layers
+    # (retorna sem registrar hook, permitindo backward completo).
+    if new_upper_k is not None:
+        _apply_paca_gradient_boundary(model, new_upper_k)
+
+    # --- 3/4. FREEZE/UNFREEZE DE ADAPTADORES ---
+    # Camadas abaixo do boundary não precisam de gradientes nos adaptadores.
+    # Congelar seus parâmetros traz 3 benefícios:
+    #   a) PyTorch não constrói o grafo de autograd para esses ops (menos memória)
+    #   b) O optimizer não itera sobre eles (menos overhead por step)
+    #   c) get_trainable_state_dict não os inclui (menos dados enviados ao servidor)
+    if new_upper_k is None or new_upper_k >= total_layers:
+        boundary_layer = 0  # Todas as camadas estão ativas
+    else:
+        boundary_layer = total_layers - new_upper_k
+
+    frozen_count = 0
+    unfrozen_count = 0
+
+    for name, param in model.named_parameters():
+        # Filtra apenas parâmetros de adaptadores (SoRA ou LoRA via PEFT)
+        if "sora" not in name and "lora" not in name:
+            continue
+        # Filtra apenas parâmetros dentro de encoder layers
+        if "encoder.layers." not in name:
+            continue
+
+        try:
+            layer_idx = int(name.split("encoder.layers.")[1].split(".")[0])
+        except (ValueError, IndexError):
+            continue
+
+        if layer_idx < boundary_layer:
+            # Camada fora do PaCA: congelar adaptador
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen_count += 1
+        else:
+            # Camada dentro do PaCA: garantir que o adaptador está ativo
+            if not param.requires_grad:
+                param.requires_grad = True
+                unfrozen_count += 1
+
+    if frozen_count > 0 or unfrozen_count > 0:
+        print(f"PaCA runtime update: upper_k={new_upper_k}, "
+              f"boundary=layer {boundary_layer}/{total_layers}, "
+              f"frozen={frozen_count} params, unfrozen={unfrozen_count} params")
+
+
 def build_model(config, num_classes, device):
     """
     Fábrica de Modelos.
@@ -322,6 +406,7 @@ def build_model(config, num_classes, device):
             layers_to_transform=layers_to_transform,
         )
         model.vision_model = get_peft_model(model.vision_model, peft_config)
+
     elif mode in SORA_MODES:
         apply_sora(model, lora_config, upper_k=upper_k)
 
@@ -460,8 +545,8 @@ def build_optimizer(model, config):
             lambda_num=lambda_num,
         )
 
-        print(f"Gate params: {sum(p.numel() for p in gate_params):,}")
-        print(f"Other trainable params: {sum(p.numel() for p in other_params):,}")
+        # print(f"Gate params: {sum(p.numel() for p in gate_params):,}")
+        # print(f"Other trainable params: {sum(p.numel() for p in other_params):,}")
         return unified_optimizer, gate_sparsifier
 
     trainable_params = [param for param in model.parameters() if param.requires_grad]
@@ -516,7 +601,7 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     # Cache: evita chamada a next(model.parameters()) a cada batch
     model_dtype = next(model.parameters()).dtype
 
-    for pixel_values, labels in tqdm(loader, desc="train", leave=False):
+    for pixel_values, labels in tqdm(loader, desc="train", leave=False, disable=True):
         pixel_values = pixel_values.to(device, dtype=model_dtype)
         labels = labels.to(device)
         
@@ -577,7 +662,7 @@ def evaluate(model, loader):
         device = next(model.parameters()).device
         model_dtype = next(model.parameters()).dtype
         
-        for pixel_values, labels in tqdm(loader, desc="eval", leave=False):
+        for pixel_values, labels in tqdm(loader, desc="eval", leave=False, disable=True):
             pixel_values = pixel_values.to(device, dtype=model_dtype)
             outputs = model(pixel_values=pixel_values)
             logits = outputs["logits"]

@@ -195,15 +195,19 @@ fi
 
 # 5. Loop de Simulações
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-if [ -n "$EXP_NAME_OVERRIDE" ]; then
-    EXP_NAME="$EXP_NAME_OVERRIDE"
-else
-    if [ "$ADAPTIVE_PACA" -eq 1 ]; then
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca_${TIMESTAMP}"
+    if [ -n "$EXP_NAME_OVERRIDE" ]; then
+        EXP_NAME="$EXP_NAME_OVERRIDE"
     else
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_${TIMESTAMP}"
+        if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+            EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca_${TIMESTAMP}"
+        elif [ "$RANDOM_PACA" -eq 1 ]; then
+            EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_randompaca_${TIMESTAMP}"
+        elif [ -n "$PACA_LIST" ]; then
+            EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_pacalist_${TIMESTAMP}"
+        else
+            EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_paca${PACA}_${TIMESTAMP}"
+        fi
     fi
-fi
 echo "📁 Diretório de Resultados: ../results/$EXP_NAME"
 
 END_RUN=$((START_RUN + SIMULATIONS - 1))
@@ -222,6 +226,10 @@ for RUN in $(seq $START_RUN $END_RUN); do
         SERVER_PACA=$PACA
     fi
 
+    # --- Criar diretório de logs ---
+    LOG_DIR="../results/$EXP_NAME/logs/sim_$RUN"
+    mkdir -p "$LOG_DIR"
+
     # --- NOVO: Adicionado --strategy $STRATEGY no comando do server.py ---
     SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME"
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
@@ -230,6 +238,10 @@ for RUN in $(seq $START_RUN $END_RUN); do
     if [ "$SORA_PRUNE" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --sora-prune"
     fi
+    
+    # Adicionar o log do servidor
+    SERVER_CMD="$SERVER_CMD 2>&1 | tee $LOG_DIR/server.log"
+
     if [ "$AUTO_NEXT" -eq 1 ]; then
         tmux new-session -d -s "$SESSION_NAME" "$SERVER_CMD"
     else
@@ -255,8 +267,6 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        LOG_DIR="../results/$EXP_NAME/logs/sim_$RUN"
-        mkdir -p "$LOG_DIR"
         CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN --exp-name $EXP_NAME 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
             CLIENT_CMD="$CLIENT_CMD ; read"
