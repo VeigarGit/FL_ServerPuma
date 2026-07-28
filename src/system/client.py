@@ -556,67 +556,143 @@ def main():
 
     elif args.mode == 'decentralized':
         import json
+        import tempfile
+
         logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
+
+        # Contador do ultimo encontro processado. Garante que cada encontro
+        # so e processado uma unica vez, mesmo que o JSON persista no disco.
         last_processed_encounter = 0
+
+        # Caminho para a pasta de sinalizacao P2P (volume compartilhado Docker).
+        # O orquestrador escreve JSONs de encontro aqui, e os clientes leem
+        # e escrevem arquivos .pt de pesos nesta mesma pasta.
         encounters_dir = Path(__file__).resolve().parents[1] / "results" / "encounters"
-        
+
         epoch = 1
         while True:
             logger.info(f"\n--- [D-PSGD] Iniciando Epoca {epoch} ---")
-            
+
+            # Obter o state_dict atual do modelo para usar como base do treino.
+            # Para CLIP, usa apenas os parametros treinaveis (LoRA/SoRA).
             if args.model == 'clip':
                 dummy_state = get_trainable_state_dict(model)
             else:
                 dummy_state = model.state_dict()
-                
+
+            # ── TREINO LOCAL ─────────────────────────────────────────────
+            # Acontece SEMPRE, independente de haver encontro ou nao.
+            # O modelo melhora continuamente com os dados locais.
             train_start = time.time()
             updated_state, personalized_acc = local_training(
-                model=model, 
-                state_dict=dummy_state, 
-                prune=args.prune, 
-                train_loader=train_loader, 
+                model=model,
+                state_dict=dummy_state,
+                prune=args.prune,
+                train_loader=train_loader,
                 test_loader=test_loader,
-                learning_rate=args.learning_rate, 
+                learning_rate=args.learning_rate,
                 round_num=1,
-                alaarg=args.ala, 
+                alaarg=args.ala,
                 ala=ala,
-                model_type=args.model, 
+                model_type=args.model,
                 run_config=run_config if args.model == 'clip' else None
             )
             client_training_time = time.time() - train_start
-            logger.info(f"Client {args.client_idx}: Treino local finalizado em {client_training_time:.2f}s.")
-            
+            logger.info(
+                f"Client {args.client_idx}: Treino local finalizado em "
+                f"{client_training_time:.2f}s."
+            )
+
+            # ── VERIFICAR SINAIS DE ENCONTRO ─────────────────────────────
+            # Apos o treino local, verificar se o orquestrador gerou algum
+            # sinal de encontro novo na pasta compartilhada.
             if encounters_dir.exists():
                 encounter_files = list(encounters_dir.glob("encounter_*.json"))
-                
-                def extract_id(f):
+
+                # Funcao auxiliar para extrair o ID do encontro do JSON.
+                # Usada para ordenar os arquivos e processa-los na sequencia.
+                def extract_id(filepath):
                     try:
-                        with open(f, "r") as json_f:
+                        with open(filepath, "r") as json_f:
                             return json.load(json_f).get("encounter_id", 0)
-                    except:
+                    except Exception:
                         return 0
-                        
+
+                # Ordenar por ID para processar na sequencia correta
                 encounter_files.sort(key=extract_id)
-                
+
                 for ef in encounter_files:
                     try:
                         with open(ef, "r") as f:
                             data = json.load(f)
+
                         enc_id = data.get("encounter_id", 0)
                         clients_in_encounter = data.get("clients", [])
-                        
+
+                        # ── Ler ETC do JSON gerado pelo orquestrador ─────
+                        # O campo etc_seconds contem o Tempo Estimado de
+                        # Contato calculado via TraCI no momento do encontro.
+                        # Usado como timeout para o polling de pesos dos vizinhos.
+                        # Default de 60s caso o campo nao exista (compatibilidade).
+                        etc_seconds = data.get("etc_seconds", 60)
+
+                        # Verificar se:
+                        # 1. Este encontro e NOVO (ID > ultimo processado)
+                        # 2. Este cliente FAZ PARTE do encontro
                         if enc_id > last_processed_encounter and args.client_idx in clients_in_encounter:
-                            logger.info(f"Client {args.client_idx}: Encontro {enc_id} detectado! Iniciando D-PSGD.")
-                            
+
+                            # Calcular timeout de polling baseado no ETC.
+                            # Subtrair 5 segundos como margem de seguranca
+                            # para garantir que a agregacao complete antes
+                            # dos veiculos sairem do raio de comunicacao.
+                            # Minimo de 5 segundos para nao abortar instantaneamente.
+                            poll_timeout = max(5, int(etc_seconds - 5))
+
+                            logger.info(
+                                f"Client {args.client_idx}: Encontro {enc_id} detectado! "
+                                f"ETC={etc_seconds:.1f}s, timeout_polling={poll_timeout}s. "
+                                f"Iniciando D-PSGD."
+                            )
+
+                            # ── ESCRITA ATOMICA dos pesos locais ─────────
+                            # Usa write-to-temp + rename para garantir que
+                            # os vizinhos nunca leiam um .pt parcialmente
+                            # escrito (operacao atomica no Linux).
                             my_weights_file = encounters_dir / f"client_{args.client_idx}_enc_{enc_id}.pt"
-                            torch.save(updated_state, my_weights_file)
-                            
+                            tmp_fd, tmp_path = tempfile.mkstemp(
+                                dir=str(encounters_dir),
+                                prefix=f".client_{args.client_idx}_",
+                                suffix=".pt.tmp",
+                            )
+                            try:
+                                # Fechar o file descriptor do mkstemp (torch.save
+                                # gerencia seu proprio file handle)
+                                os.close(tmp_fd)
+                                # Salvar pesos no arquivo temporario
+                                torch.save(updated_state, tmp_path)
+                                # Rename atomico para o nome final
+                                os.rename(tmp_path, my_weights_file)
+                            except Exception:
+                                # Limpar temporario em caso de erro
+                                if os.path.exists(tmp_path):
+                                    os.unlink(tmp_path)
+                                raise
+
+                            # ── POLLING dos pesos dos vizinhos ───────────
+                            # Esperar que todos os outros clientes do encontro
+                            # tambem salvem seus arquivos .pt. O timeout e
+                            # baseado no ETC para nao esperar alem da janela
+                            # de contato real.
                             other_clients = [c for c in clients_in_encounter if c != args.client_idx]
                             other_states = []
                             all_received = False
-                            
-                            logger.info(f"Client {args.client_idx}: Aguardando vizinhos {other_clients}...")
-                            for _ in range(60):
+
+                            logger.info(
+                                f"Client {args.client_idx}: Aguardando vizinhos "
+                                f"{other_clients} (timeout={poll_timeout}s)..."
+                            )
+
+                            for tick in range(poll_timeout):
                                 all_received = True
                                 other_states = []
                                 for c in other_clients:
@@ -625,48 +701,94 @@ def main():
                                         all_received = False
                                         break
                                     try:
-                                        state = torch.load(other_file, map_location=device, weights_only=True)
+                                        # weights_only=True por seguranca
+                                        # (nao executa codigo arbitrario)
+                                        state = torch.load(
+                                            other_file,
+                                            map_location=device,
+                                            weights_only=True,
+                                        )
                                         other_states.append(state)
-                                    except:
+                                    except Exception:
+                                        # Arquivo pode estar sendo renomeado
+                                        # neste exato momento (escrita atomica
+                                        # em andamento). Tentar novamente.
                                         all_received = False
                                         break
                                 if all_received:
                                     break
                                 time.sleep(1)
-                                
+
+                            # ── AGREGACAO D-PSGD (Media Simples) ─────────
                             if all_received:
-                                logger.info(f"Client {args.client_idx}: Pesos dos vizinhos recebidos! Aplicando consenso (Media).")
+                                logger.info(
+                                    f"Client {args.client_idx}: Pesos de "
+                                    f"{len(other_states)} vizinhos recebidos! "
+                                    f"Aplicando consenso (Media)."
+                                )
+
+                                # Calcular a media aritmetica dos pesos:
+                                # avg = (meus_pesos + vizinho1 + vizinho2 + ...) / N
                                 avg_state = {}
                                 for key in updated_state.keys():
+                                    # Comecar com uma copia dos pesos locais
                                     avg_state[key] = updated_state[key].clone()
-                                    for os_dict in other_states:
-                                        avg_state[key] += os_dict[key].to(device)
+                                    # Somar os pesos de cada vizinho
+                                    for neighbor_state in other_states:
+                                        avg_state[key] += neighbor_state[key].to(device)
+                                    # Dividir pelo total de participantes
                                     avg_state[key] = avg_state[key] / (1 + len(other_states))
-                                
+
+                                # Carregar os pesos agregados no modelo
                                 if args.model == 'clip':
                                     resize_model_to_pruned(model, avg_state)
                                 else:
                                     model.load_state_dict(avg_state, strict=False)
-                                
-                                logger.info(f"Client {args.client_idx}: Agregacao P2P do encontro {enc_id} concluida.")
+
+                                logger.info(
+                                    f"Client {args.client_idx}: Agregacao P2P do "
+                                    f"encontro {enc_id} concluida com sucesso."
+                                )
                             else:
-                                logger.warning(f"Client {args.client_idx}: Timeout aguardando vizinhos no encontro {enc_id}.")
-                            
+                                # ── FALLBACK: timeout expirado ───────────
+                                # A janela de contato (ETC) expirou antes de
+                                # todos os vizinhos salvarem seus pesos.
+                                # Neste caso, DESCARTAMOS a rodada P2P e
+                                # mantemos o modelo local intacto.
+                                # O treino local continua normalmente.
+                                logger.warning(
+                                    f"Client {args.client_idx}: Timeout (ETC expirado) "
+                                    f"no encontro {enc_id}. Descartando rodada P2P "
+                                    f"e continuando com modelo local."
+                                )
+
+                            # Marcar este encontro como processado para nao
+                            # tentar novamente na proxima epoca
                             last_processed_encounter = enc_id
-                            
+
                     except Exception as e:
                         logger.error(f"Erro processando encontro {ef}: {e}")
-                        
+
+            # ── AVALIACAO POS-EPOCA ──────────────────────────────────────
+            # Avaliar o modelo (com ou sem agregacao P2P) nos dados locais
             local_test_acc, local_test_loss = evaluate_model(model, test_loader)
             train_accuracy, train_loss = evaluate_model(model, train_loader)
-            
+
             rs_local_acc.append(local_test_acc)
             rs_train_acc.append(train_accuracy)
-            
-            logger.info(f"Client {args.client_idx} | Pos-Epoca {epoch} | Test Acc: {local_test_acc:.2f}% | Train Acc: {train_accuracy:.2f}%")
-            
-            save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=args.client_idx, argalgo=args.ala)
-            
+
+            logger.info(
+                f"Client {args.client_idx} | Pos-Epoca {epoch} | "
+                f"Test Acc: {local_test_acc:.2f}% | Train Acc: {train_accuracy:.2f}%"
+            )
+
+            # Salvar metricas incrementalmente (sobrescreve o arquivo a cada epoca)
+            save_results(
+                args, rs_global_acc, rs_global_loss, rs_ala_acc,
+                rs_local_acc, rs_train_acc,
+                idx=args.client_idx, argalgo=args.ala,
+            )
+
             epoch += 1
 
 if __name__ == '__main__':
