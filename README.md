@@ -88,34 +88,147 @@ docker compose -f docker-compose.generated.yml down
 This script automates the setup on the host machine using `tmux` to manage multiple processes, assigning a separate Tmux window (tab) for the Server and each Client. The script safely encapsulates all runs using `uv run`.
 
 ```bash
-# Navigate to the system directory where the script is located
 cd src/system/
+chmod +x run.sh    # apenas na primeira vez
 
-# Make the script executable (only needed once)
-chmod +x run.sh
+# Ver todos os argumentos disponíveis
+./run.sh --help
 
-# Run with default parameters
+# Rodar com valores padrão (2 clientes, MNIST, 5 rodadas)
 ./run.sh
 
-# Or run with custom parameters
-./run.sh --clients 3 --host "localhost" --port 9050 --dataset "Cifar100" --session "fl_session" --ala 0 --prune 1
+# Exemplo com CLIP + LoRA
+./run.sh --model clip --strategy lora --dataset OxfordPets --clients 5 --rounds 50 --num-classes 37
+
+# Exemplo com SoRA + PaCA adaptativo
+./run.sh --model clip --strategy sora_with_schedule --adaptive-paca --sora-prune --rounds 50
 ```
 
-### 🖥️ Tmux Layout & Cheat Sheet
-The script runs the session in the background (detached). To view the live logs, open a new terminal and attach to the session (by default named `david`, or the name passed to `--session`):
+### 📖 Argumentos do `run.sh`
+
+**Rede:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `-h`, `--host` | Host do servidor | `localhost` |
+| `-p`, `--port` | Porta do servidor | `9500` |
+
+**Sessão / Execução:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `-s`, `--session` | Nome da sessão tmux | `david` |
+| `--simulations` | Número de simulações sequenciais | `1` |
+| `--start-run` | Índice da primeira simulação | `1` |
+| `--exp-name` | Nome customizado do experimento | auto-gerado |
+| `--auto-next` | Não pausar entre simulações | desabilitado |
+
+**Treinamento:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `-c`, `--clients` | Número de clientes | `2` |
+| `-r`, `--rounds` | Número de rodadas | `5` |
+| `-d`, `--dataset` | Dataset (`MNIST`, `Cifar10`, `Cifar100`, `OxfordPets`) | `MNIST` |
+| `--batch-size` | Tamanho do batch | `32` |
+| `--max-clients` | Máximo de clientes permitidos | `22` |
+| `--ala` | 0=FedALA, 1=FedAvg | `1` |
+
+**Modelo:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `-m`, `--model` | Tipo de modelo (`cnn` ou `clip`) | `cnn` |
+| `--strategy` | Estratégia (`lora`, `sora_with_schedule`, etc.) | `lora` |
+| `--rank` | Rank do LoRA/SoRA | `8` |
+| `--config` | Caminho do YAML de config (obrigatório para CLIP) | `lora_clip/train_config.yml` |
+
+**Dispositivo:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `--device` | Dispositivo (`cuda`, `cpu`, `mps`) | auto-detectado |
+| `-did`, `--device-id` | ID da GPU | `0` |
+| `--cpu` | Forçar uso de CPU | desabilitado |
+
+**Pruning:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `--prune` | Habilitar pruning (`0` ou `1`) | `1` |
+| `--prune-freq` | Frequência de pruning | `1` |
+| `--sora-prune` | Habilitar pruning SoRA | desabilitado |
+
+**PaCA:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `--paca` | Valor fixo de PaCA | `12` |
+| `--adaptive-paca` | PaCA adaptativo no servidor | desabilitado |
+| `--random-paca` | PaCA aleatório por cliente | desabilitado |
+| `--paca-min` | PaCA mínimo (modo aleatório) | `1` |
+| `--paca-max` | PaCA máximo (modo aleatório) | `12` |
+| `--paca-list` | Lista de PaCA por cliente (ex: `"4,8,12"`) | — |
+
+**Arquitetura CNN:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `--in-features` | Canais de entrada | `3` |
+| `--dim` | Dimensão intermediária | `1600` |
+| `--num-classes` | Número de classes | `10` |
+| `-t`, `--test-client-idx` | Índice do cliente de teste | `0` |
+
+**Persistência de Modelo:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `--save [path]` | Salvar modelo (path opcional) | desabilitado |
+| `--load [path]` | Carregar modelo (path opcional) | desabilitado |
+
+### 🖥️ Guia Rápido do Tmux
+
+O script roda a sessão em background (detached). Cada processo (servidor + clientes) fica em sua própria **janela** (aba) dentro da sessão tmux.
+
+**Conectar e desconectar:**
 ```bash
+# Conectar à sessão (nome padrão: david)
 tmux attach -t david
+
+# Desconectar sem matar os processos (de dentro do tmux)
+# Pressione: Ctrl+b, depois d
 ```
 
-The script assigns each process to its own window (tab) to prevent layout issues. Once inside the tmux session, use these commands:
+**Navegação entre janelas (abas):**
 
-| Command | Action |
-|---------|--------|
-| `Ctrl+b n` | Go to next window (tab) |
-| `Ctrl+b p` | Go to previous window (tab) |
-| `Ctrl+b w` | List all windows to choose from |
-| `Ctrl+b d` | Detach from session (keeps running in background) |
-| `Ctrl+c` | Kill the current window's process |
+| Atalho | Ação |
+|--------|------|
+| `Ctrl+b n` | Próxima janela |
+| `Ctrl+b p` | Janela anterior |
+| `Ctrl+b w` | Lista de janelas (selecione com setas + Enter) |
+| `Ctrl+b 0..9` | Ir direto para janela pelo número |
+
+**Scroll e busca no log:**
+
+| Atalho | Ação |
+|--------|------|
+| `Ctrl+b [` | Entrar no modo scroll (use setas/PgUp/PgDn) |
+| `q` | Sair do modo scroll |
+| `Ctrl+b [` → `/` | Buscar texto no log (dentro do modo scroll) |
+
+**Gerenciamento de sessão (fora do tmux):**
+```bash
+# Listar sessões ativas
+tmux ls
+
+# Matar uma sessão específica
+tmux kill-session -t david
+
+# Matar todas as sessões
+tmux kill-server
+```
+
+> **Dica:** Se o treinamento travou e você quer forçar o encerramento, use `tmux kill-session -t david` de outro terminal. Isso mata o servidor e todos os clientes de uma vez.
 
 ---
 
