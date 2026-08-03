@@ -91,6 +91,9 @@ class FederatedLearningServer:
                 elif args.strategy == 'full_ft':
                     print("Linha 91 =========================================")
                     config["model"]["lora"]["mode"] = "without_lora"
+                # elif args.strategy == 'adalora':
+                #     print("Linha Adalora =========================================")
+                #     config["model"]["lora"]["mode"] = "with_adalora"
                     
                 if "paca" not in config["model"]:
                     config["model"]["paca"] = {}
@@ -150,6 +153,8 @@ class FederatedLearningServer:
         self.rs_client_paca = []
         self.rs_client_training_time = []
         self.rs_client_comm_time = []
+        self.rs_client_eval_time = []
+        self.rs_server_processing_time = []
         self.server_pruning_time = []
         self.aggregated_clients = []
         self.round_time = []
@@ -644,6 +649,8 @@ class FederatedLearningServer:
                 self.clients_info[client_id]['server_pruning_time'] = cnn_prune_time
                 logger.info(f"--- SERVER: PRUNING COMPLETE ({cnn_prune_time:.2f}s) ---")
 
+            # --- Medição granular: quantização do servidor ---
+            server_quant_start = time.time()
             comm_start = time.time()
             if round_num >= 2 and self.prune == 1 and self.args.model != 'clip':
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
@@ -652,6 +659,7 @@ class FederatedLearningServer:
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
+                server_quant_time = time.time() - server_quant_start
                 
                 send_data(conn, g_model_pruned)
                 send_data(conn, self.prune)
@@ -663,6 +671,7 @@ class FederatedLearningServer:
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
+                server_quant_time = time.time() - server_quant_start
                 
                 send_data(conn, current_global_state)
                 send_data(conn, self.prune)
@@ -683,7 +692,11 @@ class FederatedLearningServer:
                 self.clients_info[client_id]['training_time'] = time.time() - start_time
                 return
             
+            # --- Medição granular: dequantização do servidor ---
+            server_dequant_start = time.time()
             updated_state = dequantization(updated_state)
+            server_dequant_time = time.time() - server_dequant_start
+            
             data, rate = recv_data(conn)
             self.client_data[client_id] = data
             
@@ -694,11 +707,16 @@ class FederatedLearningServer:
             
             self.argalgo, rate = recv_data(conn)
             
-            # --- Problema #1: Recebe tempo de treino puro medido pelo cliente ---
+            # Recebe tempo de treino puro medido pelo cliente
             client_training_time, rate = recv_data(conn)
             
             client_test_acc, _ = recv_data(conn)
             client_test_loss, _ = recv_data(conn)
+            
+            # Recebe overhead de processamento do cliente (eval + quant + dequant)
+            client_processing_overhead, _ = recv_data(conn)
+            if not isinstance(client_processing_overhead, (int, float)):
+                client_processing_overhead = 0.0
             
             if client_test_acc is not None:
                 with self.lock:
@@ -723,8 +741,25 @@ class FederatedLearningServer:
             # Usa o tempo de treino reportado pelo cliente (mais preciso, exclui overhead de rede)
             training_time = client_training_time if isinstance(client_training_time, (int, float)) else handle_time
             
-            comm_time = (time.time() - comm_start) - training_time
+            # --- Cálculo CORRETO do comm_time ---
+            # Tempo total desde comm_start até agora, menos:
+            #   - treinamento do cliente (medido pelo cliente)
+            #   - processamento do cliente (eval + quant + dequant, medido pelo cliente)
+            #   - quantização do servidor (medido aqui)
+            #   - dequantização do servidor (medido aqui)
+            # O que sobra é o tempo real de rede (serialização + transferência)
+            total_comm_window = time.time() - comm_start
+            server_processing_time = server_quant_time + server_dequant_time
+            comm_time = total_comm_window - training_time - client_processing_overhead - server_processing_time
             self.clients_info[client_id]['comm_time'] = max(0.0, comm_time)
+            self.clients_info[client_id]['client_eval_time'] = client_processing_overhead
+            self.clients_info[client_id]['server_processing_time'] = server_processing_time
+            
+            logger.info(f"Round {round_num}: Client {client_id} tempos: "
+                        f"treino={training_time:.2f}s, "
+                        f"comm_rede={max(0.0, comm_time):.2f}s, "
+                        f"client_overhead={client_processing_overhead:.2f}s, "
+                        f"server_proc={server_processing_time:.2f}s")
             
             if updated_state is not None:
                 with self.lock:
@@ -732,7 +767,6 @@ class FederatedLearningServer:
                     client_weights.append(dataset_size)
                 
                 self.clients_info[client_id]['training_time'] = training_time
-                logger.info(f"Round {round_num}: Client {client_id} training completed in {training_time:.2f}s (comm_time={max(0.0, comm_time):.2f}s)")
             else:
                 logger.warning(f"Round {round_num}: No update received from client {client_id}")
                 self.clients_info[client_id]['training_time'] = training_time
@@ -800,6 +834,8 @@ class FederatedLearningServer:
             hf.create_dataset('rs_client_paca', data=self.rs_client_paca)
             hf.create_dataset('rs_client_training_time', data=self.rs_client_training_time)
             hf.create_dataset('rs_client_comm_time', data=self.rs_client_comm_time)
+            hf.create_dataset('rs_client_eval_time', data=self.rs_client_eval_time)
+            hf.create_dataset('rs_server_processing_time', data=self.rs_server_processing_time)
             hf.create_dataset('server_pruning_time', data=self.server_pruning_time)
             hf.create_dataset('received_from_clients_Mb', data=self.received_ammount)
             hf.create_dataset('total_transmitted_per_round_Mb', data=self.total_transmitted_per_round)
@@ -904,11 +940,11 @@ class FederatedLearningServer:
                             logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")
                             
                             sora_prune_start = time.time()
-                            # Threshold adaptativo: sobe de 1e-4 → ~1e-3 ao longo das rodadas
-                            # Threshold MAIOR = poda mais AGRESSIVA (mais gates considerados "zerados")
+                            # Threshold adaptativo: sobe progressivamente ao longo das rodadas
+                            # Limitado a 5x para não ser destrutivo
                             progress = (round_num + 1) / self.args.rounds  # 0.0 → 1.0
                             decay_factor = 1.0 + progress * 9.0  # 1x → 10x
-                            adaptive_threshold = 2e-3 * decay_factor
+                            adaptive_threshold = 1e-3 * decay_factor
                             logger.info(f"   Adaptive threshold: {adaptive_threshold:.6f} (progress={progress:.2f})")
                             
                             pruned_state, before, after, ranks_info = reduce_sora_state_dict_rank(
@@ -965,6 +1001,12 @@ class FederatedLearningServer:
                     
                     comm_time_list = [self.clients_info[cid].get('comm_time', 0.0) for cid in sorted(self.clients_info.keys())]
                     self.rs_client_comm_time.append(comm_time_list)
+                    
+                    eval_time_list = [self.clients_info[cid].get('client_eval_time', 0.0) for cid in sorted(self.clients_info.keys())]
+                    self.rs_client_eval_time.append(eval_time_list)
+                    
+                    server_proc_list = [self.clients_info[cid].get('server_processing_time', 0.0) for cid in sorted(self.clients_info.keys())]
+                    self.rs_server_processing_time.append(server_proc_list)
                     
                     self.server_pruning_time.append(round_pruning_time)
                     

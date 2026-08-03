@@ -17,6 +17,7 @@ from .sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
 
 DEFAULT_CONFIG_PATH = Path("train_config.yml")
 VALID_LORA_MODES = {"with_lora", "without_lora", "both", "with_sora_no_schedule", "with_sora_schedule"}
+# VALID_LORA_MODES = {"with_lora", "without_lora", "both", "with_sora_no_schedule", "with_sora_schedule", "with_adalora"}
 SORA_MODES = {"with_sora_no_schedule", "with_sora_schedule"}
 
 class CLIPForClassification(nn.Module):
@@ -407,6 +408,27 @@ def build_model(config, num_classes, device):
         )
         model.vision_model = get_peft_model(model.vision_model, peft_config)
 
+    # elif mode == "with_adalora":
+    #     total_layers = len(vision_model.encoder.layers)
+    #     layers_to_transform = list(range(total_layers - upper_k, total_layers)) if upper_k else None
+    #     
+    #     adalora_config = config["model"].get("adalora", {})
+    #     
+    #     peft_config = AdaLoraConfig(
+    #         init_r=lora_config["r"],
+    #         target_r=adalora_config.get("target_r", lora_config["r"]),
+    #         tinit=adalora_config.get("tinit", 200),
+    #         tfinal=adalora_config.get("tfinal", 1000),
+    #         deltaT=adalora_config.get("deltaT", 10),
+    #         beta1=adalora_config.get("beta1", 0.85),
+    #         beta2=adalora_config.get("beta2", 0.85),
+    #         total_step=adalora_config.get("total_step", 1500),
+    #         lora_alpha=lora_config["alpha"],
+    #         target_modules=lora_config["target_modules"],
+    #         lora_dropout=lora_config["dropout"],
+    #         layers_to_transform=layers_to_transform,
+    #     )
+    #     model.vision_model = get_peft_model(model.vision_model, peft_config)
     elif mode in SORA_MODES:
         apply_sora(model, lora_config, upper_k=upper_k)
 
@@ -601,6 +623,11 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     # Cache: evita chamada a next(model.parameters()) a cada batch
     model_dtype = next(model.parameters()).dtype
 
+    # # Identifica se é o AdaLoRA original do PEFT
+    # is_adalora = hasattr(model, "base_model") and hasattr(model.base_model, "update_and_allocate")
+    # if is_adalora and not hasattr(model, "adalora_global_step"):
+    #     model.adalora_global_step = 0
+
     for pixel_values, labels in tqdm(loader, desc="train", leave=False, disable=True):
         pixel_values = pixel_values.to(device, dtype=model_dtype)
         labels = labels.to(device)
@@ -622,6 +649,11 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
         # SparseAdamW.step(): AdamW completo + softshrink (trainer standalone)
         if sparse_optimizer is not None:
             sparse_optimizer.step()
+            
+        # # Poda dinâmica do AdaLoRA (PEFT)
+        # if is_adalora:
+        #     model.base_model.update_and_allocate(model.adalora_global_step)
+        #     model.adalora_global_step += 1
 
         total_ce_loss += ce_loss.item()
         total_loss += loss.item()

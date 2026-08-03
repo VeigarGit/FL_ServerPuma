@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """
 Plot Results - FL_ServerPuma (Comparativo)
-Gera gráficos PDF comparando múltiplos experimentos.
+Gera gráficos PDF comparando múltiplos experimentos de Aprendizado Federado.
 
 Uso:
-    uv run plot_results.py <EXP_1> <EXP_2> ... <EXP_N>
+    uv run plot_results.py
 
-Exemplo:
-    uv run plot_results.py \
-        david_clip_lora_prune1_ala1_20260714_134821 \
-        david_clip_sora_prune0_ala0_20260715_100000
+Gráficos gerados (14 no total):
+    01 - Acurácia global do modelo (servidor) vs rodadas
+    02 - Loss de treinamento vs rodadas
+    03 - Acurácia local vs treino (clientes) — detecção de overfitting
+    04 - Banda de rede acumulada vs rodadas
+    05 - Banda de rede por rodada individual (upload + download)
+    06 - Tamanho dos adaptadores (MB) vs rodadas
+    07 - Quantidade de parâmetros treináveis vs rodadas
+    08 - Evolução do PaCA adaptativo médio
+    09 - Tempo wall-clock por rodada
+    10 - Tempo de treinamento local nos clientes
+    11 - Tempo de comunicação dos clientes (média móvel)
+    12 - Decomposição temporal (barras empilhadas)
+    13 - Acurácia vs tempo: (a) tempo real, (b) tempo simulado @100Mbps
+    14 - Resumo comparativo (barras: acc, loss, tempo, banda)
 
 Os gráficos são salvos em: ../results/graficos_comparativos/
 """
@@ -24,6 +35,22 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# ==============================================================================
+# Configurações globais
+# ==============================================================================
+
+# Flag para ativar/desativar títulos explicativos nos gráficos.
+# True  = títulos aparecem (útil para apresentações e revisões)
+# False = títulos ocultos (útil para artigos/papers onde a legenda da figura é suficiente)
+SHOW_TITLES = True
+
+plt.rcParams.update({
+    'xtick.labelsize': 20,
+    'ytick.labelsize': 20,
+    'legend.fontsize': 20,
+    'axes.labelsize': 20,
+    'axes.titlesize': 20,
+})
 
 # ==============================================================================
 # Paleta de cores e estilos para comparação
@@ -41,6 +68,28 @@ STYLES = [
     {'color': '#bcbd22', 'marker': '*',  'ls': '-'},
     {'color': '#7f7f7f', 'marker': 'd',  'ls': '--'},
 ]
+
+
+# ==============================================================================
+# Funções auxiliares
+# ==============================================================================
+
+def _mark_every(n):
+    return max(1, n // 10)
+
+
+def _set_title(ax, title):
+    """Aplica título ao eixo apenas se SHOW_TITLES estiver ativado."""
+    if SHOW_TITLES:
+        ax.set_title(title, fontsize=18, fontweight='bold', pad=12)
+
+
+def _save_and_close(fig, output_dir, filename):
+    """Salva a figura como PDF e fecha."""
+    path = os.path.join(output_dir, filename)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  📊 {path}")
 
 
 # ==============================================================================
@@ -80,11 +129,13 @@ def parse_experiment(exp_name, results_base="../results"):
     algo      = match.group('algo')
 
     # Label legível para os gráficos
-    if "sora" in exp_name.lower():
+    if "adalora" in exp_name.lower():
+        label = "AdaLoRA"
+    elif "sora" in exp_name.lower():
         if "adaptpaca" in exp_name.lower():
             label = "PUMA-GT"
         else:
-            label = "SORA estático"
+            label = "SoRa Estático"
     elif "lora" in exp_name.lower():
         label = "LoRA"
     else:
@@ -121,6 +172,8 @@ def _load_server_h5(files):
     client_training_time = []
     client_comm_time = []
     server_pruning_time = []
+    client_eval_time = []
+    server_processing_time = []
     for f in files:
         with h5py.File(f, 'r') as hf:
             acc.append(np.array(hf['rs_test_acc']))
@@ -150,6 +203,16 @@ def _load_server_h5(files):
                 server_pruning_time.append(np.array(hf['server_pruning_time']))
             else:
                 server_pruning_time.append(None)
+            
+            if 'rs_client_eval_time' in hf:
+                client_eval_time.append(np.array(hf['rs_client_eval_time']))
+            else:
+                client_eval_time.append(None)
+            
+            if 'rs_server_processing_time' in hf:
+                server_processing_time.append(np.array(hf['rs_server_processing_time']))
+            else:
+                server_processing_time.append(None)
 
     paca_mean = None
     if all(p is not None for p in paca):
@@ -176,6 +239,20 @@ def _load_server_h5(files):
         valid_server_pruning_time = [t[:min_len] for t in valid_server_pruning_time]
         server_pruning_time_mean = np.mean(valid_server_pruning_time, axis=0)
 
+    valid_client_eval_time = [t for t in client_eval_time if t is not None]
+    client_eval_time_mean = None
+    if valid_client_eval_time:
+        min_len = min(len(t) for t in valid_client_eval_time)
+        valid_client_eval_time = [t[:min_len] for t in valid_client_eval_time]
+        client_eval_time_mean = np.mean(valid_client_eval_time, axis=0)
+
+    valid_server_processing_time = [t for t in server_processing_time if t is not None]
+    server_processing_time_mean = None
+    if valid_server_processing_time:
+        min_len = min(len(t) for t in valid_server_processing_time)
+        valid_server_processing_time = [t[:min_len] for t in valid_server_processing_time]
+        server_processing_time_mean = np.mean(valid_server_processing_time, axis=0)
+
     return {
         'acc_mean': np.mean(acc, axis=0), 'acc_std': np.std(acc, axis=0),
         'loss_mean': np.mean(loss, axis=0), 'loss_std': np.std(loss, axis=0),
@@ -188,6 +265,8 @@ def _load_server_h5(files):
         'client_training_time_mean': client_training_time_mean,
         'client_comm_time_mean': client_comm_time_mean,
         'server_pruning_time_mean': server_pruning_time_mean,
+        'client_eval_time_mean': client_eval_time_mean,
+        'server_processing_time_mean': server_processing_time_mean,
         'num_runs': len(files),
     }
 
@@ -213,15 +292,47 @@ def _load_client_h5(files):
 
 
 # ==============================================================================
-# Funções de plotagem comparativa
+# Funções auxiliares de cálculo (usadas em múltiplos gráficos)
 # ==============================================================================
 
-def _mark_every(n):
-    return max(1, n // 10)
+def _compute_mb_per_round(d):
+    """Calcula MB trafegados por rodada individual (ida + volta) a partir do acumulado."""
+    num_rounds = len(d['time_mean'])
+    total_envios = len(d['mb_mean'])
+    if num_rounds == 0 or total_envios == 0:
+        return None
+    clients_per_round = max(1, total_envios // num_rounds)
+    indices = [min(total_envios - 1, r * clients_per_round) for r in range(1, num_rounds + 1)]
+    mb_accumulated = [d['mb_mean'][idx] for idx in indices]
+    mb_discrete = []
+    for r in range(len(mb_accumulated)):
+        if r == 0:
+            mb_round = mb_accumulated[r]
+        else:
+            mb_round = max(0, mb_accumulated[r] - mb_accumulated[r-1])
+        # Multiplicamos por 2: o .h5 salva apenas envio servidor→cliente,
+        # mas o cliente devolve os mesmos tensores (upload ≈ download).
+        mb_discrete.append(mb_round * 2.0)
+    return mb_discrete, mb_accumulated, indices
 
 
-def plot_comparative_accuracy(experiments, output_dir):
-    """Acurácia Global do Servidor - comparativo."""
+def _get_train_time_per_round(d):
+    """Extrai o tempo médio de treinamento por rodada."""
+    t_train = d.get('client_training_time_mean')
+    if t_train is not None:
+        if t_train.ndim > 1:
+            return np.mean(t_train, axis=1)
+        return t_train
+    # Fallback: estima como 50% do tempo total da rodada
+    return d['time_mean'] * 0.5
+
+
+# ==============================================================================
+# 01 - Acurácia Global do Modelo (Servidor)
+# ==============================================================================
+
+def plot_01_acuracia_global(experiments, output_dir):
+    """Evolução da acurácia global do modelo avaliada pelo servidor ao longo das rodadas."""
     fig, ax = plt.subplots(figsize=(12, 7))
     for i, exp in enumerate(experiments):
         s = STYLES[i % len(STYLES)]
@@ -233,17 +344,19 @@ def plot_comparative_accuracy(experiments, output_dir):
         ax.fill_between(x, d['acc_mean'] - d['acc_std'], d['acc_mean'] + d['acc_std'],
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Evolução da Acurácia Global do Modelo (Servidor)")
+    _set_title(ax, "Evolução da Acurácia Global do Modelo (Servidor)")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    path = os.path.join(output_dir, "01_acuracia_global.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
+    _save_and_close(fig, output_dir, "01_acuracia_global.pdf")
 
 
-def plot_comparative_loss(experiments, output_dir):
-    """Loss de Treinamento - comparativo."""
+# ==============================================================================
+# 02 - Loss de Treinamento
+# ==============================================================================
+
+def plot_02_train_loss(experiments, output_dir):
+    """Evolução da função de custo (loss) de treinamento ao longo das rodadas."""
     fig, ax = plt.subplots(figsize=(12, 7))
     for i, exp in enumerate(experiments):
         s = STYLES[i % len(STYLES)]
@@ -255,209 +368,109 @@ def plot_comparative_loss(experiments, output_dir):
         ax.fill_between(x, d['loss_mean'] - d['loss_std'], d['loss_mean'] + d['loss_std'],
                          color=s['color'], alpha=0.1)
 
-    ax.set_title("Evolução da Função de Custo (Loss) no Treinamento")
+    _set_title(ax, "Evolução da Função de Custo (Loss) no Treinamento")
     ax.set_xlabel("Rodadas"); ax.set_ylabel("Loss")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    path = os.path.join(output_dir, "02_train_loss.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
+    _save_and_close(fig, output_dir, "02_train_loss.pdf")
 
 
-def plot_comparative_comm_cost(experiments, output_dir):
-    """Custo de Comunicação Acumulado - comparativo."""
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for i, exp in enumerate(experiments):
-        s = STYLES[i % len(STYLES)]
-        d = exp['server']
-        x = range(len(d['mb_mean']))
-        ax.plot(x, d['mb_bruto_mean'], color=s['color'], linestyle=':', alpha=0.4)
-        ax.plot(x, d['mb_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d['mb_mean'])), linestyle=s['ls'],
-                label=f"{exp['label']} (trafegado)")
-        ax.fill_between(x, d['mb_mean'] - d['mb_std'], d['mb_mean'] + d['mb_std'],
-                         color=s['color'], alpha=0.1)
+# ==============================================================================
+# 03 - Acurácia Local vs Treino (Clientes) — Detecção de Overfitting
+# ==============================================================================
 
-    ax.set_title("Custo de Comunicação de Rede Acumulado (MB)")
-    ax.set_xlabel("Envios (Clientes × Rodadas)"); ax.set_ylabel("MB Acumulados")
-    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "03_custo_comunicacao.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_round_time(experiments, output_dir):
-    """Tempo por Rodada - comparativo."""
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for i, exp in enumerate(experiments):
-        s = STYLES[i % len(STYLES)]
-        d = exp['server']
-        x = range(1, len(d['time_mean']) + 1)
-        ax.plot(x, d['time_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d['time_mean'])), linestyle=s['ls'],
-                label=f"{exp['label']} (μ={np.mean(d['time_mean']):.1f}s)")
-        ax.fill_between(x, d['time_mean'] - d['time_std'], d['time_mean'] + d['time_std'],
-                         color=s['color'], alpha=0.1)
-
-    ax.set_title("Tempo de Execução por Rodada de Comunicação")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
-    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "04_tempo_por_rodada.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_client_training_time(experiments, output_dir):
-    """Tempo de Treinamento dos Clientes por Rodada - comparativo."""
-    has_data = any(e['server'].get('client_training_time_mean') is not None for e in experiments)
+def plot_03_local_vs_treino(experiments, output_dir):
+    """Compara acurácia de teste local e de treino nos clientes para detectar overfitting."""
+    has_data = any(e['client'] is not None for e in experiments)
     if not has_data:
-        print("  ⚠️ Sem dados de tempo de treinamento dos clientes, pulando.")
         return
 
     fig, ax = plt.subplots(figsize=(12, 7))
-    has_valid_data = False
     for i, exp in enumerate(experiments):
-        d = exp['server']
-        t_mean = d.get('client_training_time_mean')
-        if t_mean is None:
+        if exp['client'] is None:
             continue
-        has_valid_data = True
         s = STYLES[i % len(STYLES)]
-        
-        if t_mean.ndim > 1:
-            time_per_round = np.mean(t_mean, axis=1)
-            time_std_per_round = np.std(t_mean, axis=1)
-        else:
-            time_per_round = t_mean
-            time_std_per_round = np.zeros_like(t_mean)
-        
-        x = range(1, len(time_per_round) + 1)
-        ax.plot(x, time_per_round, color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(time_per_round)), linestyle=s['ls'],
-                label=f"{exp['label']} (μ={np.mean(time_per_round):.1f}s)")
-        
-        if np.any(time_std_per_round > 0):
-            ax.fill_between(x, time_per_round - time_std_per_round, time_per_round + time_std_per_round,
-                             color=s['color'], alpha=0.1)
+        d = exp['client']
+        x = range(1, len(d['local_acc_mean']) + 1)
+        ax.plot(x, d['local_acc_mean'], color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(d['local_acc_mean'])), linestyle=s['ls'],
+                label=f"{exp['label']} (teste local)")
+        ax.plot(x, d['train_acc_mean'], color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(d['train_acc_mean'])), linestyle=':',
+                alpha=0.6, label=f"{exp['label']} (treino)")
+
+    _set_title(ax, "Análise de Overfitting: Acurácia de Treino vs. Teste Local")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
+    ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    _save_and_close(fig, output_dir, "03_acuracia_local_vs_treino.pdf")
+
+
+# ==============================================================================
+# 04 - Banda de Rede Acumulada por Rodada
+# ==============================================================================
+
+def plot_04_banda_acumulada(experiments, output_dir):
+    """Mostra o total de dados (MB) trafegados na rede de forma acumulada ao longo das rodadas."""
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for i, exp in enumerate(experiments):
+        s = STYLES[i % len(STYLES)]
+        d = exp['server']
+        result = _compute_mb_per_round(d)
+        if result is None:
+            continue
+        _, mb_accumulated, _ = result
+        x = range(1, len(mb_accumulated) + 1)
+        ax.plot(x, mb_accumulated, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(mb_accumulated)), linestyle=s['ls'],
+                label=exp['label'])
+
+    _set_title(ax, "Banda de Rede Acumulada por Rodada")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Acumulados")
+    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    _save_and_close(fig, output_dir, "04_banda_acumulada.pdf")
+
+
+# ==============================================================================
+# 05 - Banda de Rede por Rodada Individual (Upload + Download)
+# ==============================================================================
+
+def plot_05_banda_por_rodada(experiments, output_dir):
+    """Mostra quanto de dados (MB) foi trafegado (ida + volta) em cada rodada individual."""
+    fig, ax = plt.subplots(figsize=(12, 7))
+    has_valid_data = False
+
+    for i, exp in enumerate(experiments):
+        s = STYLES[i % len(STYLES)]
+        d = exp['server']
+        result = _compute_mb_per_round(d)
+        if result is None:
+            continue
+        mb_discrete, _, _ = result
+        x = range(1, len(mb_discrete) + 1)
+        ax.plot(x, mb_discrete, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(mb_discrete)), linestyle=s['ls'],
+                label=exp['label'])
+        has_valid_data = True
 
     if not has_valid_data:
         plt.close(fig)
         return
 
-    ax.set_title("Tempo Médio de Treinamento Local nos Clientes")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
+    _set_title(ax, "Consumo de Banda por Rodada (Upload + Download)")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Trafegados na Rodada")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    path = os.path.join(output_dir, "12_tempo_treinamento_clientes.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
+    _save_and_close(fig, output_dir, "05_banda_por_rodada.pdf")
 
 
-def plot_comparative_client_comm_time(experiments, output_dir):
-    """Tempo de Comunicação dos Clientes por Rodada - comparativo."""
-    import pandas as pd
-    
-    has_data = any(e['server'].get('client_comm_time_mean') is not None for e in experiments)
-    if not has_data:
-        print("  ⚠️ Sem dados de tempo de comunicação dos clientes, pulando.")
-        return
+# ==============================================================================
+# 06 - Tamanho dos Adaptadores (MB)
+# ==============================================================================
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-    has_valid_data = False
-    for i, exp in enumerate(experiments):
-        d = exp['server']
-        t_mean = d.get('client_comm_time_mean')
-        if t_mean is None:
-            continue
-        has_valid_data = True
-        s = STYLES[i % len(STYLES)]
-        
-        if t_mean.ndim > 1:
-            time_per_round = np.mean(t_mean, axis=1)
-            time_std_per_round = np.std(t_mean, axis=1)
-        else:
-            time_per_round = t_mean
-            time_std_per_round = np.zeros_like(t_mean)
-            
-        # --- FIX: Compensação do Overhead de Inferência do AdaLoRA ---
-        if "AdaLoRA" in exp['label']:
-            time_per_round = np.maximum(time_per_round - 2.8, 0)
-            
-        # Aplica média móvel para estabilizar o gráfico
-        time_per_round = pd.Series(time_per_round).rolling(window=10, min_periods=1).mean().values
-        
-        x = range(1, len(time_per_round) + 1)
-        ax.plot(x, time_per_round, color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(time_per_round)), linestyle=s['ls'],
-                label=f"{exp['label']} (μ={np.mean(time_per_round):.1f}s)")
-        
-        if np.any(time_std_per_round > 0):
-            ax.fill_between(x, time_per_round - time_std_per_round, time_per_round + time_std_per_round,
-                             color=s['color'], alpha=0.1)
-
-    if not has_valid_data:
-        plt.close(fig)
-        return
-
-    ax.set_title("Tempo Médio de Comunicação dos Clientes (Média Móvel=10)")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
-    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "13_tempo_comunicacao_clientes.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_server_pruning_time(experiments, output_dir):
-    """Tempo de Pruning do Servidor por Rodada - comparativo."""
-    has_data = any(e['server'].get('server_pruning_time_mean') is not None for e in experiments)
-    if not has_data:
-        print("  ⚠️ Sem dados de tempo de pruning do servidor, pulando.")
-        return
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-    has_valid_data = False
-    for i, exp in enumerate(experiments):
-        d = exp['server']
-        t_mean = d.get('server_pruning_time_mean')
-        if t_mean is None:
-            continue
-        has_valid_data = True
-        s = STYLES[i % len(STYLES)]
-        
-        if t_mean.ndim > 1:
-            time_per_round = np.mean(t_mean, axis=1)
-            time_std_per_round = np.std(t_mean, axis=1)
-        else:
-            time_per_round = t_mean
-            time_std_per_round = np.zeros_like(t_mean)
-        
-        x = range(1, len(time_per_round) + 1)
-        ax.plot(x, time_per_round, color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(time_per_round)), linestyle=s['ls'],
-                label=f"{exp['label']} (μ={np.mean(time_per_round):.1f}s)")
-        
-        if np.any(time_std_per_round > 0):
-            ax.fill_between(x, time_per_round - time_std_per_round, time_per_round + time_std_per_round,
-                             color=s['color'], alpha=0.1)
-
-    if not has_valid_data:
-        plt.close(fig)
-        return
-
-    ax.set_title("Tempo Médio de Execução da Poda (Pruning) no Servidor")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
-    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "14_tempo_pruning_servidor.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_model_size(experiments, output_dir):
-    """Tamanho do Modelo por Rodada - comparativo."""
+def plot_06_tamanho_modelo(experiments, output_dir):
+    """Evolução do tamanho dos adaptadores treináveis (em MB) ao longo das rodadas."""
     has_data = any(not np.all(e['server']['size_mb_mean'] == 0) for e in experiments)
     if not has_data:
         print("  ⚠️ Sem dados de tamanho de modelo, pulando.")
@@ -476,144 +489,19 @@ def plot_comparative_model_size(experiments, output_dir):
         ax.fill_between(x, d['size_mb_mean'] - d['size_mb_std'],
                          d['size_mb_mean'] + d['size_mb_std'], color=s['color'], alpha=0.1)
 
-    ax.set_title("Evolução do Tamanho dos Adaptadores (MB)")
+    _set_title(ax, "Evolução do Tamanho dos Adaptadores Treináveis (MB)")
     ax.set_xlabel("Rodada"); ax.set_ylabel("MB")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    path = os.path.join(output_dir, "05_tamanho_modelo.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
+    _save_and_close(fig, output_dir, "06_tamanho_modelo.pdf")
 
 
-def plot_comparative_paca_evolution(experiments, output_dir):
-    """Evolução do PaCA no Adaptativo - comparativo."""
-    has_data = any(e['server'].get('paca_mean') is not None for e in experiments)
-    if not has_data:
-        print("  ⚠️ Sem dados de evolução do PaCA, pulando.")
-        return
+# ==============================================================================
+# 07 - Quantidade de Parâmetros Treináveis
+# ==============================================================================
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for i, exp in enumerate(experiments):
-        d = exp['server']
-        if d.get('paca_mean') is None:
-            continue
-        s = STYLES[i % len(STYLES)]
-        
-        # d['paca_mean'] tem shape (Rodadas, Clientes)
-        # Vamos calcular a média de PaCA por rodada (média entre todos os clientes selecionados)
-        paca_per_round = np.mean(d['paca_mean'], axis=1)
-        paca_std_per_round = np.std(d['paca_mean'], axis=1)
-        
-        x = range(1, len(paca_per_round) + 1)
-        ax.plot(x, paca_per_round, color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(paca_per_round)), linestyle=s['ls'],
-                label=exp['label'])
-        ax.fill_between(x, paca_per_round - paca_std_per_round, paca_per_round + paca_std_per_round,
-                         color=s['color'], alpha=0.1)
-
-    ax.set_title("Dinâmica do PaCA Adaptativo Médio nos Clientes")
-    ax.set_xlabel("Rodada"); ax.set_ylabel("Valor do PaCA")
-    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "06_paca_evolucao.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_comm_cost_per_round(experiments, output_dir):
-    """Custo de Comunicação Acumulado por Rodada - comparativo."""
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for i, exp in enumerate(experiments):
-        s = STYLES[i % len(STYLES)]
-        d = exp['server']
-        
-        # d['mb_mean'] tem um registro por cliente (acumulado globalmente)
-        # d['time_mean'] tem um registro por rodada
-        # Para extrair o valor acumulado no final de cada rodada:
-        num_rounds = len(d['time_mean'])
-        total_envios = len(d['mb_mean'])
-        
-        if num_rounds == 0 or total_envios == 0:
-            continue
-            
-        # Estimamos clientes por rodada:
-        clients_per_round = max(1, total_envios // num_rounds)
-        
-        # Coleta o acumulado no final de cada rodada
-        indices = [min(total_envios - 1, (r * clients_per_round) - 1) for r in range(1, num_rounds + 1)]
-        mb_per_round = [d['mb_mean'][idx] for idx in indices]
-        
-        x = range(1, num_rounds + 1)
-        ax.plot(x, mb_per_round, color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(mb_per_round)), linestyle=s['ls'],
-                label=exp['label'])
-
-    ax.set_title("Banda de Rede Acumulada por Rodada")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Acumulados")
-    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "07_banda_acumulada_rodada.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_discrete_comm_cost_per_round(experiments, output_dir):
-    """Custo de Comunicação por Rodada (Não Acumulado) - comparativo."""
-    fig, ax = plt.subplots(figsize=(12, 7))
-    has_valid_data = False
-    
-    for i, exp in enumerate(experiments):
-        s = STYLES[i % len(STYLES)]
-        d = exp['server']
-        
-        num_rounds = len(d['time_mean'])
-        total_envios = len(d['mb_mean'])
-        
-        if num_rounds == 0 or total_envios == 0:
-            continue
-            
-        clients_per_round = max(1, total_envios // num_rounds)
-        
-        # Coleta o acumulado no final de cada rodada
-        # Como o array inicia com 0 (len = 501 para 50 rounds e 10 clientes), 
-        # o fim do round 1 está no índice 10.
-        indices = [min(total_envios - 1, r * clients_per_round) for r in range(1, num_rounds + 1)]
-        mb_accumulated = [d['mb_mean'][idx] for idx in indices]
-        
-        # Calcula a diferença para obter o custo de cada rodada individual (ida e volta = x 2)
-        mb_discrete = []
-        for r in range(len(mb_accumulated)):
-            if r == 0:
-                mb_round = mb_accumulated[r]
-            else:
-                mb_round = max(0, mb_accumulated[r] - mb_accumulated[r-1])
-            
-            # Multiplicamos por 2 porque o .h5 só salva o envio do servidor para o cliente.
-            # Como o cliente devolve exatamente os mesmos tensores de volta, o upload é igual ao download.
-            mb_discrete.append(mb_round * 2.0)
-                
-        x = range(1, num_rounds + 1)
-        ax.plot(x, mb_discrete, color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(mb_discrete)), linestyle=s['ls'],
-                label=exp['label'])
-        has_valid_data = True
-
-    if not has_valid_data:
-        plt.close(fig)
-        return
-
-    ax.set_title("Consumo de Banda por Rodada (Upload + Download)")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Trafegados na Rodada")
-    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "09_banda_por_rodada.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-
-def plot_comparative_params(experiments, output_dir):
-    """Parâmetros Treináveis - comparativo."""
+def plot_07_parametros_treinaveis(experiments, output_dir):
+    """Evolução da quantidade de parâmetros treináveis do modelo ao longo das rodadas."""
     has_data = any(not np.all(e['server']['params_mean'] == 0) for e in experiments)
     if not has_data:
         print("  ⚠️ Sem dados de parâmetros treináveis, pulando.")
@@ -630,104 +518,352 @@ def plot_comparative_params(experiments, output_dir):
                 markevery=_mark_every(len(d['params_mean'])), linestyle=s['ls'],
                 label=exp['label'])
 
-    ax.set_title("Quantidade de Parâmetros Treináveis por Rodada")
+    _set_title(ax, "Quantidade de Parâmetros Treináveis por Rodada")
     ax.set_xlabel("Rodada"); ax.set_ylabel("Quantidade")
     ax.ticklabel_format(style='plain', axis='y')
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    path = os.path.join(output_dir, "06_parametros_treinaveis.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
+    _save_and_close(fig, output_dir, "07_parametros_treinaveis.pdf")
 
 
-def plot_comparative_client_global_acc(experiments, output_dir):
-    """Acurácia Global (Clientes) - comparativo."""
-    has_data = any(e['client'] is not None for e in experiments)
+# ==============================================================================
+# 08 - Evolução do PaCA Adaptativo
+# ==============================================================================
+
+def plot_08_paca_evolucao(experiments, output_dir):
+    """Mostra como o valor médio do PaCA (adaptadores por camada) evolui nos clientes."""
+    has_data = any(e['server'].get('paca_mean') is not None for e in experiments)
     if not has_data:
-        print("  ⚠️ Sem dados de clientes, pulando.")
+        print("  ⚠️ Sem dados de evolução do PaCA, pulando.")
         return
 
     fig, ax = plt.subplots(figsize=(12, 7))
     for i, exp in enumerate(experiments):
-        if exp['client'] is None:
+        d = exp['server']
+        if d.get('paca_mean') is None:
             continue
         s = STYLES[i % len(STYLES)]
-        d = exp['client']
-        x = range(1, len(d['global_acc_mean']) + 1)
-        ax.plot(x, d['global_acc_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d['global_acc_mean'])), linestyle=s['ls'],
+        # d['paca_mean'] tem shape (Rodadas, Clientes)
+        paca_per_round = np.mean(d['paca_mean'], axis=1)
+        paca_std_per_round = np.std(d['paca_mean'], axis=1)
+        x = range(1, len(paca_per_round) + 1)
+        ax.plot(x, paca_per_round, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(paca_per_round)), linestyle=s['ls'],
                 label=exp['label'])
-        ax.fill_between(x, d['global_acc_mean'] - d['global_acc_std'],
-                         d['global_acc_mean'] + d['global_acc_std'], color=s['color'], alpha=0.1)
+        ax.fill_between(x, paca_per_round - paca_std_per_round, paca_per_round + paca_std_per_round,
+                         color=s['color'], alpha=0.1)
 
-    ax.set_title("Acurácia Global Avaliada nos Clientes")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
+    _set_title(ax, "Dinâmica do PaCA Adaptativo Médio nos Clientes")
+    ax.set_xlabel("Rodada"); ax.set_ylabel("Valor do PaCA")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    path = os.path.join(output_dir, "07_acuracia_global_clientes.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
+    _save_and_close(fig, output_dir, "08_paca_evolucao.pdf")
 
 
-def plot_comparative_client_local_vs_train(experiments, output_dir):
-    """Acurácia Local vs Treino (Clientes) - comparativo."""
-    has_data = any(e['client'] is not None for e in experiments)
-    if not has_data:
-        return
+# ==============================================================================
+# 09 - Tempo Wall-Clock por Rodada
+# ==============================================================================
 
+def plot_09_tempo_por_rodada(experiments, output_dir):
+    """Tempo real de execução (wall-clock) de cada rodada de comunicação federada."""
     fig, ax = plt.subplots(figsize=(12, 7))
     for i, exp in enumerate(experiments):
-        if exp['client'] is None:
-            continue
         s = STYLES[i % len(STYLES)]
-        d = exp['client']
-        x = range(1, len(d['local_acc_mean']) + 1)
-        ax.plot(x, d['local_acc_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d['local_acc_mean'])), linestyle=s['ls'],
-                label=f"{exp['label']} (local)")
-        ax.plot(x, d['train_acc_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d['train_acc_mean'])), linestyle=':',
-                alpha=0.6, label=f"{exp['label']} (treino)")
+        d = exp['server']
+        x = range(1, len(d['time_mean']) + 1)
+        ax.plot(x, d['time_mean'], color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(d['time_mean'])), linestyle=s['ls'],
+                label=f"{exp['label']} (μ={np.mean(d['time_mean']):.1f}s)")
+        ax.fill_between(x, d['time_mean'] - d['time_std'], d['time_mean'] + d['time_std'],
+                         color=s['color'], alpha=0.1)
 
-    ax.set_title("Análise de Overfitting: Treino vs. Teste Local nos Clientes")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
-    ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "08_local_vs_treino_clientes.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_client_loss(experiments, output_dir):
-    """Loss Global (Clientes) - comparativo."""
-    has_data = any(e['client'] is not None for e in experiments)
-    if not has_data:
-        return
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for i, exp in enumerate(experiments):
-        if exp['client'] is None:
-            continue
-        s = STYLES[i % len(STYLES)]
-        d = exp['client']
-        x = range(1, len(d['global_loss_mean']) + 1)
-        ax.plot(x, d['global_loss_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d['global_loss_mean'])), linestyle=s['ls'],
-                label=exp['label'])
-        ax.fill_between(x, d['global_loss_mean'] - d['global_loss_std'],
-                         d['global_loss_mean'] + d['global_loss_std'], color=s['color'], alpha=0.1)
-
-    ax.set_title("Função de Custo Global Avaliada nos Clientes")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Loss")
+    _set_title(ax, "Tempo de Execução por Rodada de Comunicação")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    path = os.path.join(output_dir, "09_loss_global_clientes.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
+    _save_and_close(fig, output_dir, "09_tempo_por_rodada.pdf")
 
 
-def plot_comparative_summary_bar(experiments, output_dir):
-    """Gráfico de barras comparativo: métricas finais de cada experimento."""
+# ==============================================================================
+# 10 - Tempo de Treinamento Local nos Clientes
+# ==============================================================================
+
+def plot_10_tempo_treinamento_clientes(experiments, output_dir):
+    """Tempo médio gasto pelos clientes no treinamento local por rodada."""
+    has_data = any(e['server'].get('client_training_time_mean') is not None for e in experiments)
+    if not has_data:
+        print("  ⚠️ Sem dados de tempo de treinamento dos clientes, pulando.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    has_valid_data = False
+    for i, exp in enumerate(experiments):
+        d = exp['server']
+        t_mean = d.get('client_training_time_mean')
+        if t_mean is None:
+            continue
+        has_valid_data = True
+        s = STYLES[i % len(STYLES)]
+
+        if t_mean.ndim > 1:
+            time_per_round = np.mean(t_mean, axis=1)
+            time_std_per_round = np.std(t_mean, axis=1)
+        else:
+            time_per_round = t_mean
+            time_std_per_round = np.zeros_like(t_mean)
+
+        x = range(1, len(time_per_round) + 1)
+        ax.plot(x, time_per_round, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(time_per_round)), linestyle=s['ls'],
+                label=f"{exp['label']} (μ={np.mean(time_per_round):.1f}s)")
+
+        if np.any(time_std_per_round > 0):
+            ax.fill_between(x, time_per_round - time_std_per_round, time_per_round + time_std_per_round,
+                             color=s['color'], alpha=0.1)
+
+    if not has_valid_data:
+        plt.close(fig)
+        return
+
+    _set_title(ax, "Tempo Médio de Treinamento Local nos Clientes")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
+    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    _save_and_close(fig, output_dir, "10_tempo_treinamento_clientes.pdf")
+
+
+# ==============================================================================
+# 11 - Tempo de Comunicação dos Clientes (Média Móvel)
+# ==============================================================================
+
+def plot_11_tempo_comunicacao_clientes(experiments, output_dir):
+    """Tempo médio de comunicação de rede dos clientes, suavizado com média móvel de 10 rodadas."""
+    import pandas as pd
+
+    has_data = any(e['server'].get('client_comm_time_mean') is not None for e in experiments)
+    if not has_data:
+        print("  ⚠️ Sem dados de tempo de comunicação dos clientes, pulando.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    has_valid_data = False
+    for i, exp in enumerate(experiments):
+        d = exp['server']
+        t_mean = d.get('client_comm_time_mean')
+        if t_mean is None:
+            continue
+        has_valid_data = True
+        s = STYLES[i % len(STYLES)]
+
+        if t_mean.ndim > 1:
+            time_per_round = np.mean(t_mean, axis=1)
+            time_std_per_round = np.std(t_mean, axis=1)
+        else:
+            time_per_round = t_mean
+            time_std_per_round = np.zeros_like(t_mean)
+
+        # Aplica média móvel para estabilizar o gráfico
+        time_per_round = pd.Series(time_per_round).rolling(window=10, min_periods=1).mean().values
+
+        x = range(1, len(time_per_round) + 1)
+        ax.plot(x, time_per_round, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(time_per_round)), linestyle=s['ls'],
+                label=f"{exp['label']} (μ={np.mean(time_per_round):.1f}s)")
+
+        if np.any(time_std_per_round > 0):
+            ax.fill_between(x, time_per_round - time_std_per_round, time_per_round + time_std_per_round,
+                             color=s['color'], alpha=0.1)
+
+    if not has_valid_data:
+        plt.close(fig)
+        return
+
+    _set_title(ax, "Tempo Médio de Comunicação dos Clientes (Média Móvel=10)")
+    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
+    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    _save_and_close(fig, output_dir, "11_tempo_comunicacao_clientes.pdf")
+
+
+# ==============================================================================
+# 12 - Decomposição Temporal (Barras Empilhadas)
+# ==============================================================================
+
+def plot_12_decomposicao_temporal(experiments, output_dir):
+    """Mostra onde cada estratégia gasta tempo: treino, rede, eval, servidor, overhead."""
+    labels = [e['label'] for e in experiments]
+
+    training_times = []
+    comm_times = []
+    eval_times = []
+    server_proc_times = []
+    other_times = []
+
+    for exp in experiments:
+        d = exp['server']
+        avg_round = np.mean(d['time_mean'])
+
+        # Treinamento
+        t_train = d.get('client_training_time_mean')
+        if t_train is not None:
+            if t_train.ndim > 1:
+                avg_train = np.mean(np.mean(t_train, axis=1))
+            else:
+                avg_train = np.mean(t_train)
+        else:
+            avg_train = 0.0
+
+        # Comunicação de rede
+        t_comm = d.get('client_comm_time_mean')
+        if t_comm is not None:
+            if t_comm.ndim > 1:
+                avg_comm = np.mean(np.mean(t_comm, axis=1))
+            else:
+                avg_comm = np.mean(t_comm)
+        else:
+            avg_comm = 0.0
+
+        # Processamento do cliente (eval + quant + dequant)
+        t_eval = d.get('client_eval_time_mean')
+        if t_eval is not None:
+            if t_eval.ndim > 1:
+                avg_eval = np.mean(np.mean(t_eval, axis=1))
+            else:
+                avg_eval = np.mean(t_eval)
+        else:
+            avg_eval = 0.0
+
+        # Processamento do servidor (quant + dequant)
+        t_sproc = d.get('server_processing_time_mean')
+        if t_sproc is not None:
+            if t_sproc.ndim > 1:
+                avg_sproc = np.mean(np.mean(t_sproc, axis=1))
+            else:
+                avg_sproc = np.mean(t_sproc)
+        else:
+            avg_sproc = 0.0
+
+        # Overhead residual (agregação, sleep, etc.)
+        avg_other = max(0.0, avg_round - avg_train - avg_comm - avg_eval - avg_sproc)
+
+        training_times.append(avg_train)
+        comm_times.append(avg_comm)
+        eval_times.append(avg_eval)
+        server_proc_times.append(avg_sproc)
+        other_times.append(avg_other)
+
+    x = np.arange(len(labels))
+    width = 0.5
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    ax.bar(x, training_times, width, label='Treinamento Local', color='#2196F3')
+    ax.bar(x, comm_times, width, bottom=training_times, label='Comunicação de Rede', color='#FF9800')
+
+    bottom2 = [t + c for t, c in zip(training_times, comm_times)]
+    ax.bar(x, eval_times, width, bottom=bottom2, label='Processamento Cliente (eval+quant)', color='#4CAF50')
+
+    bottom3 = [b + e for b, e in zip(bottom2, eval_times)]
+    ax.bar(x, server_proc_times, width, bottom=bottom3, label='Processamento Servidor (quant/dequant)', color='#9C27B0')
+
+    bottom4 = [b + s for b, s in zip(bottom3, server_proc_times)]
+    ax.bar(x, other_times, width, bottom=bottom4, label='Overhead (agg+misc)', color='#607D8B')
+
+    ax.set_xlabel('Estratégia')
+    ax.set_ylabel('Tempo Médio por Rodada (s)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha='right')
+    ax.legend(fontsize=12, loc='upper right')
+    ax.grid(True, axis='y', ls='--', alpha=0.4)
+
+    # Adiciona valores totais no topo de cada barra
+    for i in range(len(labels)):
+        total = training_times[i] + comm_times[i] + eval_times[i] + server_proc_times[i] + other_times[i]
+        ax.text(x[i], total + 0.2, f'{total:.1f}s', ha='center', fontsize=11, fontweight='bold')
+
+    _set_title(ax, "Decomposição do Tempo Médio por Rodada")
+    fig.tight_layout()
+    _save_and_close(fig, output_dir, "12_decomposicao_temporal.pdf")
+
+
+# ==============================================================================
+# 13 - Acurácia vs Tempo (2 Subplots: tempo real + tempo simulado)
+# ==============================================================================
+
+def plot_13_acuracia_vs_tempo(experiments, output_dir):
+    """Mostra a eficiência temporal de cada estratégia com dois painéis:
+    (a) Acurácia vs tempo real (wall-clock acumulado)
+    (b) Acurácia vs tempo estimado (treino real + rede simulada a 100 Mbps)
+    """
+    BANDWIDTH_MBPS = 100
+    BANDWIDTH_MBs = BANDWIDTH_MBPS / 8  # MB/s
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(22, 8))
+
+    # --- Subplot (a): Tempo real ---
+    for i, exp in enumerate(experiments):
+        s = STYLES[i % len(STYLES)]
+        d = exp['server']
+        accumulated_time = np.cumsum(d['time_mean'])
+        ax1.plot(accumulated_time, d['acc_mean'], color=s['color'], marker=s['marker'],
+                 markevery=_mark_every(len(d['acc_mean'])), linestyle=s['ls'],
+                 label=exp['label'])
+        ax1.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'],
+                          d['acc_mean'] + d['acc_std'], color=s['color'], alpha=0.1)
+
+    _set_title(ax1, "(a) Acurácia vs Tempo Real Acumulado")
+    ax1.set_xlabel("Tempo Acumulado (s)")
+    ax1.set_ylabel("Acurácia (%)")
+    ax1.legend()
+    ax1.grid(True, ls='--', alpha=0.4)
+
+    # --- Subplot (b): Tempo estimado (treino real + rede simulada) ---
+    for i, exp in enumerate(experiments):
+        s = STYLES[i % len(STYLES)]
+        d = exp['server']
+
+        num_rounds = len(d['time_mean'])
+        result = _compute_mb_per_round(d)
+        if result is None:
+            continue
+        mb_discrete, _, _ = result
+
+        train_per_round = _get_train_time_per_round(d)
+
+        estimated_round_time = []
+        for r in range(num_rounds):
+            t_net = mb_discrete[r] / BANDWIDTH_MBs if r < len(mb_discrete) else 0
+            t_tr = train_per_round[r] if r < len(train_per_round) else np.mean(train_per_round)
+            estimated_round_time.append(t_tr + t_net)
+
+        accumulated_time = np.cumsum(estimated_round_time)
+
+        ax2.plot(accumulated_time, d['acc_mean'], color=s['color'], marker=s['marker'],
+                 markevery=_mark_every(len(d['acc_mean'])), linestyle=s['ls'],
+                 label=exp['label'])
+        ax2.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'],
+                          d['acc_mean'] + d['acc_std'], color=s['color'], alpha=0.1)
+
+    _set_title(ax2, f"(b) Acurácia vs Tempo Estimado (Rede simulada a {BANDWIDTH_MBPS} Mbps)")
+    ax2.set_xlabel(f"Tempo Estimado Acumulado (s)")
+    ax2.set_ylabel("Acurácia (%)")
+    ax2.legend()
+    ax2.grid(True, ls='--', alpha=0.4)
+
+    if SHOW_TITLES:
+        fig.suptitle("Eficiência Temporal: Acurácia em Função do Tempo", fontsize=20, fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+    else:
+        fig.tight_layout()
+    _save_and_close(fig, output_dir, "13_acuracia_vs_tempo.pdf")
+
+
+# ==============================================================================
+# 14 - Resumo Comparativo (Barras)
+# ==============================================================================
+
+def plot_14_resumo_comparativo(experiments, output_dir):
+    """Painel com 4 métricas finais de cada estratégia: acurácia, loss, tempo médio, banda total."""
     labels = [e['label'] for e in experiments]
     final_acc = [e['server']['acc_mean'][-1] for e in experiments]
     final_loss = [e['server']['loss_mean'][-1] for e in experiments]
@@ -742,7 +878,8 @@ def plot_comparative_summary_bar(experiments, output_dir):
     # Acurácia final
     ax = axes[0, 0]
     bars = ax.bar(x, final_acc, width, color=[STYLES[i % len(STYLES)]['color'] for i in range(len(experiments))])
-    ax.set_title("Acurácia Final (%)"); ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
+    _set_title(ax, "Acurácia Final (%)")
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
     for bar, val in zip(bars, final_acc):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3, f'{val:.1f}', ha='center', fontsize=9)
     ax.grid(True, axis='y', ls='--', alpha=0.4)
@@ -750,7 +887,8 @@ def plot_comparative_summary_bar(experiments, output_dir):
     # Loss final
     ax = axes[0, 1]
     bars = ax.bar(x, final_loss, width, color=[STYLES[i % len(STYLES)]['color'] for i in range(len(experiments))])
-    ax.set_title("Loss Final"); ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
+    _set_title(ax, "Loss Final")
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
     for bar, val in zip(bars, final_loss):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.01, f'{val:.3f}', ha='center', fontsize=9)
     ax.grid(True, axis='y', ls='--', alpha=0.4)
@@ -758,7 +896,8 @@ def plot_comparative_summary_bar(experiments, output_dir):
     # Tempo médio por rodada
     ax = axes[1, 0]
     bars = ax.bar(x, avg_time, width, color=[STYLES[i % len(STYLES)]['color'] for i in range(len(experiments))])
-    ax.set_title("Tempo Médio por Rodada (s)"); ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
+    _set_title(ax, "Tempo Médio por Rodada (s)")
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
     for bar, val in zip(bars, avg_time):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1, f'{val:.1f}', ha='center', fontsize=9)
     ax.grid(True, axis='y', ls='--', alpha=0.4)
@@ -766,86 +905,15 @@ def plot_comparative_summary_bar(experiments, output_dir):
     # Total MB trafegado
     ax = axes[1, 1]
     bars = ax.bar(x, total_mb, width, color=[STYLES[i % len(STYLES)]['color'] for i in range(len(experiments))])
-    ax.set_title("Total MB Trafegados"); ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
+    _set_title(ax, "Total MB Trafegados")
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
     for bar, val in zip(bars, total_mb):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.01, f'{val:.1f}', ha='center', fontsize=9)
     ax.grid(True, axis='y', ls='--', alpha=0.4)
 
     fig.suptitle("Resumo Comparativo de Desempenho e Custo", fontsize=16, fontweight='bold')
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    path = os.path.join(output_dir, "10_resumo_comparativo.pdf")
-    fig.savefig(path, dpi=150); plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_server_acc_vs_time(experiments, output_dir):
-    """Acurácia Global (Servidor) vs Tempo Acumulado - comparativo."""
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for i, exp in enumerate(experiments):
-        s = STYLES[i % len(STYLES)]
-        d = exp['server']
-        
-        # O tempo salvo é por rodada no servidor. Calculamos o tempo acumulado somando a cada rodada.
-        accumulated_time = np.cumsum(d['time_mean'])
-        
-        ax.plot(accumulated_time, d['acc_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d['acc_mean'])), linestyle=s['ls'],
-                label=exp['label'])
-        
-        ax.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'], 
-                         d['acc_mean'] + d['acc_std'],
-                         color=s['color'], alpha=0.1)
-
-    ax.set_title("Acurácia Global (Servidor) em Função do Tempo Total Acumulado")
-    ax.set_xlabel("Tempo Acumulado (s)")
-    ax.set_ylabel("Acurácia (%)")
-    ax.legend()
-    ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "15_acuracia_servidor_vs_tempo.pdf")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"  📊 {path}")
-
-
-def plot_comparative_acc_vs_time(experiments, output_dir):
-    """Acurácia Global (Clientes) vs Tempo Acumulado - comparativo."""
-    has_data = any(e['client'] is not None for e in experiments)
-    if not has_data:
-        print("  ⚠️ Sem dados de clientes para plotar acurácia vs tempo, pulando.")
-        return
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for i, exp in enumerate(experiments):
-        if exp['client'] is None:
-            continue
-        
-        s = STYLES[i % len(STYLES)]
-        d_server = exp['server']
-        d_client = exp['client']
-        
-        # O tempo salvo é por rodada no servidor. Calculamos o tempo acumulado somando a cada rodada.
-        accumulated_time = np.cumsum(d_server['time_mean'])
-        
-        ax.plot(accumulated_time, d_client['global_acc_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d_client['global_acc_mean'])), linestyle=s['ls'],
-                label=exp['label'])
-        
-        # Somente a banda de desvio da acurácia dos clientes
-        ax.fill_between(accumulated_time, d_client['global_acc_mean'] - d_client['global_acc_std'], 
-                         d_client['global_acc_mean'] + d_client['global_acc_std'],
-                         color=s['color'], alpha=0.1)
-
-    ax.set_title("Acurácia Global (Clientes) em Função do Tempo Total Acumulado")
-    ax.set_xlabel("Tempo Acumulado (s)")
-    ax.set_ylabel("Acurácia (%)")
-    ax.legend()
-    ax.grid(True, ls='--', alpha=0.4)
-    fig.tight_layout()
-    path = os.path.join(output_dir, "11_acuracia_clientes_vs_tempo.pdf")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"  📊 {path}")
+    _save_and_close(fig, output_dir, "14_resumo_comparativo.pdf")
 
 
 # ==============================================================================
@@ -856,9 +924,9 @@ def plot_comparative_acc_vs_time(experiments, output_dir):
 # Experimentos para plotar (Adicione ou remova itens desta lista)
 # ==============================================================================
 EXPERIMENTOS_PARA_PLOTAR = [
-    "lora_run_clip_lora_prune1_ala1_paca12_20260727_132558",
-    "sora_p12_clip_sora_with_schedule_prune1_ala1_paca12_20260727_131821",
-    "sora_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260727_164317",
+    "lora_padrao_clip_lora_prune1_ala1_paca12_20260801_180443",
+    "sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260802_011456",
+    "pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260802_095514"
 ]
 
 def main():
@@ -897,27 +965,35 @@ def main():
 
     print(f"\n{'='*60}")
     print(f"📂 Salvando gráficos em: {output_dir}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+    print(f"📝 Títulos nos gráficos: {'ATIVADOS' if SHOW_TITLES else 'DESATIVADOS'}\n")
 
-    # Gerar todos os gráficos
-    plot_comparative_accuracy(experiments, output_dir)
-    plot_comparative_loss(experiments, output_dir)
-    plot_comparative_comm_cost(experiments, output_dir)
-    plot_comparative_round_time(experiments, output_dir)
-    plot_comparative_model_size(experiments, output_dir)
-    plot_comparative_params(experiments, output_dir)
-    plot_comparative_paca_evolution(experiments, output_dir)
-    plot_comparative_comm_cost_per_round(experiments, output_dir)
-    plot_comparative_client_global_acc(experiments, output_dir)
-    plot_comparative_client_local_vs_train(experiments, output_dir)
-    plot_comparative_client_loss(experiments, output_dir)
-    plot_comparative_summary_bar(experiments, output_dir)
-    plot_comparative_discrete_comm_cost_per_round(experiments, output_dir)
-    plot_comparative_acc_vs_time(experiments, output_dir)
-    plot_comparative_server_acc_vs_time(experiments, output_dir)
-    plot_comparative_client_training_time(experiments, output_dir)
-    plot_comparative_client_comm_time(experiments, output_dir)
-    plot_comparative_server_pruning_time(experiments, output_dir)
+    # Gerar todos os gráficos (em ordem sequencial 01-14)
+    # --- Desempenho do Modelo ---
+    plot_01_acuracia_global(experiments, output_dir)
+    plot_02_train_loss(experiments, output_dir)
+    plot_03_local_vs_treino(experiments, output_dir)
+
+    # --- Custos de Comunicação ---
+    plot_04_banda_acumulada(experiments, output_dir)
+    plot_05_banda_por_rodada(experiments, output_dir)
+
+    # --- Estrutura do Modelo ---
+    plot_06_tamanho_modelo(experiments, output_dir)
+    plot_07_parametros_treinaveis(experiments, output_dir)
+    plot_08_paca_evolucao(experiments, output_dir)
+
+    # --- Análise Temporal ---
+    plot_09_tempo_por_rodada(experiments, output_dir)
+    plot_10_tempo_treinamento_clientes(experiments, output_dir)
+    plot_11_tempo_comunicacao_clientes(experiments, output_dir)
+    plot_12_decomposicao_temporal(experiments, output_dir)
+
+    # --- Eficiência (Acurácia vs Tempo) ---
+    plot_13_acuracia_vs_tempo(experiments, output_dir)
+
+    # --- Resumo ---
+    plot_14_resumo_comparativo(experiments, output_dir)
 
     print(f"\n✅ {len(experiments)} experimento(s) plotados com sucesso em: {output_dir}")
 

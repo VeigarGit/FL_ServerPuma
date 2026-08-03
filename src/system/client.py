@@ -327,6 +327,7 @@ def parse_args():
     parser.add_argument('--run-id', type=int, default=1)
     parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão com timestamp')
     parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
+    # parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule', 'adalora'])
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA') 
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas para a estratégia PaCA')
     
@@ -415,6 +416,8 @@ def main():
                 config["model"]["lora"]["mode"] = "with_sora_schedule"
             elif args.strategy == 'sora_no_schedule':
                 config["model"]["lora"]["mode"] = "with_sora_no_schedule"
+            # elif args.strategy == 'adalora':
+            #     config["model"]["lora"]["mode"] = "with_adalora"
 
                 
             if "paca" not in config["model"]:
@@ -503,12 +506,15 @@ def main():
                     break
                     
                 logger.info("Received global model.")
+                client_dequant_start = time.time()
                 global_state = dequantization(global_state)
+                client_dequant_time = time.time() - client_dequant_start
                 
                 
                 if round_num + 1 >= 2 and prune == 1 and args.model != 'clip':
                     ammount, _ = recv_data(s)
                 
+                eval_start = time.time()
                 if round_num + 1 >= 2:
                     if args.model == 'clip':
                         old_local_weights = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
@@ -523,6 +529,7 @@ def main():
                                     p.data.copy_(old_local_weights[n])
                 else:
                     test_accuracy, test_loss = evaluate_model(model, test_loader)
+                client_pre_eval_time = time.time() - eval_start
                     
                 logger.info(f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
                 rs_global_acc.append(test_accuracy)
@@ -557,24 +564,38 @@ def main():
                 logger.info(f"Local training completed in {client_training_time:.2f}s.")
 
                 # Acurácia logo após o treinamento local (avaliado no conjunto de teste para comparação justa)
+                post_eval_start = time.time()
                 local_test_acc, local_test_loss = evaluate_model(model, test_loader)
                 rs_local_acc.append(local_test_acc)
                 
                 train_accuracy, train_loss = evaluate_model(model, train_loader)
                 rs_train_acc.append(train_accuracy)
+                client_post_eval_time = time.time() - post_eval_start
 
                 logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
                 
+                quant_start = time.time()
                 updated_state = quantization(updated_state)
+                client_quant_time = time.time() - quant_start
+                
+                # Tempo total de avaliação (pré + pós treinamento) e dequantização no cliente
+                client_eval_time = client_pre_eval_time + client_post_eval_time
+                client_processing_overhead = client_eval_time + client_quant_time + client_dequant_time
+                
+                logger.info(f"Client {args.client_idx}: Tempos - treino={client_training_time:.2f}s, eval={client_eval_time:.2f}s, quant={client_quant_time:.2f}s, dequant={client_dequant_time:.2f}s")
+                
                 try:
                     send_data(s, updated_state)
                     send_data(s, len(train_loader))
                     send_data(s, args.ala)
-                    send_data(s, client_training_time)  # Problema #1: Envia tempo de treino puro
+                    send_data(s, client_training_time)
                     
-                    # NOVO: Envia as métricas do modelo global calculadas no cliente
+                    # Envia as métricas do modelo global calculadas no cliente
                     send_data(s, test_accuracy)
                     send_data(s, test_loss)
+                    
+                    # Envia tempos de processamento do cliente para medição correta de comm_time
+                    send_data(s, client_processing_overhead)
                     
                     logger.info("Client update sent.")
                     
