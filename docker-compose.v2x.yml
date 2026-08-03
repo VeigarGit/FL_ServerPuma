@@ -51,6 +51,7 @@ services:
       --client-idx 0
       --dataset MNIST
       --rounds 3
+      --prune 1
       --ala 1
 
   client-v2x-1:
@@ -62,6 +63,7 @@ services:
       --client-idx 1
       --dataset MNIST
       --rounds 3
+      --prune 1
       --ala 1
 
   client-v2x-2:
@@ -73,6 +75,7 @@ services:
       --client-idx 2
       --dataset MNIST
       --rounds 3
+      --prune 1
       --ala 1
 
   client-v2x-3:
@@ -84,6 +87,7 @@ services:
       --client-idx 3
       --dataset MNIST
       --rounds 3
+      --prune 1
       --ala 1
 
   client-v2x-4:
@@ -95,6 +99,7 @@ services:
       --client-idx 4
       --dataset MNIST
       --rounds 3
+      --prune 1
       --ala 1
 
 networks:

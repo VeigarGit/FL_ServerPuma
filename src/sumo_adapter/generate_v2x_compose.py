@@ -107,6 +107,7 @@ services:
       --client-idx {client_idx}
       --dataset {dataset}
       --rounds {rounds}
+      --prune {prune}
       --ala {ala}
 
 """

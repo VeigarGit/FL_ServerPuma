@@ -54,6 +54,20 @@ DEFAULT_STEP_LENGTH = 1.0
 # leva ~2.8s para transferir.
 DEFAULT_MIN_CONTACT_TIME = 6.0
 
+# Teto maximo para o ETC em segundos. Valores acima sao truncados.
+# Evita ETCs irrealistas (ex: veiculos quase parados na mesma posicao).
+MAX_ETC = 120.0
+
+# Segundos de warmup antes de comecar a sinalizar encontros.
+# Permite que os conteineres Docker iniciem, carreguem o modelo e
+# completem pelo menos 1 epoca de treino local.
+DEFAULT_WARMUP = 60
+
+# Segundos de cooldown entre encontros consecutivos.
+# Impede que mudancas incrementais na composicao do cluster
+# (entra/sai 1 veiculo) consumam o contador de encontros.
+DEFAULT_COOLDOWN = 30
+
 # Raiz do projeto (FL_ServerPuma/)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -110,34 +124,43 @@ def estimate_contact_time(
 ) -> float:
     """Estima o Tempo de Contato restante (ETC) entre dois veiculos.
     
-    Baseado na metodologia MobFedLS:
-      ETC = (R - d_atual) / v_afastamento
+    Usa uma equacao quadratica de cinematica que modela as posicoes
+    futuras como funcoes lineares do tempo (movimento retilineo uniforme):
+    
+      p1(t) = p1 + v1 * t
+      p2(t) = p2 + v2 * t
+    
+    O ETC e o menor t > 0 tal que |p1(t) - p2(t)| = R.
+    
+    Expandindo:
+      |dv|^2 * t^2 + 2*(dp . dv) * t + (|dp|^2 - R^2) = 0
     
     Onde:
-      R = raio de comunicacao (metros)
-      d_atual = distancia euclidiana atual entre os veiculos
-      v_afastamento = componente da velocidade relativa projetada na
-                      direcao de separacao entre os veiculos
+      dp = posicao relativa (v2 - v1)
+      dv = velocidade relativa (v2 - v1)
+      A = |dv|^2, B = 2*(dp . dv), C = |dp|^2 - R^2
+    
+    Como |dp| < R (estao dentro do raio), C < 0.
+    Com A > 0, o discriminante B^2 - 4AC > 0 sempre.
+    A raiz positiva (-B + sqrt(D)) / 2A e o tempo ate saida.
+    
+    Vantagem sobre a formula linear: funciona corretamente tanto
+    quando os veiculos se aproximam quanto quando se afastam.
+    Nunca retorna infinito.
     
     Retorna:
-      float: Tempo estimado de contato em segundos.
-             - float('inf') se os veiculos estao se aproximando ou parados
-             - 0.0 se ja estao fora do raio
+      float: ETC em segundos, truncado em MAX_ETC.
+             0.0 se ja estao fora do raio.
     
     Nota sobre o angulo do SUMO:
-      O SUMO usa convencao nautica: 0 graus = Norte, sentido horario.
-      Para decompor a velocidade em componentes X/Y:
-        vx = speed * sin(angulo)  (componente Leste)
-        vy = speed * cos(angulo)  (componente Norte)
+      Convencao nautica: 0 graus = Norte, sentido horario.
+      vx = speed * sin(angulo)  (componente Leste)
+      vy = speed * cos(angulo)  (componente Norte)
     """
     # Se ja estao fora do raio, tempo de contato e zero
     dist = euclidean_distance(v1, v2)
     if dist >= radius:
         return 0.0
-
-    # Evitar divisao por zero quando os veiculos estao na mesma posicao
-    if dist < 1e-6:
-        return float('inf')
 
     # Decompor velocidade de cada veiculo em componentes X (leste) e Y (norte)
     # usando o angulo do SUMO (convencao nautica: 0=Norte, sentido horario)
@@ -149,26 +172,43 @@ def estimate_contact_time(
     v2_vx = v2.speed * math.sin(a2_rad)  # Componente Leste do veiculo 2
     v2_vy = v2.speed * math.cos(a2_rad)  # Componente Norte do veiculo 2
 
-    # Vetor unitario de separacao (de v1 para v2)
-    dx = v2.x - v1.x
-    dy = v2.y - v1.y
-    ux = dx / dist  # Componente X do vetor unitario
-    uy = dy / dist  # Componente Y do vetor unitario
+    # Posicao relativa (dp) e velocidade relativa (dv)
+    dp_x = v2.x - v1.x
+    dp_y = v2.y - v1.y
+    dv_x = v2_vx - v1_vx
+    dv_y = v2_vy - v1_vy
 
-    # Projecao da velocidade relativa na direcao de separacao.
-    # Valor positivo = veiculos se afastando
-    # Valor negativo ou zero = veiculos se aproximando (contato estavel)
-    v_afastamento = (v2_vx - v1_vx) * ux + (v2_vy - v1_vy) * uy
+    # Coeficientes da equacao quadratica: A*t^2 + B*t + C = 0
+    A = dv_x * dv_x + dv_y * dv_y         # |dv|^2
+    B = 2.0 * (dp_x * dv_x + dp_y * dv_y) # 2 * (dp . dv)
+    C = dp_x * dp_x + dp_y * dp_y - radius * radius  # |dp|^2 - R^2
 
-    if v_afastamento <= 0:
-        # Veiculos parados ou se aproximando: contato estavel (ETC infinito)
-        return float('inf')
+    # Caso especial: A ≈ 0 significa que a velocidade relativa e
+    # praticamente zero (veiculos parados ou com mesma velocidade).
+    # Neste caso, a distancia nao muda e o ETC e o maximo possivel.
+    if A < 1e-9:
+        return MAX_ETC
 
-    # Distancia restante ate sairem do raio de comunicacao
-    distancia_restante = radius - dist
+    # Discriminante: sempre positivo quando C < 0 e A > 0
+    discriminante = B * B - 4.0 * A * C
 
-    # ETC = distancia_restante / velocidade_de_afastamento
-    return distancia_restante / v_afastamento
+    if discriminante < 0:
+        # Matematicamente impossivel quando estao dentro do raio,
+        # mas tratamos por seguranca.
+        return MAX_ETC
+
+    # Raiz positiva: tempo ate a distancia atingir R
+    # (-B + sqrt(D)) / 2A e a raiz positiva porque C < 0
+    sqrt_d = math.sqrt(discriminante)
+    t_exit = (-B + sqrt_d) / (2.0 * A)
+
+    # Se t_exit <= 0, ja estao saindo (raro, mas possivel com
+    # veiculos exatamente na borda do raio)
+    if t_exit <= 0:
+        return 0.0
+
+    # Truncar no teto maximo para evitar valores irrealistas
+    return min(t_exit, MAX_ETC)
 
 
 def cluster_etc(
@@ -317,22 +357,26 @@ def write_encounter_signal(
 
 # ── Controle Docker ──────────────────────────────────────────────────────────
 
-def docker_compose_up(compose_file: str, project_root: Path) -> bool:
+def docker_compose_up(compose_file: str, project_root: Path, build: bool = False) -> bool:
     """Inicia todos os conteineres (veiculos) de uma vez no inicio da simulacao.
-    
-    Executa `docker compose up --build -d` com os logs do build visiveis
-    no terminal para que o usuario acompanhe o progresso.
     
     Args:
         compose_file: Caminho para o docker-compose.v2x.yml
         project_root: Raiz do projeto (FL_ServerPuma/)
+        build: Se True, forca o rebuild das imagens (adiciona --build)
     
     Returns:
         True se o comando foi bem sucedido, False caso contrario
     """
-    log.info("Iniciando conteineres Docker (build logs abaixo)...")
+    cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
+    if build:
+        cmd.insert(-1, "--build")
+        log.info("Iniciando conteineres Docker...")
+    else:
+        log.info("Iniciando conteineres Docker...")
+        
     result = subprocess.run(
-        ["docker", "compose", "-f", compose_file, "up", "--build", "-d"],
+        cmd,
         cwd=str(project_root),
     )
     if result.returncode != 0:
@@ -400,12 +444,14 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
     # ── Banner de configuracao ────────────────────────────────────────────
     log.info("=" * 60)
-    log.info("V2X Orchestrator - FL Oportunistico (ETC + D-PSGD)")
+    log.info("V2X Orchestrator - FL")
     log.info("=" * 60)
     log.info("  Total Clientes    : %d", args.total_clients)
     log.info("  Max Encontros     : %d", args.encounters)
     log.info("  Raio Comunicacao  : %.0f m", args.radius)
     log.info("  Min Tempo Contato : %.0f s (ETC)", args.min_contact_time)
+    log.info("  Warmup            : %d s", args.warmup)
+    log.info("  Cooldown          : %d s", args.cooldown)
     log.info("  Dataset           : %s", args.dataset)
     log.info("=" * 60)
 
@@ -433,10 +479,23 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         output_path=PROJECT_ROOT,
     )
 
-    if not docker_compose_up(compose_file, PROJECT_ROOT):
+    if not docker_compose_up(compose_file, PROJECT_ROOT, build=args.build):
         sys.exit(1)
 
-    # ── PASSO 3: Iniciar simulacao SUMO ──────────────────────────────────
+    # ── PASSO 3: Warmup ──────────────────────────────────────────────────
+    # Esperar os conteineres Docker inicializarem completamente antes de
+    # iniciar o SUMO. Isso garante que os clientes ja estejam treinando
+    # (com pesos prontos para exportar) quando o primeiro encontro chegar.
+    if args.warmup > 0:
+        log.info(
+            "Aguardando %ds de warmup (conteineres inicializando, "
+            "clientes treinando primeira epoca)...",
+            args.warmup,
+        )
+        time.sleep(args.warmup)
+        log.info("Warmup concluido!")
+
+    # ── PASSO 4: Iniciar simulacao SUMO ──────────────────────────────────
     log.info("Iniciando SUMO...")
     traci.start(sumo_cmd)
 
@@ -447,6 +506,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     prev_cluster_key: frozenset[str] | None = None # Chave do cluster anterior (para detectar mudanca)
     veh_to_client_idx: dict[str, int] = {}         # Mapa veiculo SUMO -> indice do conteiner
     next_client_idx = 0                            # Proximo indice de conteiner disponivel
+    last_encounter_time = -float('inf')            # Timestamp SUMO do ultimo encontro (para cooldown)
 
     try:
         step = 0
@@ -488,6 +548,14 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
             # Precisamos de pelo menos 2 veiculos para formar um cluster
             if len(vehicles) < 2:
+                continue
+
+            # ── Verificar cooldown ────────────────────────────────────────
+            # Se estamos dentro do periodo de cooldown apos o ultimo
+            # encontro, pular a deteccao para dar tempo a troca de pesos
+            # e evitar que mudancas incrementais no cluster consumam o
+            # contador de encontros.
+            if (sim_time - last_encounter_time) < args.cooldown:
                 continue
 
             # ── Detectar clusters ─────────────────────────────────────────
@@ -536,12 +604,10 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     # ── ETC suficiente: gerar sinal de encontro ───────────
                     encounter_count += 1
 
-                    # ETC pode ser infinito (veiculos se aproximando), exibir "inf"
-                    etc_display = "inf" if math.isinf(etc) else f"{etc:.1f}"
                     log.info(
-                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%ss",
+                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%.1fs",
                         encounter_count, args.encounters,
-                        veh_names, c_indices, etc_display,
+                        veh_names, c_indices, etc,
                     )
 
                     # Montar dados do encontro com ETC para os clientes usarem
@@ -551,7 +617,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         "timestamp": sim_time,
                         # O ETC permite que os clientes ajustem seu timeout
                         # de polling pela janela de contato real
-                        "etc_seconds": etc if not math.isinf(etc) else 9999.0,
+                        "etc_seconds": etc,
                     }
 
                     # Escrita ATOMICA do JSON (write-to-temp + rename)
@@ -564,22 +630,80 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         vehicles=veh_names,
                         details={
                             "clients": c_indices,
-                            "etc_seconds": round(etc, 1) if not math.isinf(etc) else "inf",
+                            "etc_seconds": round(etc, 1),
                         },
                     ))
 
                     # Atualizar estado
                     prev_cluster_key = cluster_key
+                    last_encounter_time = sim_time  # Iniciar cooldown
 
-                    # Verificar se atingimos o limite de encontros viaveis
+                    # ── PAUSAR SUMO e esperar troca P2P ───────────────────
+                    # O SUMO roda em tempo de simulacao (300 steps em segundos),
+                    # mas os clientes precisam de tempo real (minutos) para:
+                    #   1. Completar a epoca de treino local atual
+                    #   2. Detectar o JSON do encontro
+                    #   3. Salvar seus pesos (.pt)
+                    #   4. Carregar pesos dos vizinhos
+                    #   5. Agregar (media)
+                    #
+                    # Sem esta pausa, o SUMO avanca centenas de steps e termina
+                    # antes dos clientes sequer lerem o JSON.
+                    expected_pt_files = [
+                        encounters_dir / f"client_{c}_enc_{encounter_count}.pt"
+                        for c in c_indices
+                    ]
+                    log.info(
+                        "SUMO PAUSADO. Aguardando %d clientes completarem "
+                        "troca P2P do encontro %d...",
+                        len(c_indices), encounter_count,
+                    )
+
+                    exchange_start = time.time()
+                    exchange_timeout = 300  # Maximo 5 minutos por encontro
+
+                    for tick in range(exchange_timeout):
+                        received = [f.exists() for f in expected_pt_files]
+                        received_count = sum(received)
+
+                        # Log de progresso a cada 15 segundos
+                        if tick > 0 and tick % 15 == 0:
+                            log.info(
+                                "  ... %d/%d .pt recebidos (%ds)",
+                                received_count, len(expected_pt_files), tick,
+                            )
+
+                        if all(received):
+                            exchange_time = time.time() - exchange_start
+                            log.info(
+                                "Todos os %d .pt recebidos em %.0fs! "
+                                "Aguardando 5s para agregacao...",
+                                len(expected_pt_files), exchange_time,
+                            )
+                            # Dar tempo extra para os clientes lerem os .pt
+                            # dos vizinhos e completarem a agregacao D-PSGD
+                            time.sleep(5)
+                            break
+                        time.sleep(1)
+                    else:
+                        exchange_time = time.time() - exchange_start
+                        received_count = sum(f.exists() for f in expected_pt_files)
+                        log.warning(
+                            "Timeout de %ds esperando .pt do encontro %d "
+                            "(%d/%d recebidos). Continuando...",
+                            exchange_timeout, encounter_count,
+                            received_count, len(expected_pt_files),
+                        )
+
+                    log.info("SUMO RETOMADO.")
+
+                    # Verificar se atingimos o limite de encontros
                     if encounter_count >= args.encounters:
                         log.info(
-                            "Limite de %d encontros viaveis atingido. "
-                            "Encerrando simulacao...",
+                            "Limite de %d encontros atingido. "
+                            "Encerrando simulacao.",
                             args.encounters,
                         )
-                        # Aguardar para os clientes lerem o ultimo sinal
-                        time.sleep(10)
                         break
             else:
                 # Nenhum cluster detectado neste step
@@ -668,6 +792,26 @@ def main():
     parser.add_argument(
         "--gui", action="store_true",
         help="Usar sumo-gui (interface grafica) em vez do sumo headless",
+    )
+    parser.add_argument(
+        "--build", action="store_true",
+        help="Forcar o rebuild das imagens Docker antes de iniciar a simulacao",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=DEFAULT_WARMUP,
+        help=(
+            f"Segundos de warmup antes de sinalizar encontros. "
+            f"Permite os conteineres bootarem e completarem 1 epoca "
+            f"de treino local (default: {DEFAULT_WARMUP})"
+        ),
+    )
+    parser.add_argument(
+        "--cooldown", type=int, default=DEFAULT_COOLDOWN,
+        help=(
+            f"Segundos de espera entre encontros consecutivos. "
+            f"Evita que mudancas incrementais no cluster consumam "
+            f"o contador de encontros (default: {DEFAULT_COOLDOWN})"
+        ),
     )
     parser.add_argument(
         "--step-length", type=float, default=DEFAULT_STEP_LENGTH,
