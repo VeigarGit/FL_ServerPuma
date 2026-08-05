@@ -3,6 +3,7 @@ import numpy as np
 import os
 from dataset.utils.dataset_utils import check, separate_data, split_data, save_file
 import random
+from pathlib import Path
 random.seed(1)
 np.random.seed(1)
 
@@ -50,9 +51,9 @@ def generate_ecg_dataset(dir_path, train_csv_path, test_csv_path, num_clients, n
         os.makedirs(dir_path)
     
     # Setup dos caminhos para salvar os arquivos
-    config_path = dir_path + "config.json"
-    train_path = dir_path + "train/"
-    test_path = dir_path + "test/"
+    config_path = Path(dir_path) / "config.json"
+    train_path = Path(dir_path) / "train/"
+    test_path = Path(dir_path) / "test/"
 
     # Verifica se o dataset já foi gerado
     if check(config_path, train_path, test_path, num_clients, niid, balance, partition):

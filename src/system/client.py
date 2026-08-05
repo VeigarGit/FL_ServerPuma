@@ -306,11 +306,7 @@ def parse_args():
     parser.add_argument('--host', type=str, default='localhost')
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--rounds', type=int, default=5)
-    parser.add_argument('--dataset', type=str, default='Cifar100', choices=['Cifar10', 
-                                                                            'MNIST', 
-                                                                            'FashionMNIST',
-                                                                            'Cifar100',
-                                                                            "OxfordPets"])
+    parser.add_argument('--dataset', type=str, default='Cifar100')
     parser.add_argument('--client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
     parser.add_argument('--num-classes', type=int, default=100)
@@ -437,12 +433,7 @@ def main():
             run_mode = resolve_run_modes(config)[0]
             run_config = build_run_config(config, run_mode=run_mode)
             
-            match config["dataset"]["name"]:
-                case "enterprise-explorers/oxford-pets":
-                    model = build_model(config=run_config, num_classes=37, device=device)
-                case _:
-                    # Fallback para caso utilize Cifar10 ou Cifar100 via bash
-                    model = build_model(config=run_config, num_classes=args.num_classes, device=device)
+            model = build_model(config=run_config, num_classes=args.num_classes, device=device)
             
     model = model.to(device)
     loss = nn.CrossEntropyLoss()
@@ -497,6 +488,14 @@ def main():
                         args.paca = server_paca
                         # Atualiza o run_config para que o treino use o novo PaCA
                         run_config["model"]["paca"]["upper_layers"] = server_paca
+
+                    # #fazer a mesma coisa para receber um valor do server para o r
+                    # server_r, _ = recv_data(s)
+                    # if server_r is not None and server_r != args.rank:
+                    #     logger.info(f"r adaptativo: servidor ajustou {args.rank} -> {server_r}")
+                    #     args.rank = server_r
+                    #     # Atualiza o run_config para que o treino use o novo r
+                    #     run_config["model"]["lora"]["r"] = server_r
 
                 global_state, _ = recv_data(s)
                 prune, _ = recv_data(s)

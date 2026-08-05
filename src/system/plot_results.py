@@ -21,6 +21,7 @@ Gráficos gerados (14 no total):
     12 - Decomposição temporal (barras empilhadas)
     13 - Acurácia vs tempo: (a) tempo real, (b) tempo simulado @100Mbps
     14 - Resumo comparativo (barras: acc, loss, tempo, banda)
+    15 - MB acumulados vs tempo real (wall-clock)
 
 Os gráficos são salvos em: ../results/graficos_comparativos/
 """
@@ -42,14 +43,14 @@ import matplotlib.pyplot as plt
 # Flag para ativar/desativar títulos explicativos nos gráficos.
 # True  = títulos aparecem (útil para apresentações e revisões)
 # False = títulos ocultos (útil para artigos/papers onde a legenda da figura é suficiente)
-SHOW_TITLES = True
+SHOW_TITLES = False
 
 plt.rcParams.update({
-    'xtick.labelsize': 20,
-    'ytick.labelsize': 20,
-    'legend.fontsize': 20,
-    'axes.labelsize': 20,
-    'axes.titlesize': 20,
+    'xtick.labelsize': 24,
+    'ytick.labelsize': 24,
+    'legend.fontsize': 24,
+    'axes.labelsize': 24,
+    'axes.titlesize': 24,
 })
 
 # ==============================================================================
@@ -130,14 +131,14 @@ def parse_experiment(exp_name, results_base="../results"):
 
     # Label legível para os gráficos
     if "adalora" in exp_name.lower():
-        label = "AdaLoRA"
+        label = f"AdaLoRA r={rank}"
     elif "sora" in exp_name.lower():
         if "adaptpaca" in exp_name.lower():
-            label = "PUMA-GT"
+            label = f"PUMA-GT r={rank}"
         else:
-            label = "SoRa Estático"
+            label = f"Static SoRa r={rank}"
     elif "lora" in exp_name.lower():
-        label = "LoRA"
+        label = f"LoRA r={rank}"
     else:
         label = f"{strategy.upper()} r={rank} p={paca} ({algo})"
         if "withou" not in prune_str.lower():
@@ -344,8 +345,8 @@ def plot_01_acuracia_global(experiments, output_dir):
         ax.fill_between(x, d['acc_mean'] - d['acc_std'], d['acc_mean'] + d['acc_std'],
                          color=s['color'], alpha=0.1)
 
-    _set_title(ax, "Evolução da Acurácia Global do Modelo (Servidor)")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
+    _set_title(ax, "Global Model Accuracy Evolution (Server)")
+    ax.set_xlabel("Rounds"); ax.set_ylabel("Accuracy (%)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "01_acuracia_global.pdf")
@@ -368,8 +369,8 @@ def plot_02_train_loss(experiments, output_dir):
         ax.fill_between(x, d['loss_mean'] - d['loss_std'], d['loss_mean'] + d['loss_std'],
                          color=s['color'], alpha=0.1)
 
-    _set_title(ax, "Evolução da Função de Custo (Loss) no Treinamento")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Loss")
+    _set_title(ax, "Training Loss Evolution")
+    ax.set_xlabel("Rounds"); ax.set_ylabel("Loss")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "02_train_loss.pdf")
@@ -394,13 +395,13 @@ def plot_03_local_vs_treino(experiments, output_dir):
         x = range(1, len(d['local_acc_mean']) + 1)
         ax.plot(x, d['local_acc_mean'], color=s['color'], marker=s['marker'],
                 markevery=_mark_every(len(d['local_acc_mean'])), linestyle=s['ls'],
-                label=f"{exp['label']} (teste local)")
+                label=f"{exp['label']} (local test)")
         ax.plot(x, d['train_acc_mean'], color=s['color'], marker=s['marker'],
                 markevery=_mark_every(len(d['train_acc_mean'])), linestyle=':',
-                alpha=0.6, label=f"{exp['label']} (treino)")
+                alpha=0.6, label=f"{exp['label']} (train)")
 
-    _set_title(ax, "Análise de Overfitting: Acurácia de Treino vs. Teste Local")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Acurácia (%)")
+    _set_title(ax, "Overfitting Analysis: Train vs. Local Test Accuracy")
+    ax.set_xlabel("Rounds"); ax.set_ylabel("Accuracy (%)")
     ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "03_acuracia_local_vs_treino.pdf")
@@ -425,8 +426,8 @@ def plot_04_banda_acumulada(experiments, output_dir):
                 markevery=_mark_every(len(mb_accumulated)), linestyle=s['ls'],
                 label=exp['label'])
 
-    _set_title(ax, "Banda de Rede Acumulada por Rodada")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Acumulados")
+    _set_title(ax, "Accumulated Network Bandwidth per Round")
+    ax.set_xlabel("Rounds"); ax.set_ylabel("Accumulated MB")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "04_banda_acumulada.pdf")
@@ -458,8 +459,8 @@ def plot_05_banda_por_rodada(experiments, output_dir):
         plt.close(fig)
         return
 
-    _set_title(ax, "Consumo de Banda por Rodada (Upload + Download)")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("MB Trafegados na Rodada")
+    _set_title(ax, "Bandwidth Consumption per Round (Upload + Download)")
+    ax.set_xlabel("Rounds"); ax.set_ylabel("Transferred MB per Round")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "05_banda_por_rodada.pdf")
@@ -489,8 +490,8 @@ def plot_06_tamanho_modelo(experiments, output_dir):
         ax.fill_between(x, d['size_mb_mean'] - d['size_mb_std'],
                          d['size_mb_mean'] + d['size_mb_std'], color=s['color'], alpha=0.1)
 
-    _set_title(ax, "Evolução do Tamanho dos Adaptadores Treináveis (MB)")
-    ax.set_xlabel("Rodada"); ax.set_ylabel("MB")
+    _set_title(ax, "Trainable Adapters Size Evolution (MB)")
+    ax.set_xlabel("Round"); ax.set_ylabel("MB")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "06_tamanho_modelo.pdf")
@@ -518,8 +519,8 @@ def plot_07_parametros_treinaveis(experiments, output_dir):
                 markevery=_mark_every(len(d['params_mean'])), linestyle=s['ls'],
                 label=exp['label'])
 
-    _set_title(ax, "Quantidade de Parâmetros Treináveis por Rodada")
-    ax.set_xlabel("Rodada"); ax.set_ylabel("Quantidade")
+    _set_title(ax, "Trainable Parameters per Round")
+    ax.set_xlabel("Round"); ax.set_ylabel("Quantity")
     ax.ticklabel_format(style='plain', axis='y')
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
@@ -553,8 +554,8 @@ def plot_08_paca_evolucao(experiments, output_dir):
         ax.fill_between(x, paca_per_round - paca_std_per_round, paca_per_round + paca_std_per_round,
                          color=s['color'], alpha=0.1)
 
-    _set_title(ax, "Dinâmica do PaCA Adaptativo Médio nos Clientes")
-    ax.set_xlabel("Rodada"); ax.set_ylabel("Valor do PaCA")
+    _set_title(ax, "Average Adaptive PaCA Dynamics across Clients")
+    ax.set_xlabel("Round"); ax.set_ylabel("PaCA Value")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "08_paca_evolucao.pdf")
@@ -577,8 +578,8 @@ def plot_09_tempo_por_rodada(experiments, output_dir):
         ax.fill_between(x, d['time_mean'] - d['time_std'], d['time_mean'] + d['time_std'],
                          color=s['color'], alpha=0.1)
 
-    _set_title(ax, "Tempo de Execução por Rodada de Comunicação")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
+    _set_title(ax, "Execution Time per Communication Round")
+    ax.set_xlabel("Rounds"); ax.set_ylabel("Time (s)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "09_tempo_por_rodada.pdf")
@@ -625,8 +626,8 @@ def plot_10_tempo_treinamento_clientes(experiments, output_dir):
         plt.close(fig)
         return
 
-    _set_title(ax, "Tempo Médio de Treinamento Local nos Clientes")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
+    _set_title(ax, "Average Local Training Time across Clients")
+    ax.set_xlabel("Rounds"); ax.set_ylabel("Time (s)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "10_tempo_treinamento_clientes.pdf")
@@ -678,8 +679,8 @@ def plot_11_tempo_comunicacao_clientes(experiments, output_dir):
         plt.close(fig)
         return
 
-    _set_title(ax, "Tempo Médio de Comunicação dos Clientes (Média Móvel=10)")
-    ax.set_xlabel("Rodadas"); ax.set_ylabel("Tempo (s)")
+    _set_title(ax, "Average Client Communication Time (Moving Average=10)")
+    ax.set_xlabel("Rounds"); ax.set_ylabel("Time (s)")
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "11_tempo_comunicacao_clientes.pdf")
@@ -757,20 +758,20 @@ def plot_12_decomposicao_temporal(experiments, output_dir):
 
     fig, ax = plt.subplots(figsize=(12, 7))
 
-    ax.bar(x, training_times, width, label='Treinamento Local', color='#2196F3')
-    ax.bar(x, comm_times, width, bottom=training_times, label='Comunicação de Rede', color='#FF9800')
+    ax.bar(x, training_times, width, label='Local Training', color='#2196F3')
+    ax.bar(x, comm_times, width, bottom=training_times, label='Network Communication', color='#FF9800')
 
     bottom2 = [t + c for t, c in zip(training_times, comm_times)]
-    ax.bar(x, eval_times, width, bottom=bottom2, label='Processamento Cliente (eval+quant)', color='#4CAF50')
+    ax.bar(x, eval_times, width, bottom=bottom2, label='Client Processing (eval+quant)', color='#4CAF50')
 
     bottom3 = [b + e for b, e in zip(bottom2, eval_times)]
-    ax.bar(x, server_proc_times, width, bottom=bottom3, label='Processamento Servidor (quant/dequant)', color='#9C27B0')
+    ax.bar(x, server_proc_times, width, bottom=bottom3, label='Server Processing (quant/dequant)', color='#9C27B0')
 
     bottom4 = [b + s for b, s in zip(bottom3, server_proc_times)]
     ax.bar(x, other_times, width, bottom=bottom4, label='Overhead (agg+misc)', color='#607D8B')
 
-    ax.set_xlabel('Estratégia')
-    ax.set_ylabel('Tempo Médio por Rodada (s)')
+    ax.set_xlabel('Strategy')
+    ax.set_ylabel('Average Time per Round (s)')
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=15, ha='right')
     ax.legend(fontsize=12, loc='upper right')
@@ -781,26 +782,25 @@ def plot_12_decomposicao_temporal(experiments, output_dir):
         total = training_times[i] + comm_times[i] + eval_times[i] + server_proc_times[i] + other_times[i]
         ax.text(x[i], total + 0.2, f'{total:.1f}s', ha='center', fontsize=11, fontweight='bold')
 
-    _set_title(ax, "Decomposição do Tempo Médio por Rodada")
+    _set_title(ax, "Average Round Time Breakdown")
     fig.tight_layout()
     _save_and_close(fig, output_dir, "12_decomposicao_temporal.pdf")
 
 
 # ==============================================================================
-# 13 - Acurácia vs Tempo (2 Subplots: tempo real + tempo simulado)
+# 13 - Acurácia vs Tempo (2 Gráficos separados: tempo real e tempo simulado)
 # ==============================================================================
 
 def plot_13_acuracia_vs_tempo(experiments, output_dir):
-    """Mostra a eficiência temporal de cada estratégia com dois painéis:
+    """Mostra a eficiência temporal de cada estratégia em dois gráficos separados:
     (a) Acurácia vs tempo real (wall-clock acumulado)
     (b) Acurácia vs tempo estimado (treino real + rede simulada a 100 Mbps)
     """
     BANDWIDTH_MBPS = 100
     BANDWIDTH_MBs = BANDWIDTH_MBPS / 8  # MB/s
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(22, 8))
-
-    # --- Subplot (a): Tempo real ---
+    # --- Gráfico (a): Tempo real ---
+    fig1, ax1 = plt.subplots(figsize=(12, 7))
     for i, exp in enumerate(experiments):
         s = STYLES[i % len(STYLES)]
         d = exp['server']
@@ -811,13 +811,16 @@ def plot_13_acuracia_vs_tempo(experiments, output_dir):
         ax1.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'],
                           d['acc_mean'] + d['acc_std'], color=s['color'], alpha=0.1)
 
-    _set_title(ax1, "(a) Acurácia vs Tempo Real Acumulado")
-    ax1.set_xlabel("Tempo Acumulado (s)")
-    ax1.set_ylabel("Acurácia (%)")
+    _set_title(ax1, "Accuracy vs Accumulated Real Time")
+    ax1.set_xlabel("Accumulated Time (s)")
+    ax1.set_ylabel("Accuracy (%)")
     ax1.legend()
     ax1.grid(True, ls='--', alpha=0.4)
+    fig1.tight_layout()
+    _save_and_close(fig1, output_dir, "13a_acuracia_vs_tempo_real.pdf")
 
-    # --- Subplot (b): Tempo estimado (treino real + rede simulada) ---
+    # --- Gráfico (b): Tempo estimado (treino real + rede simulada) ---
+    fig2, ax2 = plt.subplots(figsize=(12, 7))
     for i, exp in enumerate(experiments):
         s = STYLES[i % len(STYLES)]
         d = exp['server']
@@ -844,18 +847,13 @@ def plot_13_acuracia_vs_tempo(experiments, output_dir):
         ax2.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'],
                           d['acc_mean'] + d['acc_std'], color=s['color'], alpha=0.1)
 
-    _set_title(ax2, f"(b) Acurácia vs Tempo Estimado (Rede simulada a {BANDWIDTH_MBPS} Mbps)")
-    ax2.set_xlabel(f"Tempo Estimado Acumulado (s)")
-    ax2.set_ylabel("Acurácia (%)")
+    _set_title(ax2, f"Accuracy vs Estimated Time ({BANDWIDTH_MBPS} Mbps Network)")
+    ax2.set_xlabel(f"Accumulated Estimated Time (s)")
+    ax2.set_ylabel("Accuracy (%)")
     ax2.legend()
     ax2.grid(True, ls='--', alpha=0.4)
-
-    if SHOW_TITLES:
-        fig.suptitle("Eficiência Temporal: Acurácia em Função do Tempo", fontsize=20, fontweight='bold')
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
-    else:
-        fig.tight_layout()
-    _save_and_close(fig, output_dir, "13_acuracia_vs_tempo.pdf")
+    fig2.tight_layout()
+    _save_and_close(fig2, output_dir, "13b_acuracia_vs_tempo_simulado.pdf")
 
 
 # ==============================================================================
@@ -878,7 +876,7 @@ def plot_14_resumo_comparativo(experiments, output_dir):
     # Acurácia final
     ax = axes[0, 0]
     bars = ax.bar(x, final_acc, width, color=[STYLES[i % len(STYLES)]['color'] for i in range(len(experiments))])
-    _set_title(ax, "Acurácia Final (%)")
+    _set_title(ax, "Final Accuracy (%)")
     ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
     for bar, val in zip(bars, final_acc):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3, f'{val:.1f}', ha='center', fontsize=9)
@@ -887,7 +885,7 @@ def plot_14_resumo_comparativo(experiments, output_dir):
     # Loss final
     ax = axes[0, 1]
     bars = ax.bar(x, final_loss, width, color=[STYLES[i % len(STYLES)]['color'] for i in range(len(experiments))])
-    _set_title(ax, "Loss Final")
+    _set_title(ax, "Final Loss")
     ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
     for bar, val in zip(bars, final_loss):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.01, f'{val:.3f}', ha='center', fontsize=9)
@@ -896,7 +894,7 @@ def plot_14_resumo_comparativo(experiments, output_dir):
     # Tempo médio por rodada
     ax = axes[1, 0]
     bars = ax.bar(x, avg_time, width, color=[STYLES[i % len(STYLES)]['color'] for i in range(len(experiments))])
-    _set_title(ax, "Tempo Médio por Rodada (s)")
+    _set_title(ax, "Average Time per Round (s)")
     ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
     for bar, val in zip(bars, avg_time):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1, f'{val:.1f}', ha='center', fontsize=9)
@@ -905,15 +903,51 @@ def plot_14_resumo_comparativo(experiments, output_dir):
     # Total MB trafegado
     ax = axes[1, 1]
     bars = ax.bar(x, total_mb, width, color=[STYLES[i % len(STYLES)]['color'] for i in range(len(experiments))])
-    _set_title(ax, "Total MB Trafegados")
+    _set_title(ax, "Total Transferred MB")
     ax.set_xticks(x); ax.set_xticklabels(labels, rotation=15, ha='right', fontsize=9)
     for bar, val in zip(bars, total_mb):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() * 1.01, f'{val:.1f}', ha='center', fontsize=9)
     ax.grid(True, axis='y', ls='--', alpha=0.4)
 
-    fig.suptitle("Resumo Comparativo de Desempenho e Custo", fontsize=16, fontweight='bold')
+    fig.suptitle("Comparative Summary of Performance and Cost", fontsize=16, fontweight='bold')
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     _save_and_close(fig, output_dir, "14_resumo_comparativo.pdf")
+
+
+# ==============================================================================
+# 15 - MB Acumulados vs Tempo Real (Wall-Clock)
+# ==============================================================================
+
+def plot_15_mb_vs_tempo(experiments, output_dir):
+    """Mostra o total de dados (MB) trafegados na rede em função do tempo real acumulado (wall-clock)."""
+    fig, ax = plt.subplots(figsize=(12, 7))
+    has_valid_data = False
+
+    for i, exp in enumerate(experiments):
+        s = STYLES[i % len(STYLES)]
+        d = exp['server']
+        result = _compute_mb_per_round(d)
+        if result is None:
+            continue
+        _, mb_accumulated, _ = result
+        accumulated_time = np.cumsum(d['time_mean'])
+        # Alinhar tamanhos (usar o mínimo entre os dois)
+        n = min(len(accumulated_time), len(mb_accumulated))
+        ax.plot(accumulated_time[:n], mb_accumulated[:n], color=s['color'], marker=s['marker'],
+                markevery=_mark_every(n), linestyle=s['ls'],
+                label=exp['label'])
+        has_valid_data = True
+
+    if not has_valid_data:
+        plt.close(fig)
+        return
+
+    _set_title(ax, "Accumulated MB vs Real Time (Wall-Clock)")
+    ax.set_xlabel("Accumulated Time (s)")
+    ax.set_ylabel("Accumulated MB")
+    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    _save_and_close(fig, output_dir, "15_mb_vs_tempo.pdf")
 
 
 # ==============================================================================
@@ -924,9 +958,10 @@ def plot_14_resumo_comparativo(experiments, output_dir):
 # Experimentos para plotar (Adicione ou remova itens desta lista)
 # ==============================================================================
 EXPERIMENTOS_PARA_PLOTAR = [
-    "lora_padrao_clip_lora_prune1_ala1_paca12_20260801_180443",
-    "sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260802_011456",
-    "pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260802_095514"
+    "lora_rank2",
+    "lora_rank8",
+    "sora_estatico_rank2",
+    "sora_estatico_rank8"
 ]
 
 def main():
@@ -968,7 +1003,7 @@ def main():
     print(f"{'='*60}")
     print(f"📝 Títulos nos gráficos: {'ATIVADOS' if SHOW_TITLES else 'DESATIVADOS'}\n")
 
-    # Gerar todos os gráficos (em ordem sequencial 01-14)
+    # Gerar todos os gráficos (em ordem sequencial 01-15)
     # --- Desempenho do Modelo ---
     plot_01_acuracia_global(experiments, output_dir)
     plot_02_train_loss(experiments, output_dir)
@@ -994,6 +1029,9 @@ def main():
 
     # --- Resumo ---
     plot_14_resumo_comparativo(experiments, output_dir)
+
+    # --- MB vs Tempo ---
+    plot_15_mb_vs_tempo(experiments, output_dir)
 
     print(f"\n✅ {len(experiments)} experimento(s) plotados com sucesso em: {output_dir}")
 

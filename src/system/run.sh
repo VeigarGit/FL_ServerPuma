@@ -82,7 +82,7 @@ Opções de Sessão:
 Opções de Treinamento:
   -c, --clients <n>           Número de clientes (padrão: 2)
   -r, --rounds <n>            Número de rodadas (padrão: 5)
-  -d, --dataset <nome>        Dataset: MNIST, Cifar10, Cifar100, OxfordPets (padrão: MNIST)
+  -d, --dataset <nome>        Dataset: Nome do dataset (deve existir um generate_Nome.py) (padrão: MNIST)
   --batch-size <n>            Tamanho do batch (padrão: 32)
   --max-clients <n>           Máximo de clientes permitidos (padrão: 22)
   --simulations <n>           Número de simulações (padrão: 1)
@@ -279,13 +279,14 @@ echo "===================================="
 
 # ---- Preparação do Dataset ----
 cd ../dataset || exit 1
-case "$DATASET" in
-    Cifar100)    uv run generate_Cifar100.py noniid - dir ;;
-    Cifar10)     uv run generate_Cifar10.py noniid - dir ;;
-    MNIST)       uv run generate_MNIST.py noniid - dir ;;
-    OxfordPets)  uv run generate_oxford_pets.py noniid - dir ;;
-    *)           echo "❌ Dataset não reconhecido: $DATASET"; exit 1 ;;
-esac
+    # Encontra o script ignorando case
+    SCRIPT_NAME=$(find . -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
+    if [ -n "$SCRIPT_NAME" ]; then
+        uv run "$SCRIPT_NAME" noniid - dir
+    else
+        echo "❌ Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
+        exit 1
+    fi
 cd ../system || exit 1
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then
@@ -365,7 +366,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --run-id $RUN --exp-name $EXP_NAME 2>&1 | tee $LOG_DIR/client_$i.log"
+        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --num-classes $NUM_CLASSES --in-features $IN_FEATURES --run-id $RUN --exp-name $EXP_NAME 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
             CLIENT_CMD="$CLIENT_CMD ; read"
         fi

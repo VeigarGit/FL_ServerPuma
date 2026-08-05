@@ -108,18 +108,15 @@ class FederatedLearningServer:
                     config["model"]["paca"]["enabled"] = False
                     config["model"]["paca"]["upper_layers"] = None
 
-                match config["dataset"]["name"]:
-                    case "enterprise-explorers/oxford-pets":
-                        # Agora ele vai resolver o modo que nós forçamos acima!
-                        run_mode = resolve_run_modes(config)[0]
-                        run_config = build_run_config(config, run_mode=run_mode)
-                        
-                        self.global_model = build_model(
-                            config=run_config, 
-                            num_classes=args.num_classes, 
-                            device=args.device
-                        )
-                        self.input_size = (1, 3, 224, 224)
+                run_mode = resolve_run_modes(config)[0]
+                run_config = build_run_config(config, run_mode=run_mode)
+                
+                self.global_model = build_model(
+                    config=run_config, 
+                    num_classes=args.num_classes, 
+                    device=args.device
+                )
+                self.input_size = (1, 3, 224, 224)
                         
                         
         if args.load_model:
@@ -609,11 +606,34 @@ class FederatedLearningServer:
                     if keys_before != keys_after:
                         logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
                                     f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
+
+            # # Todo Modificar para logica do rank adaptativo
+
+            # if self.args.model == 'clip' and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            #     ideal_paca = self.calculate_adaptive_paca(client_id)
+            #     self.clients_info[client_id]['current_paca'] = ideal_paca
+            #     
+            #     # Filtra: remove chaves de camadas fora do PaCA ideal
+            #     min_layer = self.total_encoder_layers - ideal_paca
+            #     if min_layer > 0:
+            #         keys_before = len(current_global_state)
+            #         current_global_state = {
+            #             k: v for k, v in current_global_state.items()
+            #             if not self._is_excluded_by_paca(k, min_layer)
+            #         }
+            #         keys_after = len(current_global_state)
+            #         if keys_before != keys_after:
+            #             logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
+            #                         f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
+
             
             # --- Problema #4: Envia PaCA dinâmico para que o cliente treine apenas as camadas necessárias ---
             if self.args.model == 'clip':
                 client_paca = self.clients_info[client_id].get('current_paca', self.args.paca) if getattr(self.args, 'adaptive_paca', False) else self.args.paca
                 send_data(conn, client_paca)
+
+                # client_rank = self.clients_info[client_id].get('current_rank', self.args.rank) if getattr(self.args, 'adaptive_rank', False) else self.args.rank
+                # send_data(conn, client_rank)
 
             if round_num >= 2 and self.prune == 1 and self.args.model != 'clip':
                 logger.info("--- SERVER: PRUNING START (Round 2) ---")
@@ -1054,10 +1074,7 @@ def parse_args():
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--clients-per-round', type=int, default=8)
     parser.add_argument('--rounds', type=int, default=5)
-    parser.add_argument('--dataset', type=str, default='Cifar10', choices=['Cifar10', 
-                                                                           'MNIST', 'FashionMNIST', 
-                                                                           'Cifar100', 
-                                                                           "OxfordPets"])
+    parser.add_argument('--dataset', type=str, default='Cifar10')
     parser.add_argument('--test-client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
     parser.add_argument('--num-classes', type=int, default=100)
