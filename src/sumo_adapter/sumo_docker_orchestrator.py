@@ -476,6 +476,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         rounds=3,  # No modo descentralizado, o cliente roda em loop infinito
         prune=args.prune,
         ala=args.ala,
+        exp_name='default_exp_v2x',
         output_path=PROJECT_ROOT,
     )
 

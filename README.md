@@ -232,7 +232,113 @@ tmux kill-server
 
 ---
 
-## 🚀 Method 3: Manual Execution
+## 🚀 Method 3: V2X-Docker Execution
+
+This method simulates **Vehicular Federated Learning (V2X)** using [SUMO](https://eclipse.dev/sumo/) for urban vehicle mobility and Docker containers as decentralized FL clients. Vehicles train locally and exchange model weights via **D-PSGD (Decentralized Parallel SGD)** when they come within communication range; no central server is required.
+
+### Prerequisites
+
+In addition to the base prerequisites (Docker, docker-tc), you need **SUMO** installed:
+
+```bash
+sudo apt install sumo sumo-tools
+```
+
+Verify the installation:
+```bash
+sumo --version
+```
+
+### Step 1: Generate the Non-IID Dataset
+
+```bash
+uv run python src/dataset/generate_MNIST.py noniid - dir
+```
+
+### Step 2: Run the V2X Simulation
+
+Navigate to the `sumo_adapter` directory and execute the orchestrator:
+
+```bash
+cd src/sumo_adapter/
+
+# First run or after code changes
+sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+    --sumo-cfg maps/grid.sumocfg \
+    --build --gui"
+
+# Default run (headless, 5 vehicles, MNIST, max 4 encounters)
+sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+    --sumo-cfg maps/grid.sumocfg"
+
+# With SUMO GUI + custom parameters
+sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+    --sumo-cfg maps/grid.sumocfg \
+    --gui \
+    --total-clients 5 \
+    --encounters 4 \
+    --radius 300 \
+    --dataset MNIST \
+    --warmup 60 \
+    --cooldown 30"
+```
+
+> **Note:** `sg docker -c "..."` runs the command with Docker group permissions. Alternatively, run `sudo chmod 666 /var/run/docker.sock` once to avoid wrapping every command.
+
+### 📖 Orchestrator Arguments
+
+**SUMO & Simulation:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--sumo-cfg` | Path to the `.sumocfg` file (**required**) | — |
+| `--gui` | Open SUMO graphical interface | headless |
+| `--step-length` | Duration of each SUMO step in seconds | `1.0` |
+
+**V2X Communication:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--radius` | V2X communication radius in meters | `300` |
+| `--min-clients` | Minimum vehicles to form a cluster | `2` |
+| `--min-contact-time` | Minimum ETC (seconds) to trigger encounter | `6.0` |
+
+**Simulation Control:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--total-clients` | Total vehicle containers to create | `5` |
+| `--encounters` | Maximum viable encounters before stopping | `4` |
+| `--warmup` | Seconds to wait before signaling encounters (containers boot + first epoch) | `60` |
+| `--cooldown` | Seconds between consecutive encounters (prevents encounter spam) | `30` |
+
+**Training:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--dataset` | Dataset: `MNIST`, `Cifar10`, `Cifar100` | `MNIST` |
+| `--prune` | Adaptive pruning: `0`=yes, `1`=no | `1` |
+| `--ala` | FedALA: `0`=yes, `1`=no (FedAvg) | `1` |
+| `--build` | Force Docker image rebuild | disabled |
+
+### Step 3: Monitor the Simulation
+
+The orchestrator prints real-time logs showing encounter formation, ETC values, and P2P exchange progress:
+
+```
+10:27:42 [INFO] Encontro 1/4! Veiculos ['veh_0', 'veh_3'] (Clientes [0, 1]) | ETC=120.0s
+10:27:42 [INFO] SUMO PAUSADO. Aguardando 2 clientes completarem troca P2P do encontro 1...
+10:27:57 [INFO]   ... 1/2 .pt recebidos (15s)
+10:28:20 [INFO] Todos os 2 .pt recebidos em 38s! Aguardando 5s para agregacao...
+10:28:25 [INFO] SUMO RETOMADO.
+```
+
+To inspect individual container logs during execution:
+```bash
+sg docker -c "docker compose -f docker-compose.v2x.yml logs -f fl-client-v2x-0"
+```
+
+## 🚀 Method 4: Manual Execution
 
 To isolate logs and debug specific client-server interactions, open multiple terminal windows manually. There is no need to activate virtual environments.
 
@@ -264,3 +370,4 @@ After the simulation completes, performance metrics (Accuracy, Loss, Model Size 
 - **Logs & Results**: Saved in the `src/results/<experiment_name>/` directory.
 - **Model Weights**: Saved in the `src/system/saved_weights/` directory (if saving is enabled).
 - **Aggregated Data**: May also be exported to `src/system/dados_compartilhados/`.
+

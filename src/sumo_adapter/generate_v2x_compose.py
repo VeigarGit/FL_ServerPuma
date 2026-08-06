@@ -25,6 +25,7 @@ def generate(
     rounds: int,
     prune: int,
     ala: int,
+    exp_name: str,
     output_path: Path,
 ) -> str:
     """Gera um docker-compose.yml customizado para o modo V2X descentralizado.
@@ -84,9 +85,9 @@ x-client-template: &client
   labels:
     - "com.docker-tc.enabled=1"
     # Taxa efetiva tipica do DSRC 802.11p (canal de servico SCH)
-    - "com.docker-tc.limit=7mbit"
+    - "com.docker-tc.limit=100mbit"
     # Latencia de comunicacao V2X (propagacao + processamento)
-    - "com.docker-tc.delay=40ms"
+    - "com.docker-tc.delay=5ms"
     # Perda de pacotes em cenario urbano (interferencia + multipath)
     - "com.docker-tc.loss=3%"
 
@@ -109,6 +110,7 @@ services:
       --rounds {rounds}
       --prune {prune}
       --ala {ala}
+      --exp-name {exp_name}
 
 """
 
