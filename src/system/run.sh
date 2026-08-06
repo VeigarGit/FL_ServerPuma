@@ -41,7 +41,7 @@ USE_CPU=0
 
 # Pruning
 PRUNE=1
-PRUNE_FREQ=1
+PRUNE_FREQ=0
 SORA_PRUNE=0
 
 # ALA
@@ -60,6 +60,11 @@ RANDOM_PACA=0
 PACA_MIN=1
 PACA_MAX=12
 PACA_LIST=""
+
+# Rank Adaptativo
+ADAPTIVE_RANK=0
+ADAPTIVE_RANK_MIN=2
+ADAPTIVE_RANK_MAX=8
 
 # Persistência de Modelo
 WEIGHTS_DIR="saved_weights"
@@ -121,6 +126,11 @@ Opções de PaCA:
   --paca-min <n>              PaCA mínimo para modo aleatório (padrão: 1)
   --paca-max <n>              PaCA máximo para modo aleatório (padrão: 12)
   --paca-list <lista>         Lista de PaCA por cliente (ex: "4,8,12")
+
+Opções de Rank Adaptativo:
+  --adaptive-rank             Habilitar rank adaptativo no servidor
+  --adaptive-rank-min <n>     Rank mínimo no rank adaptativo (padrão: 2)
+  --adaptive-rank-max <n>     Rank máximo no rank adaptativo (padrão: 8)
 
 Persistência de Modelo:
   --save [path]               Salvar modelo (path opcional, gera nome automático)
@@ -187,6 +197,11 @@ while [ $# -gt 0 ]; do
         --paca-min) PACA_MIN="$2"; shift 2 ;;
         --paca-max) PACA_MAX="$2"; shift 2 ;;
         --paca-list) PACA_LIST="$2"; shift 2 ;;
+
+        # Rank Adaptativo
+        --adaptive-rank) ADAPTIVE_RANK=1; shift 1 ;;
+        --adaptive-rank-min) ADAPTIVE_RANK_MIN="$2"; shift 2 ;;
+        --adaptive-rank-max) ADAPTIVE_RANK_MAX="$2"; shift 2 ;;
 
         # Persistência de Modelo
         --save)
@@ -334,6 +349,9 @@ for RUN in $(seq $START_RUN $END_RUN); do
     SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME"
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-paca"
+    fi
+    if [ "$ADAPTIVE_RANK" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --adaptive-rank --adaptive-rank-min $ADAPTIVE_RANK_MIN --adaptive-rank-max $ADAPTIVE_RANK_MAX"
     fi
     if [ "$SORA_PRUNE" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --sora-prune"

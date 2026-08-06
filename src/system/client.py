@@ -489,13 +489,13 @@ def main():
                         # Atualiza o run_config para que o treino use o novo PaCA
                         run_config["model"]["paca"]["upper_layers"] = server_paca
 
-                    # #fazer a mesma coisa para receber um valor do server para o r
-                    # server_r, _ = recv_data(s)
-                    # if server_r is not None and server_r != args.rank:
-                    #     logger.info(f"r adaptativo: servidor ajustou {args.rank} -> {server_r}")
-                    #     args.rank = server_r
-                    #     # Atualiza o run_config para que o treino use o novo r
-                    #     run_config["model"]["lora"]["r"] = server_r
+                    # fazer a mesma coisa para receber um valor do server para o r
+                    server_r, _ = recv_data(s)
+                    if server_r is not None and server_r != args.rank:
+                        logger.info(f"r adaptativo: servidor ajustou {args.rank} -> {server_r}")
+                        args.rank = server_r
+                        # Atualiza o run_config para que o treino use o novo r
+                        run_config["model"]["lora"]["r"] = server_r
 
                 global_state, _ = recv_data(s)
                 prune, _ = recv_data(s)

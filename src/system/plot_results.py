@@ -130,17 +130,20 @@ def parse_experiment(exp_name, results_base="../results"):
     algo      = match.group('algo')
 
     # Label legível para os gráficos
+    is_adap_rank = any(term in exp_name.lower() for term in ["adap_rank", "adaptrank", "adaptive_rank"])
+    rank_str = f"r={rank} (AdaRank)" if is_adap_rank else f"r={rank}"
+
     if "adalora" in exp_name.lower():
-        label = f"AdaLoRA r={rank}"
+        label = f"AdaLoRA {rank_str}"
     elif "sora" in exp_name.lower():
         if "adaptpaca" in exp_name.lower():
-            label = f"PUMA-GT r={rank}"
+            label = f"PUMA-GT {rank_str}"
         else:
-            label = f"Static SoRa r={rank}"
+            label = f"Static SoRa {rank_str}"
     elif "lora" in exp_name.lower():
-        label = f"LoRA r={rank}"
+        label = f"LoRA {rank_str}"
     else:
-        label = f"{strategy.upper()} r={rank} p={paca} ({algo})"
+        label = f"{strategy.upper()} {rank_str} p={paca} ({algo})"
         if "withou" not in prune_str.lower():
             label += " +prune"
 
@@ -958,10 +961,10 @@ def plot_15_mb_vs_tempo(experiments, output_dir):
 # Experimentos para plotar (Adicione ou remova itens desta lista)
 # ==============================================================================
 EXPERIMENTOS_PARA_PLOTAR = [
-    "lora_rank2",
-    "lora_rank8",
-    "sora_estatico_rank2",
-    "sora_estatico_rank8"
+    "pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260802_095514",
+    "sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260802_011456",
+    "lora_padrao_clip_lora_prune1_ala1_paca12_20260801_180443",
+    "pumagt_adap_rank_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260805_183756"
 ]
 
 def main():

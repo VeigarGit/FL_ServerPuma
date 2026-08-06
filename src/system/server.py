@@ -305,7 +305,7 @@ class FederatedLearningServer:
         local_out, local_in = local_val.shape
         global_out, global_in = global_val.shape
         
-        aligned = torch.zeros_like(global_val)
+        aligned = global_val.clone()
         min_out = min(local_out, global_out)
         min_in = min(local_in, global_in)
         aligned[:min_out, :min_in] = local_val[:min_out, :min_in]
@@ -318,7 +318,7 @@ class FederatedLearningServer:
         local_len = local_val.shape[0]
         global_len = global_val.shape[0]
         
-        aligned = torch.zeros_like(global_val)
+        aligned = global_val.clone()
         min_len = min(local_len, global_len)
         aligned[:min_len] = local_val[:min_len]
         return aligned
@@ -476,6 +476,119 @@ class FederatedLearningServer:
                     f"(bw={bandwidth:.2f} MB/s, time={training_time:.1f}s, target={target_latency:.1f}s)")
         return ideal_paca
 
+    def calculate_adaptive_rank(self, client_id):
+        try:
+            client_info = self.clients_info[client_id]
+        except KeyError:
+            return self.args.rank
+            
+        bandwidth = client_info.get('bandwidth')
+        training_time = client_info.get('training_time')
+        current_rank = client_info.get('current_rank', self.args.rank)
+        max_rank = getattr(self.args, 'adaptive_rank_max', 8)
+        min_rank = getattr(self.args, 'adaptive_rank_min', 2)
+
+        # Sem dados suficientes, mantém o atual
+        if bandwidth is None or training_time is None:
+            return current_rank
+
+        target_latency = getattr(self, 'time_threshold', 60.0)
+        
+        # --- 1. Sinal da Acurácia Global ---
+        last_reduction_round = client_info.get('last_rank_reduction_round', 0)
+        current_round = len(self.rs_test_acc)
+        cooldown_rounds = 5
+        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
+
+        acc_signal = self._check_accuracy_signal_rank(client_id, current_rank, min_rank, max_rank, in_cooldown)
+        
+        # Acurácia despencou (Pânico! Reversão tem prioridade)
+        if acc_signal is not None and acc_signal > current_rank:
+            client_info['last_rank_reduction_round'] = current_round
+            return acc_signal
+            
+        # --- 2. Sinal de Loss Local (Dificuldade do cliente) ---
+        global_loss = self.rs_test_loss[-1] if self.rs_test_loss else 1.0
+        client_loss = client_info.get('last_loss', 0.0)
+        
+        is_difficult_client = (client_loss > global_loss * 1.2)
+        
+        if is_difficult_client:
+            if current_rank < max_rank:
+                logger.info(f"Rank adaptativo {client_id}: cliente difícil (loss={client_loss:.4f} > global={global_loss:.4f}*1.2). Forçando subida {current_rank} -> {current_rank + 1}")
+                return current_rank + 1
+            return current_rank
+
+        # --- 3. Acurácia Estável (Platô) ---
+        if acc_signal is not None and acc_signal < current_rank:
+            client_info['last_rank_reduction_round'] = current_round
+            return acc_signal
+
+        # --- 4. Sinal de Latência (Padrão) ---
+        # Cliente está rápido: pode subir o rank (se não estiver no máximo)
+        if training_time <= target_latency:
+            if training_time < target_latency * 0.7 and current_rank < max_rank:
+                new_rank = min(current_rank + 1, max_rank)
+                logger.debug(f"Rank adaptativo {client_id}: subindo {current_rank} -> {new_rank} "
+                             f"(tempo={training_time:.1f}s << threshold={target_latency:.1f}s)")
+                return new_rank
+            return current_rank
+
+        # Cliente está lento: reduz o rank em 1
+        if current_rank > min_rank:
+            new_rank = current_rank - 1
+            logger.info(f"Rank adaptativo {client_id}: reduzindo {current_rank} -> {new_rank} "
+                        f"(tempo={training_time:.1f}s > threshold={target_latency:.1f}s)")
+            client_info['last_rank_reduction_round'] = current_round
+            return new_rank
+
+        return current_rank
+        
+    def _check_accuracy_signal_rank(self, client_id, current_rank, rank_min, max_rank, in_cooldown=False):
+        """
+        Verifica se a acurácia indica que o Rank pode ser ajustado.
+        - Reversão (Pânico): SEMPRE ativa. Se a acurácia caiu >2pp após redução, reverte +2.
+        - Plateau: APENAS fora do cooldown. Se estabilizou, reduz -1.
+        """
+        acc_history = self.rs_test_acc
+        window = 5
+        
+        if len(acc_history) < window:
+            return None
+        
+        recent = acc_history[-window:]
+        mean_acc = sum(recent) / len(recent)
+        std_acc = (sum((x - mean_acc) ** 2 for x in recent) / len(recent)) ** 0.5
+        
+        rank_before_last_change = self.clients_info[client_id].get('rank_before_change')
+        if rank_before_last_change is not None and rank_before_last_change > current_rank:
+            acc_before_window = acc_history[-(window + 1):-1] if len(acc_history) > window else acc_history[:window]
+            mean_before = sum(acc_before_window) / len(acc_before_window)
+            
+            if mean_acc < mean_before - 2.0:
+                new_rank = min(current_rank + 2, max_rank)
+                logger.info(f"Rank adaptativo {client_id}: REVERTENDO {current_rank} -> {new_rank} "
+                            f"(acurácia caiu: {mean_before:.1f}% -> {mean_acc:.1f}%)")
+                self.clients_info[client_id]['rank_before_change'] = current_rank
+                return new_rank
+        
+        if in_cooldown:
+            return None
+            
+        best_acc = max(acc_history) if acc_history else 0.0
+        min_acc_for_plateau = best_acc * 0.90
+        
+        if (std_acc < 0.5 
+                and current_rank > rank_min 
+                and mean_acc >= min_acc_for_plateau):
+            new_rank = current_rank - 1
+            logger.info(f"Rank adaptativo {client_id}: reduzindo {current_rank} -> {new_rank} "
+                        f"(acurácia estável: {mean_acc:.1f}% ± {std_acc:.2f}%)")
+            self.clients_info[client_id]['rank_before_change'] = current_rank
+            return new_rank
+        
+        return None
+
     def _check_accuracy_signal(self, client_id, current_paca, paca_min, max_paca, in_cooldown=False):
         """
         Verifica se a acurácia indica que o PaCA pode ser ajustado.
@@ -607,24 +720,19 @@ class FederatedLearningServer:
                         logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
                                     f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
 
-            # # Todo Modificar para logica do rank adaptativo
-
-            # if self.args.model == 'clip' and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
-            #     ideal_paca = self.calculate_adaptive_paca(client_id)
-            #     self.clients_info[client_id]['current_paca'] = ideal_paca
-            #     
-            #     # Filtra: remove chaves de camadas fora do PaCA ideal
-            #     min_layer = self.total_encoder_layers - ideal_paca
-            #     if min_layer > 0:
-            #         keys_before = len(current_global_state)
-            #         current_global_state = {
-            #             k: v for k, v in current_global_state.items()
-            #             if not self._is_excluded_by_paca(k, min_layer)
-            #         }
-            #         keys_after = len(current_global_state)
-            #         if keys_before != keys_after:
-            #             logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
-            #                         f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
+            # --- RANK ADAPTATIVO (só para CLIP, a partir do round 2, se ativado) ---
+            if self.args.model == 'clip' and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
+                ideal_rank = self.calculate_adaptive_rank(client_id)
+                self.clients_info[client_id]['current_rank'] = ideal_rank
+                
+                # Slicing de Rank
+                for k, v in current_global_state.items():
+                    if '.lora_A' in k:
+                        current_global_state[k] = v[:ideal_rank, :].clone()
+                    elif '.lora_B' in k:
+                        current_global_state[k] = v[:, :ideal_rank].clone()
+                    elif '.gate' in k:
+                        current_global_state[k] = v[:, :ideal_rank].clone()
 
             
             # --- Problema #4: Envia PaCA dinâmico para que o cliente treine apenas as camadas necessárias ---
@@ -632,8 +740,8 @@ class FederatedLearningServer:
                 client_paca = self.clients_info[client_id].get('current_paca', self.args.paca) if getattr(self.args, 'adaptive_paca', False) else self.args.paca
                 send_data(conn, client_paca)
 
-                # client_rank = self.clients_info[client_id].get('current_rank', self.args.rank) if getattr(self.args, 'adaptive_rank', False) else self.args.rank
-                # send_data(conn, client_rank)
+                client_rank = self.clients_info[client_id].get('current_rank', self.args.rank) if getattr(self.args, 'adaptive_rank', False) else self.args.rank
+                send_data(conn, client_rank)
 
             if round_num >= 2 and self.prune == 1 and self.args.model != 'clip':
                 logger.info("--- SERVER: PRUNING START (Round 2) ---")
@@ -742,6 +850,7 @@ class FederatedLearningServer:
                 with self.lock:
                     client_accuracies.append(client_test_acc)
                     client_losses.append(client_test_loss)
+                self.clients_info[client_id]['last_loss'] = client_test_loss
             
             media_rate = (sum(bit_rate) / len(bit_rate)) / 8 / (1024 * 1024)
             self.clients_info[client_id]['bandwidth'] = media_rate
@@ -897,6 +1006,7 @@ class FederatedLearningServer:
                     'last_params': None,
                     'dataset_size': 1.0,
                     'current_paca': self.args.paca,  # PaCA atual do cliente (dinâmico)
+                    'current_rank': self.args.rank,  # Rank atual do cliente (dinâmico)
                 }
                 
                 logger.info(f"Client {len(self.client_connections) + 1} connected: {addr}")
@@ -1100,6 +1210,9 @@ def parse_args():
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')
     parser.add_argument('--adaptive-paca', action='store_true', help='Ativa PaCA dinâmico: servidor ajusta automaticamente o número de camadas por cliente baseado em latência')
     parser.add_argument('--adaptive-paca-min', type=int, default=2, help='Número mínimo de camadas que o PaCA adaptativo pode alcançar')
+    parser.add_argument('--adaptive-rank', action='store_true', help='Ativa rank adaptativo: servidor ajusta automaticamente o rank por cliente baseado em latência')
+    parser.add_argument('--adaptive-rank-min', type=int, default=2, help='Rank mínimo para o rank adaptativo')
+    parser.add_argument('--adaptive-rank-max', type=int, default=8, help='Rank máximo para o rank adaptativo')
     parser.add_argument('--min-rank', type=int, default=2, help='Rank mínimo permitido por módulo SoRA durante poda iterativa')
     parser.add_argument('--sora-prune', action='store_true', help='Ativa poda iterativa de rank do SoRA (independente do --prune CNN)')
     return parser.parse_args()
