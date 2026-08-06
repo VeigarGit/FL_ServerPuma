@@ -91,9 +91,9 @@ class FederatedLearningServer:
                 elif args.strategy == 'full_ft':
                     print("Linha 91 =========================================")
                     config["model"]["lora"]["mode"] = "without_lora"
-                # elif args.strategy == 'adalora':
-                #     print("Linha Adalora =========================================")
-                #     config["model"]["lora"]["mode"] = "with_adalora"
+                elif args.strategy == 'adalora':
+                    print("Linha AdaLoRA =========================================")
+                    config["model"]["lora"]["mode"] = "with_adalora"
                     
                 if "paca" not in config["model"]:
                     config["model"]["paca"] = {}
@@ -1205,7 +1205,7 @@ def parse_args():
     
     parser.add_argument('--run-id', type=int, default=1, help='ID da simulação atual')
     parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão com timestamp')
-    parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
+    parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'adalora', 'sora_with_schedule', 'sora_no_schedule'])
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA')
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')
     parser.add_argument('--adaptive-paca', action='store_true', help='Ativa PaCA dinâmico: servidor ajusta automaticamente o número de camadas por cliente baseado em latência')

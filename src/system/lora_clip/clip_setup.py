@@ -16,8 +16,14 @@ from transformers import CLIPModel, CLIPProcessor
 from .sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
 
 DEFAULT_CONFIG_PATH = Path("train_config.yml")
-VALID_LORA_MODES = {"with_lora", "without_lora", "both", "with_sora_no_schedule", "with_sora_schedule"}
-# VALID_LORA_MODES = {"with_lora", "without_lora", "both", "with_sora_no_schedule", "with_sora_schedule", "with_adalora"}
+VALID_LORA_MODES = {
+    "with_lora",
+    "with_adalora",
+    "without_lora",
+    "both",
+    "with_sora_no_schedule",
+    "with_sora_schedule",
+}
 SORA_MODES = {"with_sora_no_schedule", "with_sora_schedule"}
 
 class CLIPForClassification(nn.Module):
@@ -210,7 +216,7 @@ def apply_sora(model, lora_config, upper_k=None):
         for target in target_modules:
             if not name.endswith(target):
                 continue
-            
+
             # Filtro PaCA: Verifica se a camada está entre as últimas 'upper_k'
             if upper_k is not None:
                 if "encoder.layers." not in name:
@@ -400,6 +406,31 @@ def build_model(config, num_classes, device):
         
         peft_config = LoraConfig(
             r=lora_config["r"],
+            lora_alpha=lora_config["alpha"],
+            target_modules=lora_config["target_modules"],
+            lora_dropout=lora_config["dropout"],
+            bias=lora_config["bias"],
+            layers_to_transform=layers_to_transform,
+        )
+        model.vision_model = get_peft_model(model.vision_model, peft_config)
+    elif mode == "with_adalora":
+        # PaCA: restringe LoRA às últimas upper_k camadas do encoder
+        # Referência: PEFT LoraConfig.layers_to_transform (documentação oficial HuggingFace)
+        total_layers = len(vision_model.encoder.layers)
+        layers_to_transform = list(range(total_layers - upper_k, total_layers)) if upper_k else None
+        adalora_config = config["model"]["adalora"]
+
+        peft_config = AdaLoraConfig(
+            r=lora_config["r"],
+            init_r=adalora_config["init_r"],
+            target_r=adalora_config["target_r"],
+            tinit=adalora_config["tinit"],
+            tfinal=adalora_config["tfinal"],
+            deltaT=adalora_config["deltaT"],
+            beta1=adalora_config["beta1"],
+            beta2=adalora_config["beta2"],
+            total_step=adalora_config["total_step"],
+            orth_reg_weight=adalora_config.get("orth_reg_weight", 0.5),
             lora_alpha=lora_config["alpha"],
             target_modules=lora_config["target_modules"],
             lora_dropout=lora_config["dropout"],
@@ -623,10 +654,14 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     # Cache: evita chamada a next(model.parameters()) a cada batch
     model_dtype = next(model.parameters()).dtype
 
-    # # Identifica se é o AdaLoRA original do PEFT
-    # is_adalora = hasattr(model, "base_model") and hasattr(model.base_model, "update_and_allocate")
-    # if is_adalora and not hasattr(model, "adalora_global_step"):
-    #     model.adalora_global_step = 0
+    # Identifica o AdaLoRA do PEFT, que envolve apenas o vision_model.
+    is_adalora = (
+        hasattr(model, "vision_model")
+        and hasattr(model.vision_model, "base_model")
+        and hasattr(model.vision_model.base_model, "update_and_allocate")
+    )
+    if is_adalora and not hasattr(model, "adalora_global_step"):
+        model.adalora_global_step = 0
 
     for pixel_values, labels in tqdm(loader, desc="train", leave=False, disable=True):
         pixel_values = pixel_values.to(device, dtype=model_dtype)
@@ -645,6 +680,10 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
 
         loss.backward()
         optimizer.step()
+
+        if is_adalora:
+            model.vision_model.base_model.update_and_allocate(model.adalora_global_step)
+            model.adalora_global_step += 1
         # GateSparsifier.step(): aplica APENAS softshrink (proximal step)
         # SparseAdamW.step(): AdamW completo + softshrink (trainer standalone)
         if sparse_optimizer is not None:

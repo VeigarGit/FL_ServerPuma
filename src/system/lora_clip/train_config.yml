@@ -15,14 +15,16 @@ model:
       - v_proj
       - out_proj
 
-  # adalora:
-  #   target_r: 8
-  #   tinit: 200
-  #   tfinal: 1000
-  #   deltaT: 10
-  #   beta1: 0.85
-  #   beta2: 0.85
-  #   total_step: 1500
+  adalora:
+    init_r: 8
+    target_r: 1
+    tinit: 100
+    tfinal: 100
+    deltaT: 10
+    beta1: 0.85
+    beta2: 0.85
+    orth_reg_weight: 0.5
+    total_step: 500
   paca:                     # ← NOVO
     enabled: true
     #Testar para todas as camadas com fine tuning

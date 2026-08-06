@@ -322,8 +322,7 @@ def parse_args():
     parser.add_argument('--experiments', type=int, default=1)
     parser.add_argument('--run-id', type=int, default=1)
     parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão com timestamp')
-    parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'])
-    # parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule', 'adalora'])
+    parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'adalora', 'sora_with_schedule', 'sora_no_schedule'])
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA') 
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas para a estratégia PaCA')
     
@@ -408,12 +407,12 @@ def main():
             
             if args.strategy == 'lora':
                 config["model"]["lora"]["mode"] = "with_lora"
+            elif args.strategy == 'adalora':
+                config["model"]["lora"]["mode"] = "with_adalora"
             elif args.strategy == 'sora_with_schedule':
                 config["model"]["lora"]["mode"] = "with_sora_schedule"
             elif args.strategy == 'sora_no_schedule':
                 config["model"]["lora"]["mode"] = "with_sora_no_schedule"
-            # elif args.strategy == 'adalora':
-            #     config["model"]["lora"]["mode"] = "with_adalora"
 
                 
             if "paca" not in config["model"]:
