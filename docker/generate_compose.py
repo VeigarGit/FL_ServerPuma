@@ -6,7 +6,7 @@ def generate_docker_compose(num_clients, dataset, rounds, prune, ala):
 x-client-template: &client
   build:
     context: .
-    dockerfile: dockerfile.client
+    dockerfile: docker/dockerfile.client
     args:
       - NO_CACHE=true
   image: fl-client-image
@@ -37,7 +37,7 @@ services:
   server:
     build:
       context: .
-      dockerfile: dockerfile.server
+      dockerfile: docker/dockerfile.server
       args:
         - NO_CACHE=true
     container_name: fl-server
@@ -81,7 +81,9 @@ networks:
     driver: bridge
 """
 
-    with open('docker-compose.generated.yml', 'w') as f:
+    compose_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    with open(os.path.join(compose_dir, 'docker-compose.generated.yml'), 'w') as f:
         f.write(template)
     
     print(f"Gerado docker-compose com {num_clients} clientes | Dataset: {dataset} | Rounds: {rounds} | Prune: {prune} | ALA: {ala}")

@@ -1,7 +1,7 @@
 x-client-template: &client
   build:
     context: .
-    dockerfile: dockerfile.client
+    dockerfile: docker/dockerfile.client
     args:
       # Argumento de build para invalidar cache quando necessario
       - NO_CACHE=true
@@ -35,9 +35,9 @@ x-client-template: &client
   labels:
     - "com.docker-tc.enabled=1"
     # Taxa efetiva tipica do DSRC 802.11p (canal de servico SCH)
-    - "com.docker-tc.limit=7mbit"
+    - "com.docker-tc.limit=100mbit"
     # Latencia de comunicacao V2X (propagacao + processamento)
-    - "com.docker-tc.delay=40ms"
+    - "com.docker-tc.delay=5ms"
     # Perda de pacotes em cenario urbano (interferencia + multipath)
     - "com.docker-tc.loss=3%"
 
@@ -53,6 +53,7 @@ services:
       --rounds 3
       --prune 1
       --ala 1
+      --exp-name default_exp_v2x
 
   client-v2x-1:
     <<: *client
@@ -65,6 +66,7 @@ services:
       --rounds 3
       --prune 1
       --ala 1
+      --exp-name default_exp_v2x
 
   client-v2x-2:
     <<: *client
@@ -77,6 +79,7 @@ services:
       --rounds 3
       --prune 1
       --ala 1
+      --exp-name default_exp_v2x
 
   client-v2x-3:
     <<: *client
@@ -89,6 +92,7 @@ services:
       --rounds 3
       --prune 1
       --ala 1
+      --exp-name default_exp_v2x
 
   client-v2x-4:
     <<: *client
@@ -101,6 +105,7 @@ services:
       --rounds 3
       --prune 1
       --ala 1
+      --exp-name default_exp_v2x
 
 networks:
   docker-tc:

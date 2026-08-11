@@ -26,7 +26,6 @@ def generate(
     prune: int,
     ala: int,
     exp_name: str,
-    output_path: Path,
 ) -> str:
     """Gera um docker-compose.yml customizado para o modo V2X descentralizado.
     
@@ -37,7 +36,7 @@ def generate(
                 descentralizado o cliente roda em loop infinito)
         prune: Flag de pruning (0=ativo, 1=desativado)
         ala: Flag de FedALA (0=ativo, 1=desativado/FedAvg)
-        output_path: Diretorio raiz do projeto onde o arquivo sera salvo
+        exp_name: Nome do experimento para salvar os resultados
     
     Returns:
         Caminho absoluto do arquivo docker-compose.v2x.yml gerado
@@ -51,7 +50,7 @@ def generate(
 x-client-template: &client
   build:
     context: .
-    dockerfile: dockerfile.client
+    dockerfile: docker/dockerfile.client
     args:
       # Argumento de build para invalidar cache quando necessario
       - NO_CACHE=true
@@ -124,7 +123,10 @@ networks:
 """
 
     # Salvar o arquivo no diretorio raiz do projeto
-    compose_path = output_path / COMPOSE_FILE
+    project_root = Path(__file__).resolve().parents[2]
+    compose_dir = project_root / "docker"
+    compose_dir.mkdir(parents=True, exist_ok=True)
+    compose_path = compose_dir / COMPOSE_FILE
     with open(compose_path, "w") as f:
         f.write(template)
 

@@ -368,7 +368,7 @@ def docker_compose_up(compose_file: str, project_root: Path, build: bool = False
     Returns:
         True se o comando foi bem sucedido, False caso contrario
     """
-    cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
+    cmd = ["docker", "compose", "--project-directory", ".", "-f", compose_file, "up", "-d"]
     if build:
         cmd.insert(-1, "--build")
         log.info("Iniciando conteineres Docker...")
@@ -394,7 +394,7 @@ def docker_compose_down(compose_file: str, project_root: Path) -> None:
     """
     log.info("Encerrando conteineres Docker...")
     subprocess.run(
-        ["docker", "compose", "-f", compose_file, "down", "--remove-orphans", "-v"],
+        ["docker", "compose", "--project-directory", ".", "-f", compose_file, "down", "--remove-orphans", "-v"],
         cwd=str(project_root),
         capture_output=True, text=True, timeout=120,
     )
@@ -470,6 +470,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
     # ── PASSO 2: Gerar Docker Compose e iniciar conteineres ──────────────
     client_indices = list(range(args.total_clients))
+    
     compose_file = compose_generate(
         client_indices=client_indices,
         dataset=args.dataset,
@@ -477,7 +478,6 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         prune=args.prune,
         ala=args.ala,
         exp_name='default_exp_v2x',
-        output_path=PROJECT_ROOT,
     )
 
     if not docker_compose_up(compose_file, PROJECT_ROOT, build=args.build):

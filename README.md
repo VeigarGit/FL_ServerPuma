@@ -58,7 +58,8 @@ This method containerizes the server and clients using highly optimized Multi-st
 **1. Generate the Docker Compose file dynamically:**
 Use `generate_compose.py` to set up your experiment parameters.
 ```bash
-uv run generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --prune 1 --ala 0
+cd docker/
+uv run python generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --prune 1 --ala 0
 ```
 *Parameters:*
 * `--clients`: Number of clients to simulate.
@@ -69,16 +70,16 @@ uv run generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --prune 1 -
 
 **2. Build and run the simulation:**
 ```bash
-# Build the images and start the containers in the background
-docker compose -f docker-compose.generated.yml up --build -d
+# Build the images and start the containers in the background (from the docker folder)
+docker compose --project-directory .. -f docker-compose.generated.yml up --build -d
 
 # Follow the live logs to monitor the training process
-docker compose -f docker-compose.generated.yml logs -f
+docker compose --project-directory .. -f docker-compose.generated.yml logs -f
 ```
 
 **3. Cleanup:**
 ```bash
-docker compose -f docker-compose.generated.yml down
+docker compose --project-directory .. -f docker-compose.generated.yml down
 ```
 
 ---
