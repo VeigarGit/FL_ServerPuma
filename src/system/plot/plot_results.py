@@ -23,7 +23,7 @@ Gráficos gerados (14 no total):
     14 - Resumo comparativo (barras: acc, loss, tempo, banda)
     15 - MB acumulados vs tempo real (wall-clock)
 
-Os gráficos são salvos em: ../results/graficos_comparativos/
+Os gráficos são salvos em: ../../results/graficos_comparativos/
 """
 
 import os
@@ -97,7 +97,7 @@ def _save_and_close(fig, output_dir, filename):
 # Funções de carregamento
 # ==============================================================================
 
-def parse_experiment(exp_name, results_base="../results"):
+def parse_experiment(exp_name, results_base="../../results"):
     """Analisa um diretório de experimento e retorna seus metadados + dados."""
     results_dir = os.path.join(results_base, exp_name)
     if not os.path.isdir(results_dir):
@@ -998,7 +998,7 @@ def main():
     if len(experiments) == 1:
         output_dir = os.path.join(experiments[0]['results_dir'], "graficos")
     else:
-        output_dir = os.path.join("..", "results", "graficos_comparativos")
+        output_dir = os.path.join("..", "..", "results", "graficos_comparativos")
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n{'='*60}")

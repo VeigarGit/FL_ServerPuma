@@ -36,7 +36,7 @@ if str(parent_dir) not in sys.path:
 # -----------------------------------------------------------------
 
 from model import SimpleModel
-from data_utils import read_client_data
+from utils.data_utils import read_client_data
 from prunning import prune_and_restructure
 from size_mode import get_model_size, get_trainable_size_and_params
 from synexp import LayerComplexityCalculator

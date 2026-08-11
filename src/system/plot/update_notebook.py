@@ -10,7 +10,7 @@ for cell in nb['cells']:
             # Replace old directory constants
             if 'SERVER_RESULTS_DIR = "../results/"' in line:
                 new_source.append('EXP_NAME = "fl_session_TODO" # INSIRA O NOME DA PASTA DO SEU EXPERIMENTO AQUI (ex: fl_session_20260706_120400)\n')
-                new_source.append('RESULTS_DIR = f"../results/{EXP_NAME}/"\n')
+                new_source.append('RESULTS_DIR = f"../../results/{EXP_NAME}/"\n')
                 continue
             if 'CLIENT_RESULTS_DIR = "./dados_compartilhados/"' in line:
                 continue # We'll just use RESULTS_DIR for both now
@@ -31,11 +31,11 @@ for cell in nb['cells']:
                 
             # Replace hardcoded directory paths in other cells
             if 'results_dir = "../results"' in line:
-                line = line.replace('results_dir = "../results"', 'results_dir = f"../results/{EXP_NAME}"')
+                line = line.replace('results_dir = "../results"', 'results_dir = f"../../results/{EXP_NAME}"')
             if 'RESULTS_DIR = "../results/*.h5"' in line:
-                line = line.replace('RESULTS_DIR = "../results/*.h5"', 'RESULTS_DIR = f"../results/{EXP_NAME}/server_*.h5"')
+                line = line.replace('RESULTS_DIR = "../results/*.h5"', 'RESULTS_DIR = f"../../results/{EXP_NAME}/server_*.h5"')
             if 'CLIENT_RESULTS_DIR = "./dados_compartilhados/*.h5"' in line:
-                line = line.replace('CLIENT_RESULTS_DIR = "./dados_compartilhados/*.h5"', 'CLIENT_RESULTS_DIR = f"../results/{EXP_NAME}/client_*.h5"')
+                line = line.replace('CLIENT_RESULTS_DIR = "./dados_compartilhados/*.h5"', 'CLIENT_RESULTS_DIR = f"../../results/{EXP_NAME}/client_*.h5"')
 
             new_source.append(line)
         cell['source'] = new_source

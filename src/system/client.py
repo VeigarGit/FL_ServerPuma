@@ -33,7 +33,7 @@ if str(parent_dir) not in sys.path:
     sys.path.append(str(parent_dir))
 # -----------------------------------------------------------------
 
-from data_utils import read_client_data
+from utils.data_utils import read_client_data
 from prunning import prune_and_restructure
 from ALA import ALA
 from ALA_LoRA import ALA_LoRA

@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 # Configurações das Simulações
 # ==========================================
 DATASET = "OxfordPets"
-RESULTS_BASE = "../results"
-OUTPUT_DIR = "../results/plots_comparisons"
+RESULTS_BASE = "../../results"
+OUTPUT_DIR = "../../results/plots_comparisons"
 
 # Cria a pasta de saída para os gráficos organizados
 os.makedirs(OUTPUT_DIR, exist_ok=True)

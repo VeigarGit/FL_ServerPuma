@@ -36,7 +36,7 @@ src/system/dados_compartilhados/
 # Docker e Autogerados
 # =========================
 docker-tc/
-*.generated.yml
+*.yml
 
 # =========================
 # Arquivos Temporários
