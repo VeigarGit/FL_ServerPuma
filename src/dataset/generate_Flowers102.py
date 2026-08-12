@@ -11,7 +11,7 @@ from pathlib import Path
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 20
+num_clients = 22
 dir_path = "Flowers102/"
 
 
@@ -19,6 +19,11 @@ dir_path = "Flowers102/"
 def generate_dataset(dir_path, num_clients, niid, balance, partition):
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
+
+    else:
+        print("Caminho encontrado! iniciando geração e produção do dataset")
+
+    
         
     # Setup directory for train/test data
     config_path = Path(dir_path) / "config.json"
@@ -32,6 +37,8 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
     dataset_label = []
         
     # Get Flowers102 data
+    #TODO Análise qualitativa dos dados verificação e procura de ruídos
+    # que possam introduzir ruidos nos modelos treinados.
     transform = transforms.Compose(
         [transforms.Resize((64, 64)), 
         transforms.ToTensor(), 

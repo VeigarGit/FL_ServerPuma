@@ -11,7 +11,7 @@ from pathlib import Path
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 20
+num_clients = 22
 dir_path = "FGVCAircraft/"
 
 
@@ -41,12 +41,14 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
     def load_data(split="train"):
         trainset = torchvision.datasets.FGVCAircraft(
             root=dir_path+"rawdata", split=split, download=True, transform=transform)
-        trainloader = torch.utils.data.DataLoader(
-            trainset, batch_size=len(trainset), shuffle=False)
-        for _, train_data in enumerate(trainloader, 0):
-            trainset.data, trainset.targets = train_data
-        dataset_image.extend(trainset.data.cpu().detach().numpy())
-        dataset_label.extend(trainset.targets.cpu().detach().numpy())
+        
+        total = len(trainset)
+        for i in range(total):
+            img, label = trainset[i]
+            dataset_image.append(img.numpy())
+            dataset_label.append(label)
+            if (i + 1) % 500 == 0 or (i + 1) == total:
+                print(f"  [{split}] Processando: {i + 1}/{total}")
 
     load_data("train")
     load_data("val")

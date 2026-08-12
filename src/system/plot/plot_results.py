@@ -45,6 +45,12 @@ import matplotlib.pyplot as plt
 # False = títulos ocultos (útil para artigos/papers onde a legenda da figura é suficiente)
 SHOW_TITLES = False
 
+# Flag para controlar se a informação do valor do rank entra na legenda dos gráficos.
+# True  = exibe o rank na legenda (ex: "LoRA r=8", "PUMA-GT r=8 (AdaRank)")
+# False = omite a informação de rank da legenda (ex: "LoRA", "PUMA-GT")
+SHOW_RANK_IN_LEGEND = False
+
+
 plt.rcParams.update({
     'xtick.labelsize': 24,
     'ytick.labelsize': 24,
@@ -130,20 +136,23 @@ def parse_experiment(exp_name, results_base="../../results"):
     algo      = match.group('algo')
 
     # Label legível para os gráficos
-    is_adap_rank = any(term in exp_name.lower() for term in ["adap_rank", "adaptrank", "adaptive_rank"])
-    rank_str = f"r={rank} (AdaRank)" if is_adap_rank else f"r={rank}"
+    if SHOW_RANK_IN_LEGEND:
+        is_adap_rank = any(term in exp_name.lower() for term in ["adap_rank", "adaptrank", "adaptive_rank"])
+        rank_str = f" r={rank} (AdaRank)" if is_adap_rank else f" r={rank}"
+    else:
+        rank_str = ""
 
     if "adalora" in exp_name.lower():
-        label = f"AdaLoRA {rank_str}"
+        label = f"AdaLoRA{rank_str}"
     elif "sora" in exp_name.lower():
         if "adaptpaca" in exp_name.lower():
-            label = f"PUMA-GT {rank_str}"
+            label = f"PUMA-GT{rank_str}"
         else:
-            label = f"Static SoRa {rank_str}"
+            label = f"Static SoRa{rank_str}"
     elif "lora" in exp_name.lower():
-        label = f"LoRA {rank_str}"
+        label = f"LoRA{rank_str}"
     else:
-        label = f"{strategy.upper()} {rank_str} p={paca} ({algo})"
+        label = f"{strategy.upper()}{rank_str} p={paca} ({algo})"
         if "withou" not in prune_str.lower():
             label += " +prune"
 
@@ -961,10 +970,10 @@ def plot_15_mb_vs_tempo(experiments, output_dir):
 # Experimentos para plotar (Adicione ou remova itens desta lista)
 # ==============================================================================
 EXPERIMENTOS_PARA_PLOTAR = [
-    "pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260802_095514",
-    "sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260802_011456",
-    "lora_padrao_clip_lora_prune1_ala1_paca12_20260801_180443",
-    "pumagt_adap_rank_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260805_183756"
+    "1_lora_padrao_clip_lora_prune1_ala1_paca12_20260801_180443",
+    "2_sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260802_011456",
+    "3_pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260802_095514",
+    # "pumagt_adap_rank_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260805_183756"
 ]
 
 def main():
@@ -1004,7 +1013,8 @@ def main():
     print(f"\n{'='*60}")
     print(f"📂 Salvando gráficos em: {output_dir}")
     print(f"{'='*60}")
-    print(f"📝 Títulos nos gráficos: {'ATIVADOS' if SHOW_TITLES else 'DESATIVADOS'}\n")
+    print(f"📝 Títulos nos gráficos: {'ATIVADOS' if SHOW_TITLES else 'DESATIVADOS'}")
+    print(f"🏷️ Legenda com Rank: {'ATIVADA' if SHOW_RANK_IN_LEGEND else 'DESATIVADA'}\n")
 
     # Gerar todos os gráficos (em ordem sequencial 01-15)
     # --- Desempenho do Modelo ---
