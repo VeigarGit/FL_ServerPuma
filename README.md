@@ -70,24 +70,39 @@ uv run python generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --pr
 ```
 *Parameters:*
 * `--clients`: Number of clients to simulate.
-* `--dataset`: `Cifar100`, `Cifar10`, or `MNIST`.
+* `--dataset`: `Cifar100`, `Cifar10`, `MNIST`, `FashionMNIST` or `OxfordPets`.
 * `--rounds`: Number of training rounds.
 * `--prune`: `1` to enable Adaptive Pruning, `0` to disable.
 * `--ala`: `0` to enable FedALA, `1` to use standard FedAvg. **⚠️ Note: the semantics are inverted — `0` means ON.**
+* `--model`: `cnn` or `clip`.
+* `--strategy`: `lora`, `sora_with_schedule`, or `sora_no_schedule`.
 
 **2. Build and run the simulation:**
 ```bash
-# Build the images and start the containers in the background (from the docker folder)
+# Build the images and start the containers in the background
 docker compose --project-directory .. -f docker-compose.generated.yml up --build -d
+```
+*(Always use `--build` so the containers capture any recent changes in your local Python scripts).*
 
+**3. Monitor the live logs:**
+```bash
 # Follow the live logs to monitor the training process
 docker compose --project-directory .. -f docker-compose.generated.yml logs -f
 ```
 
-**3. Cleanup:**
+**4. End of simulation & Cleanup (CRITICAL):**
+When the simulation finishes ("Training completed"), the containers will stay running idly. You must tear them down before starting a new experiment:
 ```bash
 docker compose --project-directory .. -f docker-compose.generated.yml down
 ```
+> **⚠️ Important:** DO NOT use the `-v` flag when running `down` (unless you want to do a deep clean). The setup uses a shared `hf-cache` volume to cache HuggingFace models (like the 600MB CLIP model). Using `-v` will delete this cache, forcing the containers to download the heavy model all over again on the next run.
+
+### 🔄 Standard Workflow to Change Parameters
+To run a new experiment with different parameters, simply repeat the cycle:
+1. Run `generate_compose.py` with the new flags.
+2. Run `docker compose ... up --build -d`.
+3. Run `docker compose ... logs -f`.
+4. Run `docker compose ... down` when finished.
 
 ---
 

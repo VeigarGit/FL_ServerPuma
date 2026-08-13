@@ -1197,7 +1197,7 @@ def parse_args():
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('--experiments', type=int, default=1)
     parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip"])
-    parser.add_argument('--config', type=str, default="lora_clip/config.yaml")
+    parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
     parser.add_argument('--prune-freq', type=int, default=0)
     
     parser.add_argument('--save-model', type=str, default=None, help='Caminho para salvar os pesos treinados (.pt)')

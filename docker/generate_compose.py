@@ -1,7 +1,7 @@
 import os
 import argparse
 
-def generate_docker_compose(num_clients, dataset, rounds, prune, ala):
+def generate_docker_compose(num_clients, dataset, rounds, prune, ala, model, strategy, prune_freq):
     template = f"""
 x-client-template: &client
   build:
@@ -18,6 +18,7 @@ x-client-template: &client
   volumes:
     - ./src/dataset:/app/src/dataset
     - ./src/results:/app/src/results
+    - hf-cache:/root/.cache/huggingface
   deploy:
     resources:
       reservations:
@@ -49,6 +50,7 @@ services:
     volumes:
       - ./src/dataset:/app/src/dataset
       - ./src/results:/app/src/results
+      - hf-cache:/root/.cache/huggingface
     deploy:
       resources:
         reservations:
@@ -58,7 +60,7 @@ services:
               capabilities: [gpu]
     ports:
       - "9000:9000"
-    command: ["python", "server.py", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}", "--rounds", "{rounds}", "--prune", "{prune}"]
+    command: ["python", "server.py", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}", "--rounds", "{rounds}", "--prune", "{prune}", "--model", "{model}", "--strategy", "{strategy}", "--prune-freq", "{prune_freq}"]
     networks:
       - docker-tc
     labels:
@@ -72,13 +74,16 @@ services:
   client-{i}:
     <<: *client
     container_name: fl-client-{i}
-    command: ["python", "client.py", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "{dataset}", "--rounds", "{rounds}", "--ala", "{ala}"]
+    command: ["python", "client.py", "--client-idx", "{i}", "--host", "fl-server", "--dataset", "{dataset}", "--rounds", "{rounds}", "--ala", "{ala}", "--model", "{model}", "--strategy", "{strategy}"]
 """
 
     template += """
 networks:
   docker-tc:
     driver: bridge
+
+volumes:
+  hf-cache:
 """
 
     compose_dir = os.path.dirname(os.path.abspath(__file__))
@@ -86,15 +91,19 @@ networks:
     with open(os.path.join(compose_dir, 'docker-compose.generated.yml'), 'w') as f:
         f.write(template)
     
-    print(f"Gerado docker-compose com {num_clients} clientes | Dataset: {dataset} | Rounds: {rounds} | Prune: {prune} | ALA: {ala}")
+    print(f"Gerado docker-compose com {num_clients} clientes | Dataset: {dataset} | Rounds: {rounds} | Prune: {prune} | Prune Freq: {prune_freq} | ALA: {ala} | Model: {model} | Strategy: {strategy}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate Docker Compose file for Federated Learning')
     parser.add_argument('--clients', type=int, default=3, help='Number of clients')
-    parser.add_argument('--dataset', type=str, default='Cifar100', choices=['MNIST', 'Cifar10', 'Cifar100'])
+    parser.add_argument('--dataset', type=str, default='Cifar100', choices=['MNIST', 'Cifar10', 'Cifar100', 'OxfordPets', 'FashionMNIST'])
     parser.add_argument('--rounds', type=int, default=5, help='Number of training rounds')
     parser.add_argument('--prune', type=int, default=0, help='Enable Adaptive Pruning (1 = On, 0 = Off)')
     parser.add_argument('--ala', type=int, default=0, help='Enable FedALA (0 = On, 1 = Off/FedAvg)')
+    parser.add_argument('--model', type=str, default='cnn', choices=['cnn', 'clip'], help='Model to use (cnn or clip)')
+    parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'sora_with_schedule', 'sora_no_schedule'], help='Training strategy')
+    parser.add_argument('--prune-freq', type=int, default=0, help='Prune frequency in rounds (0 = disabled)')
     
     args = parser.parse_args()
-    generate_docker_compose(args.clients, args.dataset, args.rounds, args.prune, args.ala)
+    
+    generate_docker_compose(args.clients, args.dataset, args.rounds, args.prune, args.ala, args.model, args.strategy, args.prune_freq)

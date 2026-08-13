@@ -318,7 +318,7 @@ def parse_args():
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument("--ala", type=int, default=0)
     parser.add_argument("--model", type=str, default="cnn")
-    parser.add_argument('--config', type=str, default="lora_clip/config.yaml")
+    parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
     parser.add_argument('--experiments', type=int, default=1)
     parser.add_argument('--run-id', type=int, default=1)
     parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão com timestamp')

@@ -30,6 +30,7 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
+ARG NO_CACHE=1
 COPY . .
 
 RUN mkdir -p /app/src/system/dados_compartilhados
