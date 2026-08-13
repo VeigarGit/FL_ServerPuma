@@ -57,7 +57,7 @@ services:
               count: all
               capabilities: [gpu]
     ports:
-      - "9090:9090"
+      - "9000:9000"
     command: ["python", "server.py", "--dataset", "{dataset}", "--clients-per-round", "{num_clients}", "--rounds", "{rounds}", "--prune", "{prune}"]
     networks:
       - docker-tc

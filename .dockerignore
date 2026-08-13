@@ -18,3 +18,7 @@ docker-compose.yml
 .env_cuda_latest.yaml
 results2/
 results2.zip
+.venv/
+src/dataset/*/data/
+src/results/
+*.h5

@@ -47,7 +47,14 @@ Regardless of the execution method, the environment must be synced and the parti
 
 2. **Generate the Non-IID Dataset:**
    ```bash
+   # Example with MNIST (lightest, recommended for initial testing)
+   uv run python src/dataset/generate_MNIST.py noniid - dir
+
+   # Example with Cifar100
    uv run python src/dataset/generate_Cifar100.py noniid - dir
+   ```
+
+> **⚠️ Important:** The number of data partitions is defined by the `num_clients` variable **inside each dataset generator script** (e.g., `generate_MNIST.py`). Make sure this value matches or exceeds the `--clients` count you plan to use in Docker Compose. Otherwise, some clients will have no data and the experiment will fail.
 
 ---
 
@@ -66,7 +73,7 @@ uv run python generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --pr
 * `--dataset`: `Cifar100`, `Cifar10`, or `MNIST`.
 * `--rounds`: Number of training rounds.
 * `--prune`: `1` to enable Adaptive Pruning, `0` to disable.
-* `--ala`: `0` to enable FedALA, `1` to use standard FedAvg.
+* `--ala`: `0` to enable FedALA, `1` to use standard FedAvg. **⚠️ Note: the semantics are inverted — `0` means ON.**
 
 **2. Build and run the simulation:**
 ```bash
@@ -372,3 +379,15 @@ After the simulation completes, performance metrics (Accuracy, Loss, Model Size 
 - **Model Weights**: Saved in the `src/system/saved_weights/` directory (if saving is enabled).
 - **Aggregated Data**: May also be exported to `src/system/dados_compartilhados/`.
 
+---
+
+## ❓ Troubleshooting
+
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| `CUDA not available` inside containers | NVIDIA Container Toolkit not installed | Install `nvidia-container-toolkit`, or remove the `deploy.resources` GPU block from `generate_compose.py` to run on CPU |
+| Clients exit immediately with data errors | Dataset not generated, or fewer partitions than clients | Ensure `num_clients` in the generator script ≥ `--clients` in compose, then regenerate the dataset |
+| `docker-tc` rules not applying | Daemon not running | Check with `docker ps | grep docker-tc`; restart if needed |
+| First Docker build is very slow | Downloading all Python dependencies | Subsequent builds are cached; only rebuilds if `pyproject.toml` or `uv.lock` change |
+| Port conflict on `9000` | Another service using the port | Change `--port` in server args or stop the conflicting service |
+| Build context is huge (several GB) | `.dockerignore` not filtering `.venv`/data | Ensure `.dockerignore` excludes `.venv/`, `src/dataset/*/data/`, and other large directories |

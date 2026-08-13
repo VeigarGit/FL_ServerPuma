@@ -474,6 +474,11 @@ def main():
                 logger.exception("Connection failed after multiple attempts")
                 sys.exit(1)
                 
+            # Timeout de segurança: evita que o client fique preso
+            # indefinidamente caso o server feche a conexão (race condition
+            # no último round)
+            s.settimeout(120)
+            
             send_data(s, args.client_idx)
             logger.info(f"Connected to server {args.host}:{args.port}")
             for round_num in range(args.rounds):
@@ -599,8 +604,8 @@ def main():
                     
                     s.recv(3)
                     logger.info("Ready for next round...")
-                except (OSError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.warning("Conexão fechada pelo servidor (provável limite de tempo atingido ou fim do treinamento).")
+                except (OSError, BrokenPipeError, ConnectionResetError, socket.timeout) as e:
+                    logger.warning(f"Conexão fechada pelo servidor ou timeout ({type(e).__name__}). Finalizando.")
                     break
                     
         save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=args.client_idx, argalgo=args.ala)

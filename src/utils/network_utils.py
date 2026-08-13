@@ -16,7 +16,11 @@ def recvall(conn: socket.socket, n: int):
     """Garante o recebimento exato de 'n' bytes."""
     data = b'' 
     while len(data) < n:
-        packet = conn.recv(n - len(data))
+        try:
+            packet = conn.recv(n - len(data))
+        except socket.timeout:
+            logger.warning("Socket timeout durante recebimento de dados.")
+            return None
         if not packet:
             return None
         data += packet
