@@ -613,7 +613,7 @@ def main():
 
     elif args.mode == 'decentralized':
         import json
-        import tempfile
+        import threading
 
         logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
 
@@ -622,13 +622,38 @@ def main():
         last_processed_encounter = 0
 
         # Caminho para a pasta de sinalizacao P2P (volume compartilhado Docker).
-        # O orquestrador escreve JSONs de encontro aqui, e os clientes leem
-        # e escrevem arquivos .pt de pesos nesta mesma pasta.
         encounters_dir = Path(__file__).resolve().parents[1] / "results" / "encounters"
+        
+        in_memory_weights = {}
+        in_memory_lock = threading.Lock()
+        
+        def p2p_server_thread():
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind(('0.0.0.0', 9000))
+            server_socket.listen(50)
+            logger.info(f"Client {args.client_idx}: P2P Server listening on port 9000")
+            
+            while True:
+                try:
+                    conn, addr = server_socket.accept()
+                    data, _ = recv_data(conn)
+                    if data is not None:
+                        sender_id, enc_id, state = data
+                        with in_memory_lock:
+                            if enc_id not in in_memory_weights:
+                                in_memory_weights[enc_id] = {}
+                            in_memory_weights[enc_id][sender_id] = state
+                        logger.info(f"Client {args.client_idx}: Recebeu pesos do Cliente {sender_id} para encontro {enc_id}")
+                    conn.close()
+                except Exception as e:
+                    logger.error(f"Erro no P2P Server: {e}")
+                    
+        threading.Thread(target=p2p_server_thread, daemon=True).start()
 
         epoch = 1
         while True:
-            logger.info(f"\n--- [D-PSGD] Iniciando Epoca {epoch} ---")
+            logger.info(f"\n--- Iniciando Epoca {epoch} ---")
 
             # Obter o state_dict atual do modelo para usar como base do treino.
             # Para CLIP, usa apenas os parametros treinaveis (LoRA/SoRA).
@@ -711,113 +736,71 @@ def main():
                                 f"Iniciando D-PSGD."
                             )
 
-                            # ── ESCRITA ATOMICA dos pesos locais ─────────
-                            # Usa write-to-temp + rename para garantir que
-                            # os vizinhos nunca leiam um .pt parcialmente
-                            # escrito (operacao atomica no Linux).
-                            my_weights_file = encounters_dir / f"client_{args.client_idx}_enc_{enc_id}.pt"
-                            tmp_fd, tmp_path = tempfile.mkstemp(
-                                dir=str(encounters_dir),
-                                prefix=f".client_{args.client_idx}_",
-                                suffix=".pt.tmp",
-                            )
-                            try:
-                                # Fechar o file descriptor do mkstemp (torch.save
-                                # gerencia seu proprio file handle)
-                                os.close(tmp_fd)
-                                # Salvar pesos no arquivo temporario
-                                torch.save(updated_state, tmp_path)
-                                # Rename atomico para o nome final
-                                os.rename(tmp_path, my_weights_file)
-                            except Exception:
-                                # Limpar temporario em caso de erro
-                                if os.path.exists(tmp_path):
-                                    os.unlink(tmp_path)
-                                raise
-
-                            # ── POLLING dos pesos dos vizinhos ───────────
-                            # Esperar que todos os outros clientes do encontro
-                            # tambem salvem seus arquivos .pt. O timeout e
-                            # baseado no ETC para nao esperar alem da janela
-                            # de contato real.
+                            # ── ENVIO DE PESOS (CLIENTE TCP) ─────────
                             other_clients = [c for c in clients_in_encounter if c != args.client_idx]
-                            other_states = []
-                            all_received = False
-
-                            logger.info(
-                                f"Client {args.client_idx}: Aguardando vizinhos "
-                                f"{other_clients} (timeout={poll_timeout}s)..."
-                            )
-
-                            for tick in range(poll_timeout):
-                                all_received = True
-                                other_states = []
-                                for c in other_clients:
-                                    other_file = encounters_dir / f"client_{c}_enc_{enc_id}.pt"
-                                    if not other_file.exists():
-                                        all_received = False
-                                        break
+                            
+                            # Envia para todos os vizinhos
+                            for c in other_clients:
+                                target_host = f"fl-client-v2x-{c}"
+                                sent = False
+                                for attempt in range(poll_timeout):
                                     try:
-                                        # weights_only=True por seguranca
-                                        # (nao executa codigo arbitrario)
-                                        state = torch.load(
-                                            other_file,
-                                            map_location=device,
-                                            weights_only=True,
-                                        )
-                                        other_states.append(state)
-                                    except Exception:
-                                        # Arquivo pode estar sendo renomeado
-                                        # neste exato momento (escrita atomica
-                                        # em andamento). Tentar novamente.
-                                        all_received = False
+                                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                                            s.settimeout(2.0)
+                                            s.connect((target_host, 9000))
+                                            # Envia (meu_id, id_do_encontro, pesos)
+                                            send_data(s, (args.client_idx, enc_id, updated_state))
+                                            sent = True
+                                            break
+                                    except Exception as e:
+                                        time.sleep(1)
+                                if not sent:
+                                    logger.warning(f"Client {args.client_idx}: Falha ao enviar para Cliente {c} no encontro {enc_id}")
+
+                            # ── POLLING dos pesos dos vizinhos na MEMÓRIA ───────────
+                            logger.info(f"Client {args.client_idx}: Aguardando vizinhos {other_clients} (timeout={poll_timeout}s)...")
+                            
+                            all_received = False
+                            other_states = []
+                            
+                            for tick in range(poll_timeout):
+                                with in_memory_lock:
+                                    enc_weights = in_memory_weights.get(enc_id, {})
+                                    if all(c in enc_weights for c in other_clients):
+                                        all_received = True
+                                        other_states = [enc_weights[c] for c in other_clients]
                                         break
-                                if all_received:
-                                    break
                                 time.sleep(1)
 
                             # ── AGREGACAO D-PSGD (Media Simples) ─────────
                             if all_received:
-                                logger.info(
-                                    f"Client {args.client_idx}: Pesos de "
-                                    f"{len(other_states)} vizinhos recebidos! "
-                                    f"Aplicando consenso (Media)."
-                                )
-
-                                # Calcular a media aritmetica dos pesos:
-                                # avg = (meus_pesos + vizinho1 + vizinho2 + ...) / N
+                                logger.info(f"Client {args.client_idx}: Pesos de {len(other_states)} vizinhos recebidos via rede! Aplicando consenso (Media).")
+                                
                                 avg_state = {}
                                 for key in updated_state.keys():
-                                    # Comecar com uma copia dos pesos locais
                                     avg_state[key] = updated_state[key].clone()
-                                    # Somar os pesos de cada vizinho
                                     for neighbor_state in other_states:
                                         avg_state[key] += neighbor_state[key].to(device)
-                                    # Dividir pelo total de participantes
                                     avg_state[key] = avg_state[key] / (1 + len(other_states))
 
-                                # Carregar os pesos agregados no modelo
                                 if args.model == 'clip':
                                     resize_model_to_pruned(model, avg_state)
                                 else:
                                     model.load_state_dict(avg_state, strict=False)
 
-                                logger.info(
-                                    f"Client {args.client_idx}: Agregacao P2P do "
-                                    f"encontro {enc_id} concluida com sucesso."
-                                )
+                                logger.info(f"Client {args.client_idx}: Agregacao P2P do encontro {enc_id} concluida com sucesso.")
+                                
+                                # Limpar memória para não vazar RAM
+                                with in_memory_lock:
+                                    if enc_id in in_memory_weights:
+                                        del in_memory_weights[enc_id]
+                                        
+                                # Sinaliza ao orquestrador que terminou criando arquivo vazio
+                                done_file = encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
+                                done_file.touch()
                             else:
                                 # ── FALLBACK: timeout expirado ───────────
-                                # A janela de contato (ETC) expirou antes de
-                                # todos os vizinhos salvarem seus pesos.
-                                # Neste caso, DESCARTAMOS a rodada P2P e
-                                # mantemos o modelo local intacto.
-                                # O treino local continua normalmente.
-                                logger.warning(
-                                    f"Client {args.client_idx}: Timeout (ETC expirado) "
-                                    f"no encontro {enc_id}. Descartando rodada P2P "
-                                    f"e continuando com modelo local."
-                                )
+                                logger.warning(f"Client {args.client_idx}: Timeout (ETC expirado) no encontro {enc_id}. Descartando rodada P2P.")
 
                             # Marcar este encontro como processado para nao
                             # tentar novamente na proxima epoca

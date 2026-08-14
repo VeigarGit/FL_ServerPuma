@@ -61,7 +61,7 @@ MAX_ETC = 120.0
 # Segundos de warmup antes de comecar a sinalizar encontros.
 # Permite que os conteineres Docker iniciem, carreguem o modelo e
 # completem pelo menos 1 epoca de treino local.
-DEFAULT_WARMUP = 60
+DEFAULT_WARMUP = 30
 
 # Segundos de cooldown entre encontros consecutivos.
 # Impede que mudancas incrementais na composicao do cluster
@@ -464,6 +464,8 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         f.unlink()
     for f in encounters_dir.glob("*.pt"):
         f.unlink()
+    for f in encounters_dir.glob(".done_enc_*"):
+        f.unlink()
     # Limpar arquivos temporarios orfaos de escritas atomicas interrompidas
     for f in encounters_dir.glob(".encounter_*.tmp"):
         f.unlink()
@@ -650,8 +652,8 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     #
                     # Sem esta pausa, o SUMO avanca centenas de steps e termina
                     # antes dos clientes sequer lerem o JSON.
-                    expected_pt_files = [
-                        encounters_dir / f"client_{c}_enc_{encounter_count}.pt"
+                    expected_done_files = [
+                        encounters_dir / f".done_enc_{encounter_count}_client_{c}"
                         for c in c_indices
                     ]
                     log.info(
@@ -664,36 +666,35 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     exchange_timeout = 300  # Maximo 5 minutos por encontro
 
                     for tick in range(exchange_timeout):
-                        received = [f.exists() for f in expected_pt_files]
+                        received = [f.exists() for f in expected_done_files]
                         received_count = sum(received)
 
                         # Log de progresso a cada 15 segundos
                         if tick > 0 and tick % 15 == 0:
                             log.info(
-                                "  ... %d/%d .pt recebidos (%ds)",
-                                received_count, len(expected_pt_files), tick,
+                                "  ... %d/%d confirmacoes recebidas (%ds)",
+                                received_count, len(expected_done_files), tick,
                             )
 
                         if all(received):
                             exchange_time = time.time() - exchange_start
                             log.info(
-                                "Todos os %d .pt recebidos em %.0fs! "
-                                "Aguardando 5s para agregacao...",
-                                len(expected_pt_files), exchange_time,
+                                "Todas as %d confirmacoes recebidas em %.0fs! "
+                                "Aguardando 5s para retomada...",
+                                len(expected_done_files), exchange_time,
                             )
-                            # Dar tempo extra para os clientes lerem os .pt
-                            # dos vizinhos e completarem a agregacao D-PSGD
+                            # Dar tempo extra para garantia
                             time.sleep(5)
                             break
                         time.sleep(1)
                     else:
                         exchange_time = time.time() - exchange_start
-                        received_count = sum(f.exists() for f in expected_pt_files)
+                        received_count = sum(f.exists() for f in expected_done_files)
                         log.warning(
-                            "Timeout de %ds esperando .pt do encontro %d "
-                            "(%d/%d recebidos). Continuando...",
+                            "Timeout de %ds esperando confirmacoes do encontro %d "
+                            "(%d/%d recebidas). Continuando...",
                             exchange_timeout, encounter_count,
-                            received_count, len(expected_pt_files),
+                            received_count, len(expected_done_files),
                         )
 
                     log.info("SUMO RETOMADO.")
