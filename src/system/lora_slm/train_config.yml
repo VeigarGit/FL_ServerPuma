@@ -1,0 +1,51 @@
+dataset:
+  name: enterprise-explorers/oxford-pets
+
+model:
+  name: Qwen/Qwen3-VL-2B-Instruct
+  lora:
+    mode: with_lora
+    r: 8
+    alpha: 32
+    dropout: 0.05
+    bias: none
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+  paca:
+    enabled: true
+    upper_layers: 2
+
+  sora:
+    sparse_lambda: 0.001
+    sparse_lambda_2: 0.10
+    sparse_lr: 0.01
+    lambda_schedule: linear
+    max_lambda: 0.20
+    lambda_num: 10
+    schedule_epochs: 1
+    pre_prune_ratio: 0.0
+    min_rank: 2
+
+training:
+  batch_size: 16
+  epochs: 1
+  test_size: 0.2
+  seed: 42
+
+optimizer:
+  lr: 0.0005
+  weight_decay: 0.01
+
+scheduler:
+  step_size: 1
+  gamma: 0.7
+
+output:
+  weights_path: slm_pets_finetuned.pth
