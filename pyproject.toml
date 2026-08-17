@@ -34,7 +34,7 @@ dependencies = [
     "higher",
     "diffusers",
     "accelerate",
-    "transformers",
+    "transformers>=4.49.0",
     "datasets>=4.8.5",
     "pyyaml>=6.0.3",
     "peft>=0.19.1",
@@ -44,6 +44,7 @@ dependencies = [
     "torchaudio>=2.11.0",
     "traci>=1.27.1",
     "sumolib>=1.27.1",
+    "qwen-vl-utils[decord]>=0.0.14",
 ]
 
 [tool.ruff]

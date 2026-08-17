@@ -1,0 +1,391 @@
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+class SoRALinear(nn.Module):
+    """
+    Camada fundamental do Sparse LoRA (SoRA).
+    Implementa uma projeção de rank baixo (matrizes A e B) multiplicada por um vetor 
+    de portões (gate) treinável. O gate permite ao modelo "aprender" a esparsidade, 
+    desativando dimensões inúteis do rank durante o treinamento.
+    """
+
+    def __init__(self, in_features, out_features, r=8, lora_alpha=16, lora_dropout=0.0):
+        super().__init__()
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.scaling = lora_alpha / r
+
+        if lora_dropout > 0.0:
+            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        else:
+            self.lora_dropout = lambda x: x
+
+        self.lora_A = nn.Parameter(torch.zeros(r, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+        self.gate = nn.Parameter(torch.full((1, r), 0.1))
+
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        """Calcula a saída do adaptador: (x * A * gate) * B."""
+        return ((self.lora_dropout(x) @ self.lora_A.T).mul(self.gate) @ self.lora_B.T) * self.scaling
+
+
+class SoRAWrappedLinear(nn.Module):
+    """
+    Integração não-invasiva de adaptadores.
+    Envolve uma camada linear original (congelada) e adiciona o SoRALinear em paralelo. 
+    A saída final é a soma da projeção original com a correção de rank baixo.
+    """
+
+    def __init__(self, original_linear, r=8, lora_alpha=16, lora_dropout=0.0):
+        super().__init__()
+        self.original = original_linear
+        self.sora = SoRALinear(
+            original_linear.in_features,
+            original_linear.out_features,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+        )
+        
+        self.sora.to(original_linear.weight.dtype)
+        
+        # Congela os pesos originais para garantir que apenas o adaptador aprenda
+        for p in self.original.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        # Proteção: se o SoRA for removido (em versões futuras ou poda radical), retorna apenas o original
+        if self.sora is None:
+            return self.original(x)
+        return self.original(x) + self.sora(x)
+
+@torch.no_grad()
+def prune_sora_to_lora_and_report(model, min_rank=2):
+    """
+    Poda Estrutural Pós-Treino.
+    Analisa os 'gates' do SoRA, remove as dimensões do rank que foram zeradas pelo 
+    SparseAdamW e absorve os gates restantes na matriz B. Converte o SoRA em um 
+    LoRA estático extremamente compacto e eficiente para inferência.
+    Respeita um rank mínimo (min_rank) por módulo para evitar over-pruning.
+    """
+    import sys
+    import pickle
+    total_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    sora_modules = 0
+    
+    print("\n" + "="*75)
+    print("PRUNING SoRA → LoRA COMPACTO")
+    print("="*75)
+
+    for name, module in model.named_modules():
+        if not isinstance(module, SoRAWrappedLinear):
+            continue
+
+        sora = module.sora
+        gate = sora.gate.data.squeeze(0)
+        
+        # Identifica quais dimensões manter (onde gate > 1e-4)
+        mask = torch.abs(gate) > 1e-4
+        keep_idx = torch.where(mask)[0]
+        r_new = len(keep_idx)
+        r_original = len(gate)
+
+        # Garante que o rank não caia abaixo de min_rank
+        effective_min = min(min_rank, r_original)
+        if r_new < effective_min:
+            keep_idx = torch.topk(gate.abs(), k=effective_min).indices
+            r_new = len(keep_idx)
+            print(f"    {name:<50} → Rank forçado para {r_new} (min_rank={min_rank})")
+
+        # Compacta as matrizes A e B e absorve o gate na matriz B
+        A_pruned = sora.lora_A.data[keep_idx, :]
+        B_pruned = sora.lora_B.data[:, keep_idx]
+        g_pruned = gate[keep_idx]
+        new_B = B_pruned * g_pruned.unsqueeze(0)
+
+        # Define uma classe leve para o LoRA já podado
+        class PrunedLoRA(nn.Module):
+            def __init__(self, A, B, scaling):
+                super().__init__()
+                self.lora_A = nn.Parameter(A.clone())
+                self.lora_B = nn.Parameter(B.clone())
+                self.scaling = scaling
+
+            def forward(self, x):
+                return (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+
+        module.sora = PrunedLoRA(A_pruned, new_B, sora.scaling)
+        sora_modules += 1
+
+        print(f"   {name:<50} Rank: {r_original:3d} → {r_new:3d}")
+
+    total_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print("="*70)
+    print(f"   RESUMO DA PODA: {sora_modules} módulos processados")
+    print(f"   Redução de parâmetros treináveis: {((1 - total_after / total_before) * 100):.2f}%")
+    print("="*70)
+    return model
+
+@torch.no_grad()
+def prune_sora_iterative(model, min_rank=2):
+    """
+    Poda Iterativa (Intermediária) para Aprendizado Federado.
+    Reduz o tamanho das matrizes A, B e do gate, MAS MANTÉM o gate vivo
+    para que o modelo continue a aprender esparsidade nas próximas rodadas.
+    Respeita um rank mínimo (min_rank) por módulo para evitar over-pruning.
+    """
+    total_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    sora_modules = 0
+    
+    print("\n" + "="*75)
+    print("PRUNING ITERATIVO (SoRA → SoRA Compacto)")
+    print("="*75)
+
+    for name, module in model.named_modules():
+        if not isinstance(module, SoRAWrappedLinear):
+            continue
+
+        sora = module.sora
+        gate = sora.gate.data.squeeze(0)
+        
+        # Identifica quais dimensões manter (onde gate > 1e-4)
+        mask = torch.abs(gate) > 1e-4
+        keep_idx = torch.where(mask)[0]
+        r_new = len(keep_idx)
+        r_original = len(gate)
+
+        # Garante que o rank não caia abaixo de min_rank
+        effective_min = min(min_rank, r_original)
+        if r_new < effective_min:
+            keep_idx = torch.topk(gate.abs(), k=effective_min).indices
+            r_new = len(keep_idx)
+            print(f"    {name:<50} → Rank forçado para {r_new} (min_rank={min_rank})")
+
+        # Se o rank não diminuiu nesta camada, não fazemos nada
+        if r_new == r_original:
+            continue
+
+        # --- A GRANDE MÁGICA ACONTECE AQUI ---
+        # 1. Fatiamos as matrizes usando apenas os índices úteis (keep_idx)
+        A_pruned = sora.lora_A.data[keep_idx, :]
+        B_pruned = sora.lora_B.data[:, keep_idx]
+        g_pruned = sora.gate.data[:, keep_idx] # O gate continua a existir!
+
+        # 2. Re-instanciamos os parâmetros de rede para avisar o PyTorch da mudança
+        sora.lora_A = nn.Parameter(A_pruned)
+        sora.lora_B = nn.Parameter(B_pruned)
+        sora.gate = nn.Parameter(g_pruned)
+        
+        # 3. Atualizamos a variável de controle do rank
+        sora.r = r_new 
+        
+        # Nota de Engenharia: NÃO alteramos o sora.scaling! 
+        # Manter o scaling original evita que os gradientes explodam após a poda.
+
+        sora_modules += 1
+        print(f"   {name:<50} Rank: {r_original:3d} → {r_new:3d}")
+
+    total_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print("="*70)
+    print(f"   RESUMO DA PODA ITERATIVA: {sora_modules} módulos afetados")
+    print(f"   Redução de parâmetros treináveis: {((1 - total_after / total_before) * 100):.2f}%")
+    print("="*70)
+    
+    return model
+
+@torch.no_grad()
+def pre_prune_whole_model(model, prune_ratio=0.3, device="cpu"):
+    """
+    Otimização Preventiva do Backbone.
+    Realiza uma poda conservadora das camadas MLP do CLIP original baseada na norma L1. 
+    Reduz o número de parâmetros do modelo "base" antes mesmo do treino começar, 
+    economizando memória e acelerando o processamento.
+    """
+    print(f"\n  PRE-PRUNING CONSERVADOR (ratio = {prune_ratio*100:.0f}%)")
+    vision_model = model.vision_model
+    
+    for name, module in vision_model.named_modules():
+        if not isinstance(module, nn.Linear) or "mlp" not in name:
+            continue
+
+        weight = module.weight.data
+        if "fc1" in name: # Camada de expansão (Fan-out)
+            norms = torch.norm(weight, dim=1, p=1)
+            keep_idx = torch.topk(norms, int(module.out_features * (1 - prune_ratio)), largest=True).indices
+            new_linear = nn.Linear(module.in_features, len(keep_idx), bias=module.bias is not None).to(device)
+            new_linear.weight.data = weight[keep_idx, :]
+        else: # Camada de projeção (Fan-in)
+            norms = torch.norm(weight, dim=0, p=1)
+            keep_idx = torch.topk(norms, int(module.in_features * (1 - prune_ratio)), largest=True).indices
+            new_linear = nn.Linear(len(keep_idx), module.out_features, bias=module.bias is not None).to(device)
+            new_linear.weight.data = weight[:, keep_idx]
+
+        if module.bias is not None:
+            new_linear.bias.data = module.bias.data[keep_idx] if "fc1" in name else module.bias.data
+
+        # Substitui a camada no backbone pelo novo tensor podado
+        parent = vision_model.get_submodule(".".join(name.split(".")[:-1]))
+        setattr(parent, name.split(".")[-1], new_linear)
+
+    return model
+
+def re_freeze_vision_model(model):
+    """Integridade do Backbone. Garante que o vision_model não seja treinado após as modificações estruturais, mantendo apenas os adaptadores (SoRA/LoRA) ativos."""
+    for name, param in model.vision_model.named_parameters():
+        if "sora" in name or "lora" in name:
+            continue
+        param.requires_grad = False
+    return model
+
+def get_trainable_state_dict(model):
+    """Extração de Pesos. Retorna apenas os adaptadores treinados, ignorando o backbone congelado."""
+    return {n: p.detach().cpu().clone() for n, p in model.named_parameters() if p.requires_grad}
+
+class SparseAdamW(torch.optim.AdamW):
+    """
+    Otimizador para Aprendizado de Estrutura.
+    Implementa uma penalidade de esparsidade via 'Soft-Thresholding' (Proximal Gradient). 
+    A cada passo, ele "limpa" os portões SoRA, forçando valores insignificantes a zero, 
+    o que permite a posterior poda estrutural.
+    """
+
+    def __init__(self, sparse_lambda=0.1, lambda_schedule=None, max_lambda=None, lambda_num=None, **kwargs):
+        super().__init__(**kwargs)
+        self.sparse_lambda = sparse_lambda
+        self.lambda_idx = 0
+        self.lambda_schedule = lambda_schedule
+        self._build_lambda_list(max_lambda, lambda_num)
+
+    def _build_lambda_list(self, max_lambda, lambda_num):
+        """Constrói agendas dinâmicas para o hiperparâmetro lambda de esparsidade."""
+        if self.lambda_schedule is None:
+            self._lambdas = None
+            return
+        if isinstance(self.lambda_schedule, list):
+            self._lambdas = self.lambda_schedule
+            return
+        if max_lambda is None or lambda_num is None:
+            raise ValueError(
+                f"max_lambda and lambda_num are required for schedule '{self.lambda_schedule}', "
+                f"got max_lambda={max_lambda}, lambda_num={lambda_num}"
+            )
+        if self.lambda_schedule == "linear":
+            self._lambdas = np.linspace(self.sparse_lambda, max_lambda, lambda_num)
+        elif self.lambda_schedule == "log_linear":
+            self._lambdas = np.log(np.linspace(np.exp(self.sparse_lambda), np.exp(max_lambda), lambda_num))
+        elif self.lambda_schedule == "exp_linear":
+            self._lambdas = np.exp(np.linspace(np.log(self.sparse_lambda), np.log(max_lambda), lambda_num))
+        else:
+            raise ValueError(f"Unknown lambda_schedule: {self.lambda_schedule}")
+
+    def step_lambda(self):
+        """Avança o índice na agenda de lambdas, aumentando a pressão por esparsidade."""
+        if self._lambdas is None:
+            return
+        if self.lambda_idx < len(self._lambdas) - 1:
+            self.lambda_idx += 1
+            self.sparse_lambda = self._lambdas[self.lambda_idx]
+            print(f"[SparseAdamW] lambda={self.sparse_lambda}")
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Executa o passo AdamW tradicional seguido do limiar de esparsidade (Proximal Step)."""
+        loss = super().step(closure)
+
+        for group in self.param_groups:
+            # O threshold verdadeiro de Proximal Gradient é scaled pelo learning rate
+            lr = group.get("lr", 1.0)
+            threshold = self.sparse_lambda * lr
+            for p in group["params"]:
+                if threshold > 0:
+                    # Aplica Soft-Thresholding vetorizado nativo (extremamente mais rápido)
+                    p.data = torch.nn.functional.softshrink(p.data, threshold)
+
+        return loss
+
+
+class GateSparsifier:
+    """
+    Passo Proximal Leve para Portões SoRA (Federated Learning).
+
+    No algoritmo SoRA (Ding et al.), a esparsidade estrutural é aprendida via
+    Proximal Gradient Descent, que consiste em dois passos por iteração:
+      1. Gradient step (AdamW padrão — feito pelo otimizador unificado)
+      2. Proximal step (soft-thresholding nos gates — feito aqui)
+
+    Esta classe substitui o SparseAdamW completo no contexto de FL, eliminando
+    o overhead de um segundo otimizador (zero_grad + AdamW state + step) sem
+    alterar a matemática do SoRA. Os gates são incluídos como param_group no
+    AdamW unificado, e esta classe aplica APENAS o operador proximal do L1.
+
+    Nota: O SparseAdamW original é mantido para o trainer standalone (main.py),
+    que precisa de compatibilidade com schedulers (StepLR).
+    """
+
+    def __init__(self, gate_params, sparse_lambda, gate_lr,
+                 lambda_schedule=None, max_lambda=None, lambda_num=None):
+        self.gate_params = list(gate_params)
+        self.sparse_lambda = sparse_lambda
+        self.gate_lr = gate_lr
+        self.lambda_idx = 0
+        self.lambda_schedule = lambda_schedule
+        self._lambdas = None
+        self._build_lambda_list(max_lambda, lambda_num)
+
+    def _build_lambda_list(self, max_lambda, lambda_num):
+        """Constrói agendas dinâmicas para o hiperparâmetro lambda de esparsidade."""
+        if self.lambda_schedule is None:
+            return
+        if isinstance(self.lambda_schedule, list):
+            self._lambdas = self.lambda_schedule
+            return
+        if max_lambda is None or lambda_num is None:
+            raise ValueError(
+                f"max_lambda and lambda_num are required for schedule '{self.lambda_schedule}', "
+                f"got max_lambda={max_lambda}, lambda_num={lambda_num}"
+            )
+        if self.lambda_schedule == "linear":
+            self._lambdas = np.linspace(self.sparse_lambda, max_lambda, lambda_num)
+        elif self.lambda_schedule == "log_linear":
+            self._lambdas = np.log(np.linspace(np.exp(self.sparse_lambda), np.exp(max_lambda), lambda_num))
+        elif self.lambda_schedule == "exp_linear":
+            self._lambdas = np.exp(np.linspace(np.log(self.sparse_lambda), np.log(max_lambda), lambda_num))
+        else:
+            raise ValueError(f"Unknown lambda_schedule: {self.lambda_schedule}")
+
+    def step_lambda(self):
+        """Avança o índice na agenda de lambdas, aumentando a pressão por esparsidade."""
+        if self._lambdas is None:
+            return
+        if self.lambda_idx < len(self._lambdas) - 1:
+            self.lambda_idx += 1
+            self.sparse_lambda = self._lambdas[self.lambda_idx]
+            # print(f"[GateSparsifier] lambda={self.sparse_lambda}")
+
+    def zero_grad(self, set_to_none=False):
+        """No-op: os gradientes dos gates são geridos pelo otimizador unificado."""
+        pass
+
+    @torch.no_grad()
+    def step(self):
+        """
+        Proximal step: aplica soft-thresholding (operador proximal do L1) nos gates.
+        
+        Matematicamente: gate ← S_λ(gate), onde S_λ é o operador de soft-shrinkage
+        com threshold = sparse_lambda × learning_rate.
+        
+        Este é o segundo passo do Proximal Gradient Descent usado no SoRA.
+        """
+        threshold = self.sparse_lambda * self.gate_lr
+        if threshold <= 0:
+            return
+        for p in self.gate_params:
+            p.data = torch.nn.functional.softshrink(p.data, threshold)

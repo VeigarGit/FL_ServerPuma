@@ -51,6 +51,10 @@ EXPERIMENTS = [
      "3_pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260802_095514",
      "server_OxfordPets_*_run*.h5"),
 
+    ("OxfordPets", "PUMA-GT Rank Adap",
+     "4_pumagt_adap_rank_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260805_183756",
+     "server_OxfordPets_*_run*.h5"),
+
     # --- DTD ---
     ("DTD", "LoRA Padrão",
      "DTD_run_lora_padrao_clip_lora_prune1_ala1_paca12_20260811_174358",
@@ -62,6 +66,10 @@ EXPERIMENTS = [
 
     ("DTD", "PUMA-GT",
      "DTD_run_sora_adapt_paca_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260810_191511",
+     "server_DTD_*_run*.h5"),
+
+    ("DTD", "PUMA-GT Rank Adap",
+     "DTD_run_puma_gt_rank_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260812_185342",
      "server_DTD_*_run*.h5"),
 
     # --- FGVCAircraft ---
@@ -77,6 +85,10 @@ EXPERIMENTS = [
      "FGVCAircraft_run_sora_adapt_paca_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260810_091733",
      "server_FGVCAircraft_*_run*.h5"),
 
+    ("FGVCAircraft", "PUMA-GT Rank Adap",
+     "FGVCAircraft_run_puma_gt_rank_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260813_121451",
+     "server_FGVCAircraft_*_run*.h5"),
+
     # --- Flowers102 ---
     ("Flowers102", "LoRA Padrão",
      "Flowers102_run_lora_padrao_clip_lora_prune1_ala1_paca12_20260808_080534",
@@ -88,6 +100,10 @@ EXPERIMENTS = [
 
     ("Flowers102", "PUMA-GT",
      "Flowers102_run_pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260806_192626",
+     "server_Flowers102_*_run*.h5"),
+
+    ("Flowers102", "PUMA-GT Rank Adap",
+     "Flowers102_run_puma_gt_rank_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260813_220649",
      "server_Flowers102_*_run*.h5"),
 ]
 
@@ -338,18 +354,18 @@ def main():
     print()
     print("=" * 160)
     header = (
-        f"{'Dataset':<15} | {'Estratégia':<16} | {'Runs':>4} | "
+        f"{'Dataset':<15} | {'Estratégia':<20} | {'Runs':>4} | "
         f"{'Acurácia Final (%)':>22} | {'Rodada Converg.':>20} | "
         f"{'Dados Total (MB)':>22} | {'Tempo Médio/Rod (s)':>22} | "
         f"{'Dados Médios/Rod (MB)':>24}"
     )
     print(header)
-    print("-" * 160)
+    print("-" * 168)
 
     for r in all_results:
         if r['status'] == 'MISSING':
             print(
-                f"{r['dataset']:<15} | {r['strategy']:<16} | {'---':>4} | "
+                f"{r['dataset']:<15} | {r['strategy']:<20} | {'---':>4} | "
                 f"{'--- SEM DADOS ---':>22} | {'---':>20} | "
                 f"{'---':>22} | {'---':>22} | {'---':>24}"
             )
@@ -363,26 +379,26 @@ def main():
         avg_data = format_metric(r['avg_data_per_round_mb_mean'], r['avg_data_per_round_mb_std'], '.2f', n)
 
         print(
-            f"{r['dataset']:<15} | {r['strategy']:<16} | {n:>4} | "
+            f"{r['dataset']:<15} | {r['strategy']:<20} | {n:>4} | "
             f"{acc:>22} | {conv:>20} | "
             f"{total_data:>22} | {avg_time:>22} | "
             f"{avg_data:>24}"
         )
 
     # ======================================================================
-    # EXIBIÇÃO: Linhas de Improvement (PUMA-GT vs LoRA Padrão)
+    # EXIBIÇÃO: Linhas de Improvement (PUMA-GT Rank Adap vs LoRA Padrão)
     # ======================================================================
     improvement_data = {}  # dataset -> dict de improvements
     if args.improvement:
-        print("-" * 160)
+        print("-" * 168)
         datasets_list = ["OxfordPets", "DTD", "FGVCAircraft", "Flowers102"]
         for ds in datasets_list:
-            puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT' and r['status'] == 'OK'), None)
+            puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT Rank Adap' and r['status'] == 'OK'), None)
             lora = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'LoRA Padrão' and r['status'] == 'OK'), None)
 
             if puma is None or lora is None:
                 print(
-                    f"{ds:<15} | {'⚡ Improvement':<16} | {'---':>4} | "
+                    f"{ds:<15} | {'⚡ Improvement':<20} | {'---':>4} | "
                     f"{'--- DADOS INSUF. ---':>22} | {'---':>20} | "
                     f"{'---':>22} | {'---':>22} | {'---':>24}"
                 )
@@ -398,42 +414,69 @@ def main():
             dpr_imp = format_improvement(imp['avg_data_round'])
 
             print(
-                f"{ds:<15} | {'⚡ Improvement':<16} | {'':>4} | "
+                f"{ds:<15} | {'⚡ Improvement':<20} | {'':>4} | "
                 f"{acc_imp:>22} | {conv_imp:>20} | "
                 f"{data_imp:>22} | {time_imp:>22} | "
                 f"{dpr_imp:>24}"
             )
 
-    print("=" * 160)
+    print("=" * 168)
 
     # ======================================================================
-    # EXIBIÇÃO: Análise comparativa por dataset
+    # EXIBIÇÃO: Eleição do melhor por atributo (por dataset)
     # ======================================================================
     print("\n")
     datasets = ["OxfordPets", "DTD", "FGVCAircraft", "Flowers102"]
-    strategies = ["LoRA Padrão", "SoRA Estático", "PUMA-GT"]
+
+    # Definição dos atributos com: (label, chave_mean, higher_is_better)
+    attributes = [
+        ("Acurácia Final",       'final_accuracy_mean',              True),
+        ("Rodada Converg.",      'convergence_round_mean',           False),
+        ("Dados Total (MB)",     'total_data_transmitted_mb_mean',   False),
+        ("Tempo Médio/Rod (s)",  'avg_round_time_s_mean',            False),
+        ("Dados Médios/Rod (MB)",'avg_data_per_round_mb_mean',       False),
+    ]
+
+    # Contagem global de vitórias por estratégia
+    global_wins = {}  # strategy -> count
 
     for ds in datasets:
         ds_results = [r for r in all_results if r['dataset'] == ds and r['status'] == 'OK']
         if len(ds_results) < 2:
             continue
 
-        print(f"📊 COMPARATIVO — {ds}")
-        print("-" * 80)
+        print(f"🏅 ELEIÇÃO DO MELHOR — {ds}")
+        print("-" * 90)
+        print(f"  {'Atributo':<25} | {'Melhor Estratégia':<22} | {'Valor':>15}")
+        print(f"  {'-'*25}-+-{'-'*22}-+-{'-'*15}")
 
-        # Encontrar melhor acurácia
-        best_acc = max(ds_results, key=lambda x: x['final_accuracy_mean'])
-        # Encontrar menor total de dados
-        least_data = min(ds_results, key=lambda x: x['total_data_transmitted_mb_mean'])
-        # Encontrar convergência mais rápida
-        fastest_conv = min(ds_results, key=lambda x: x['convergence_round_mean'])
-        # Encontrar menor tempo por rodada
-        fastest_round = min(ds_results, key=lambda x: x['avg_round_time_s_mean'])
+        for label, key, higher_is_better in attributes:
+            if higher_is_better:
+                best = max(ds_results, key=lambda x: x[key])
+            else:
+                best = min(ds_results, key=lambda x: x[key])
 
-        print(f"  🏆 Melhor acurácia:         {best_acc['strategy']} ({best_acc['final_accuracy_mean']:.2f}%)")
-        print(f"  📉 Menos dados transmitidos: {least_data['strategy']} ({least_data['total_data_transmitted_mb_mean']:.2f} MB)")
-        print(f"  ⚡ Convergência mais rápida: {fastest_conv['strategy']} (rodada {fastest_conv['convergence_round_mean']:.1f})")
-        print(f"  🚀 Rodada mais rápida:       {fastest_round['strategy']} ({fastest_round['avg_round_time_s_mean']:.2f}s)")
+            val = best[key]
+            strat = best['strategy']
+
+            # Contabilizar vitória global
+            global_wins[strat] = global_wins.get(strat, 0) + 1
+
+            print(f"  {label:<25} | {strat:<22} | {val:>15.2f}")
+
+        print()
+
+    # ======================================================================
+    # EXIBIÇÃO: Resumo global de vitórias
+    # ======================================================================
+    if global_wins:
+        print("🏆 RESUMO GLOBAL — Vitórias por estratégia (total de 'melhor' em todos os datasets)")
+        print("=" * 60)
+        sorted_wins = sorted(global_wins.items(), key=lambda x: x[1], reverse=True)
+        for rank, (strat, count) in enumerate(sorted_wins, 1):
+            medal = ["🥇", "🥈", "🥉", "  "][min(rank - 1, 3)]
+            print(f"  {medal} {strat:<22} : {count} vitória(s)")
+        print("=" * 60)
         print()
 
     # ======================================================================
@@ -493,7 +536,7 @@ def main():
             for ds, imp in improvement_data.items():
                 writer.writerow({
                     'Dataset': ds,
-                    'Estrategia': 'IMPROVEMENT (PUMA-GT vs LoRA)',
+                    'Estrategia': 'IMPROVEMENT (PUMA-GT Rank Adap vs LoRA)',
                     'N_Runs': '',
                     'Improvement_Acuracia_%': f"{imp['accuracy']:.4f}",
                     'Improvement_Convergencia_%': f"{imp['convergence']:.4f}",
