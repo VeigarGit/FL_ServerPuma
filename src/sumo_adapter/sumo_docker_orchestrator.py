@@ -61,7 +61,7 @@ MAX_ETC = 120.0
 # Segundos de warmup antes de comecar a sinalizar encontros.
 # Permite que os conteineres Docker iniciem, carreguem o modelo e
 # completem pelo menos 1 epoca de treino local.
-DEFAULT_WARMUP = 30
+DEFAULT_WARMUP = 60
 
 # Segundos de cooldown entre encontros consecutivos.
 # Impede que mudancas incrementais na composicao do cluster
@@ -476,10 +476,16 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     compose_file = compose_generate(
         client_indices=client_indices,
         dataset=args.dataset,
-        rounds=3,  # No modo descentralizado, o cliente roda em loop infinito
+        rounds=3,
         prune=args.prune,
         ala=args.ala,
         exp_name='default_exp_v2x',
+        max_epochs=args.max_epochs,
+        model=args.model,
+        config=args.config,
+        strategy=args.strategy,
+        rank=args.rank,
+        paca=args.paca,
     )
 
     if not docker_compose_up(compose_file, PROJECT_ROOT, build=args.build):
@@ -747,7 +753,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="V2X Opportunistic FL Orchestrator (ETC + D-PSGD)",
+        description="V2X Opportunistic FL Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -819,6 +825,17 @@ def main():
         "--step-length", type=float, default=DEFAULT_STEP_LENGTH,
         help=f"Duracao de cada step do SUMO em segundos (default: {DEFAULT_STEP_LENGTH})",
     )
+    parser.add_argument(
+        "--max-epochs", type=int, default=0,
+        help="Limite de epocas por cliente no modo descentralizado (0 = sem limite, default: 0)",
+    )
+    
+    # ── Parametros do Modelo (CNN / CLIP) ─────────────────────────────────
+    parser.add_argument("--model", type=str, default="cnn", choices=["cnn", "clip"], help="Modelo a ser utilizado (default: cnn)")
+    parser.add_argument("--config", type=str, default="lora_clip/train_config.yml", help="Caminho do config YAML para o CLIP")
+    parser.add_argument("--strategy", type=str, default="lora", choices=["lora", "adalora", "sora_with_schedule", "sora_no_schedule"], help="Estrategia de PEFT")
+    parser.add_argument("--rank", type=int, default=8, help="Rank para LoRA/SoRA")
+    parser.add_argument("--paca", type=int, default=12, help="Numero de camadas upper para a estrategia PaCA")
 
     args = parser.parse_args()
     run_orchestrator(args)

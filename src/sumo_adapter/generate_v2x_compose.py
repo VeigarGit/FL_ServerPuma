@@ -26,17 +26,23 @@ def generate(
     prune: int,
     ala: int,
     exp_name: str,
+    max_epochs: int = 0,
+    model: str = "cnn",
+    config: str = "lora_clip/train_config.yml",
+    strategy: str = "lora",
+    rank: int = 8,
+    paca: int = 12,
 ) -> str:
     """Gera um docker-compose.yml customizado para o modo V2X descentralizado.
     
     Args:
         client_indices: Lista de indices dos clientes (ex: [0, 1, 2, 3, 4])
         dataset: Nome do dataset (ex: "MNIST", "Cifar10", "Cifar100")
-        rounds: Numero de rodadas (repassado ao client.py, mas no modo
-                descentralizado o cliente roda em loop infinito)
+        rounds: Numero de rodadas (repassado ao client.py)
         prune: Flag de pruning (0=ativo, 1=desativado)
         ala: Flag de FedALA (0=ativo, 1=desativado/FedAvg)
         exp_name: Nome do experimento para salvar os resultados
+        max_epochs: Limite de epocas (0 = sem limite)
     
     Returns:
         Caminho absoluto do arquivo docker-compose.v2x.yml gerado
@@ -97,6 +103,7 @@ services:
     # Cada cliente recebe seu indice unico (--client-idx) que define qual
     # particao do dataset ele usa e como ele se identifica nos encontros.
     for i, client_idx in enumerate(client_indices):
+        epochs_line = f"\n      --max-epochs {max_epochs}" if max_epochs > 0 else ""
         template += f"""\
   client-v2x-{i}:
     <<: *client
@@ -110,6 +117,11 @@ services:
       --prune {prune}
       --ala {ala}
       --exp-name {exp_name}
+      --model {model}
+      --config {config}
+      --strategy {strategy}
+      --rank {rank}
+      --paca {paca}{epochs_line}
 
 """
 
