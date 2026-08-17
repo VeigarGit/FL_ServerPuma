@@ -34,7 +34,8 @@ model:
     min_rank: 2
 
 training:
-  batch_size: 16
+  batch_size: 2
+  gradient_accumulation_steps: 8
   epochs: 1
   test_size: 0.2
   seed: 42

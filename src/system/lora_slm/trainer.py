@@ -30,6 +30,7 @@ class ModelTrainer:
         self.run_mode = config["model"]["lora"]["mode"]
         self.is_sora = is_sora
         self.sora_config = config["model"].get("sora", {})
+        self.accumulation_steps = config.get("training", {}).get("gradient_accumulation_steps", 1)
 
     def print_metrics(self, epoch, num_epochs, metrics, eval_acc, phase_label):
         """
@@ -66,7 +67,7 @@ class ModelTrainer:
         sparse_lambda = self.sora_config.get("sparse_lambda", 0.0) if self.is_sora else 0.0
 
         for epoch in range(num_epochs):
-            metrics = train_epoch(self.model, self.train_loader, self.optimizer, self.sparse_optimizer, sparse_lambda)
+            metrics = train_epoch(self.model, self.train_loader, self.optimizer, self.sparse_optimizer, sparse_lambda, self.accumulation_steps)
             eval_acc = evaluate(self.model, self.eval_loader)
 
             self.scheduler.step()

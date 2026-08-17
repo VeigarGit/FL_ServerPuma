@@ -257,9 +257,15 @@ else
 fi
 
 # ---- Validação ----
-if [ "$MODEL" = "clip" ] && [ -z "$CONFIG_FILE" ]; then
-    echo "❌ Erro: Ao usar --model clip, forneça o caminho do YAML usando --config."
-    exit 1
+if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ]; then
+    if [ -z "$CONFIG_FILE" ]; then
+        if [ "$MODEL" = "slm" ]; then
+            CONFIG_FILE="lora_slm/train_config.yml"
+        else
+            echo "❌ Erro: Ao usar --model $MODEL, forneça o caminho do YAML usando --config."
+            exit 1
+        fi
+    fi
 fi
 
 # ---- Exibição da Configuração ----
@@ -271,6 +277,8 @@ echo "  Dataset: $DATASET | Prune: $PRUNE"
 echo "  ALA (0=FedALA, 1=FedAvg): $ALA"
 if [ "$MODEL" = "clip" ]; then
     echo "  🔥 Modelo: CLIP | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
+elif [ "$MODEL" = "slm" ]; then
+    echo "  🧠 Modelo: SLM (Qwen-VL) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 else
     echo "  🧊 Modelo: CNN Simples Padrão"
 fi
@@ -314,13 +322,13 @@ if [ -n "$EXP_NAME_OVERRIDE" ]; then
     EXP_NAME="$EXP_NAME_OVERRIDE"
 else
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca_${TIMESTAMP}"
+        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca"
     elif [ "$RANDOM_PACA" -eq 1 ]; then
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_randompaca_${TIMESTAMP}"
+        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_randompaca"
     elif [ -n "$PACA_LIST" ]; then
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_pacalist_${TIMESTAMP}"
+        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_pacalist"
     else
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_paca${PACA}_${TIMESTAMP}"
+        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_paca${PACA}"
     fi
 fi
 echo "📁 Diretório de Resultados: ../results/$EXP_NAME"
@@ -346,7 +354,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
     mkdir -p "$LOG_DIR"
 
     # Comando do servidor
-    SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME"
+    SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME --timestamp $TIMESTAMP"
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-paca"
     fi
@@ -384,7 +392,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --num-classes $NUM_CLASSES --in-features $IN_FEATURES --run-id $RUN --exp-name $EXP_NAME 2>&1 | tee $LOG_DIR/client_$i.log"
+        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --num-classes $NUM_CLASSES --in-features $IN_FEATURES --run-id $RUN --exp-name $EXP_NAME --timestamp $TIMESTAMP 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
             CLIENT_CMD="$CLIENT_CMD ; read"
         fi

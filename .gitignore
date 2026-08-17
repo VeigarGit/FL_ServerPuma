@@ -43,5 +43,6 @@ docker-tc/
 # =========================
 # Arquivos Temporários
 # =========================
-*~*.pth
+*.pth
 *.pt
+*.log

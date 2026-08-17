@@ -103,8 +103,8 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
     if round_num >= 2 and prune == 1:
         if model_type == 'cnn':
             state_dict = map_sequential_to_simplemodel(state_dict)
-    # === CORREÇÃO ESTRUTURAL APENAS PARA O CLIP ===
-    if model_type == 'clip':
+    # === CORREÇÃO ESTRUTURAL PARA CLIP E SLM ===
+    if model_type in ['clip', 'slm']:
         # 1. 'model' contém nossos pesos locais. 
         # Criamos o 'global_model' copiando a estrutura atual.
         global_model = copy.deepcopy(model)
@@ -113,27 +113,15 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
         global_model = resize_model_to_pruned(global_model, state_dict)
         
         # 3. Agora temos os mundos perfeitamente isolados:
-        # model -> Possui os Pesos Locais
-        # global_model -> Possui os Pesos Globais
         
         if alaarg == 0 and round_num >= 2:
             logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
-            
-            # O FedALA lê os dois modelos, calcula a proporção ideal 
-            # e salva o resultado da mistura DENTRO do 'model'
             local_initialization(ala, global_model, model)
-            
-            # Avaliação imediata pós-ALA para ver se a mistura foi boa
             personalized_acc, _ = evaluate_model(model, test_loader)
             logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
         else:
-            # Fluxo FedAvg Clássico (alaarg != 0) ou Rodada 1: 
-            # ATENÇÃO: Nunca use set_parameters(model, global_model) aqui se o shape puder mudar (SoRA).
-            # set_parameters troca o ponteiro de .data e corrompe o grafo do otimizador/CUDA.
-            # O resize_model_to_pruned recria o nn.Parameter com segurança via setattr se o shape mudar.
             resize_model_to_pruned(model, state_dict)
             
-        # Limpa o modelo global da memória para evitar Out Of Memory (OOM) na GPU
         del global_model
         
     else:
@@ -157,14 +145,13 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
     device = next(model.parameters()).device
     
     # --- 1. SELEÇÃO DE OTIMIZADOR ---
-    if model_type == 'clip':
-        from lora_clip.clip_setup import build_optimizer, train_epoch, update_paca_runtime
+    if model_type in ['clip', 'slm']:
+        if model_type == 'clip':
+            from lora_clip.clip_setup import build_optimizer, train_epoch, update_paca_runtime
+        else:
+            from lora_slm.slm_setup import build_optimizer, train_epoch, update_paca_runtime
         
         # --- PaCA RUNTIME UPDATE ---
-        # Atualiza o boundary de gradientes e congela/descongela adaptadores
-        # ANTES de construir o optimizer, garantindo que apenas os parâmetros
-        # dentro do PaCA atual sejam incluídos nos param_groups.
-        # Deve rodar APÓS resize_model_to_pruned (que pode recriar nn.Parameter).
         paca_config = run_config["model"].get("paca", {})
         if paca_config.get("enabled"):
             update_paca_runtime(model, paca_config.get("upper_layers"))
@@ -174,16 +161,22 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
         if not hasattr(model, '_last_trainable_count') or model._last_trainable_count != trainable_count:
             logger.info(f"[DIAG] Parâmetros treináveis neste round: {trainable_count:,}")
             model._last_trainable_count = trainable_count
+            
+        # VRAM OPTIMIZATION: Habilita Gradient Checkpointing para SLM (Ação 1)
+        if model_type == 'slm':
+            if hasattr(model, "slm_model") and hasattr(model.slm_model, "gradient_checkpointing_enable"):
+                model.slm_model.gradient_checkpointing_enable()
+                logger.info("Gradient Checkpointing ativado no SLM (Redução de VRAM).")
         
-        # O build_optimizer já sabe se é LoRA ou SoRA lendo o run_config. 
-        # Como é só LoRA, sparse_optimizer será None.
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
-        # Verifica se o SoRA está ativo e resgata o lambda de esparsidade do YAML
         is_sora = run_config["model"]["lora"]["mode"] in ["with_sora_no_schedule", "with_sora_schedule"]
         sparse_lambda = run_config["model"].get("sora", {}).get("sparse_lambda", 0.0) if is_sora else 0.0
         
-        # O train_epoch já faz o loop no train_loader, calcula as perdas e atualiza os pesos
-        metrics = train_epoch(model, train_loader, optimizer, sparse_optimizer, sparse_lambda)
+        if model_type == 'slm':
+            accumulation_steps = run_config.get("training", {}).get("gradient_accumulation_steps", 1)
+            metrics = train_epoch(model, train_loader, optimizer, sparse_optimizer, sparse_lambda, accumulation_steps)
+        else:
+            metrics = train_epoch(model, train_loader, optimizer, sparse_optimizer, sparse_lambda)
         
         logger.info(f"Métricas do Treino Local - CE Loss: {metrics['ce_loss']:.4f} | Sparse Loss: {metrics['sparse_loss']:.4f}")
     else:
@@ -221,21 +214,62 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
                 sparse_optimizer.step()
     
     # --- 2. SELEÇÃO DOS PESOS QUE SERÃO ENVIADOS PARA O SERVIDOR ---
-    if model_type == 'clip':
-        from lora_clip.sora import get_trainable_state_dict
-        return get_trainable_state_dict(model), personalized_acc # Envia APENAS o LoRA e Head, e a acuracia pos-ALA
+    if model_type in ['clip', 'slm']:
+        if model_type == 'clip':
+            from lora_clip.sora import get_trainable_state_dict
+        else:
+            from lora_slm.sora import get_trainable_state_dict
+        return get_trainable_state_dict(model), personalized_acc 
     else:
-        return model.state_dict(), personalized_acc # Envia tudo do CNN, e a acuracia pos-ALA
+        return model.state_dict(), personalized_acc 
 
 
 
-import torchvision.transforms as T # Adicione isto no topo dos imports
+import torchvision.transforms as T
+from PIL import Image
 
-def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip=False):
+def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip=False, is_slm=False, slm_config=None):
     train_data = read_client_data(dataset, client_idx, is_train)
     X, y = zip(*train_data)
     X = torch.stack(X)
     
+    if is_slm:
+        from lora_slm.slm_setup import CustomCollator
+        from transformers import AutoProcessor
+        
+        processor = AutoProcessor.from_pretrained(slm_config["model"]["name"])
+        label_to_idx = {i: i for i in range(1000)}
+        label_to_idx.update({str(i): i for i in range(1000)})
+        collate_fn = CustomCollator(processor, label_to_idx)
+        
+        slm_data = []
+        for x_tensor, y_tensor in zip(X, y):
+            x_tensor = x_tensor.cpu()
+            
+            # Se o tensor estiver normalizado (ex: CIFAR [-1, 1]), desfazemos a normalização
+            if x_tensor.min() < 0:
+                x_tensor = x_tensor * 0.5 + 0.5
+                
+            if x_tensor.max() <= 1.0:
+                x_tensor = x_tensor * 255.0
+                
+            # Clamp de segurança para garantir [0, 255]
+            x_tensor = torch.clamp(x_tensor, 0, 255)
+            x_numpy = x_tensor.byte().numpy()
+            
+            if x_numpy.shape[0] in [1, 3]: # (C, H, W)
+                x_numpy = np.transpose(x_numpy, (1, 2, 0))
+            if x_numpy.shape[-1] == 1:
+                x_numpy = np.squeeze(x_numpy, axis=-1)
+                
+            pil_img = Image.fromarray(x_numpy)
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+            
+            slm_data.append({"image": pil_img, "label": y_tensor.item()})
+            
+        return DataLoader(slm_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+
     # Redimensionamento vital para o CLIP não quebrar
     if is_clip:
         resize = T.Resize((224, 224), antialias=True)
@@ -254,7 +288,8 @@ def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, 
     b = "FedALA" if argalgo == 0 else "FedAVG"
     
     paca_val = args.paca if (args.paca is not None and args.paca > 0) else 0
-    algo = f"client_{idx}_{args.dataset}_{args.strategy}_rank{args.rank}_paca{paca_val}_{b}_run{args.run_id}"
+    ts_suffix = f"_{args.timestamp}" if hasattr(args, 'timestamp') and args.timestamp else ""
+    algo = f"client_{idx}_{args.dataset}_{args.strategy}_rank{args.rank}_paca{paca_val}_{b}_run{args.run_id}{ts_suffix}"
     
     current_dir = Path(__file__).resolve().parent
     result_path = current_dir.parent / "results" / args.exp_name
@@ -321,7 +356,8 @@ def parse_args():
     parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
     parser.add_argument('--experiments', type=int, default=1)
     parser.add_argument('--run-id', type=int, default=1)
-    parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão com timestamp')
+    parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão')
+    parser.add_argument('--timestamp', type=str, default='', help='Timestamp para diferenciar rodadas de simulação')
     parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'adalora', 'sora_with_schedule', 'sora_no_schedule'])
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA') 
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas para a estratégia PaCA')
@@ -403,8 +439,12 @@ def main():
                 case _:
                     logger.error(f"Dataset inválido: {args.dataset}")
                     sys.exit(1)
-        case 'clip':
-            config = load_config(args.config)
+        case 'clip' | 'slm':
+            if args.model == 'clip':
+                config = load_config(args.config)
+            else:
+                from lora_slm.slm_setup import load_config as load_config_slm
+                config = load_config_slm(args.config)
             
             if args.strategy == 'lora':
                 config["model"]["lora"]["mode"] = "with_lora"
@@ -429,11 +469,17 @@ def main():
                 config["model"]["paca"]["enabled"] = False
                 config["model"]["paca"]["upper_layers"] = None
             
-            # Resolve o modo de execução a partir do YAML modificado
-            run_mode = resolve_run_modes(config)[0]
-            run_config = build_run_config(config, run_mode=run_mode)
-            
-            model = build_model(config=run_config, num_classes=args.num_classes, device=device)
+            if args.model == 'clip':
+                run_mode = resolve_run_modes(config)[0]
+                run_config = build_run_config(config, run_mode=run_mode)
+                model = build_model(config=run_config, num_classes=args.num_classes, device=device)
+            else:
+                from lora_slm.slm_setup import resolve_run_modes as resolve_run_modes_slm
+                from lora_slm.slm_setup import build_run_config as build_run_config_slm
+                from lora_slm.slm_setup import build_model as build_model_slm
+                run_mode = resolve_run_modes_slm(config)[0]
+                run_config = build_run_config_slm(config, run_mode=run_mode)
+                model = build_model_slm(config=run_config, num_classes=args.num_classes, device=device)
             
     model = model.to(device)
     loss = nn.CrossEntropyLoss()
@@ -445,8 +491,9 @@ def main():
     
     try:
         is_clip_flag = (args.model == 'clip')
-        train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag)
-        test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag)
+        is_slm_flag = (args.model == 'slm')
+        train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None)
+        test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None)
         logger.info(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
     except Exception as e:
         logger.exception("Error loading data")

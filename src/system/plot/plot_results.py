@@ -119,8 +119,8 @@ def parse_experiment(exp_name, results_base="../../results"):
     sample = os.path.basename(server_files[0])
     
     # Exemplo: server_OxfordPets_sora_with_schedule_rank8_paca12_prune_freq1_FedAVG_run1.h5
-    # Ou: server_OxfordPets_lora_rank8_paca12_withou_Prune_freq1_FedAVG_run1.h5
-    pattern = r"server_(?P<dataset>[^_]+)_(?P<strategy>.+)_rank(?P<rank>\d+)_paca(?P<paca>\d+)_(?P<prune>.*?)_freq(?P<freq>\d+)_(?P<algo>[^_]+)_run\d+\.h5"
+    # Ou: server_OxfordPets_lora_rank8_paca12_withou_Prune_freq1_FedAVG_run1_20260817_142300.h5
+    pattern = r"server_(?P<dataset>[^_]+)_(?P<strategy>.+)_rank(?P<rank>\d+)_paca(?P<paca>\d+)_(?P<prune>.*?)_freq(?P<freq>\d+)_(?P<algo>[^_]+)_run\d+(?:_\d{8}_\d{6})?\.h5"
     
     match = re.match(pattern, sample)
     if not match:
