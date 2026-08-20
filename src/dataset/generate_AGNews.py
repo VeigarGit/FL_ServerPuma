@@ -22,6 +22,7 @@ import random
 import torchtext
 from dataset.utils.dataset_utils import check, separate_data, split_data, save_file
 from utils.language_utils import tokenizer
+from pathlib import Path
 
 
 random.seed(1)
@@ -38,9 +39,9 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
         os.makedirs(dir_path)
         
     # Setup directory for train/test data
-    config_path = dir_path + "config.json"
-    train_path = dir_path + "train/"
-    test_path = dir_path + "test/"
+    config_path = Path(dir_path) / "config.json"
+    train_path = Path(dir_path) / "train/"
+    test_path = Path(dir_path) / "test/"
 
     if check(config_path, train_path, test_path, num_clients, niid, balance, partition):
         return

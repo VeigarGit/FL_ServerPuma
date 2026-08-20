@@ -28,7 +28,7 @@ from pathlib import Path
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 5
+num_clients = 10
 dir_path = Path(__file__).parent / "MNIST"
 
 

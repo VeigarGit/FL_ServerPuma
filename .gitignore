@@ -13,6 +13,9 @@ src/dataset/Cifar10/
 src/dataset/Cifar100/
 src/dataset/MNIST/
 src/dataset/OxfordPets/
+src/dataset/Flowers102/
+src/dataset/DTD/
+src/dataset/FGVCAircraft/
 Cifar100/
 *.npz
 
@@ -35,9 +38,11 @@ src/system/dados_compartilhados/
 # Docker e Autogerados
 # =========================
 docker-tc/
-*.generated.yml
+*.yml
 
 # =========================
 # Arquivos Temporários
 # =========================
-*~
+*.pth
+*.pt
+*.log

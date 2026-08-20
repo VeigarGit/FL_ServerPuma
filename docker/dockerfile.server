@@ -8,6 +8,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 
 ENV UV_COMPILE_BYTECODE=1
+# Forçamos o uv a criar o ambiente num local blindado do SO
 ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
 
 RUN uv sync --frozen --no-dev --no-install-project
@@ -30,9 +31,10 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
+ARG NO_CACHE=1
 COPY . .
 
-RUN mkdir -p /app/src/system/dados_compartilhados
+EXPOSE 9000
 
 WORKDIR /app/src/system
-CMD ["python", "client.py"]
+CMD ["python", "server.py"]

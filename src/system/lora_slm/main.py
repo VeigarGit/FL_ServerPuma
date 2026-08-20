@@ -2,10 +2,10 @@ import os
 import torch
 import pickle
 import sys
-from transformers import CLIPProcessor
+from transformers import AutoProcessor
 
-# Importa as funções auxiliares e de configuração do clip_setup
-from clip_setup import (
+# Importa as funções auxiliares e de configuração do slm_setup
+from slm_setup import (
     parse_args, load_config, get_device, resolve_run_modes, 
     build_run_config, build_output_path, build_dataloaders,
     build_model, build_optimizer, build_scheduler, 
@@ -33,7 +33,7 @@ def main():
     device = get_device()
 
     # Inicializa o processador e os dataloaders
-    processor = CLIPProcessor.from_pretrained(config["model"]["name"])
+    processor = AutoProcessor.from_pretrained(config["model"]["name"])
     train_loader, eval_loader, class_names = build_dataloaders(config, processor, device)
     
     run_modes = resolve_run_modes(config)
@@ -54,6 +54,7 @@ def main():
 
         # 3. Benchmark de performance da atenção
         benchmark_attention(model, eval_loader, device)
+        torch.cuda.empty_cache()
 
         # 4. Inicializa otimizadores e schedulers
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
@@ -83,9 +84,11 @@ def main():
         total_epochs = run_config["training"]["epochs"]
         print(f"\nStarting run: {run_mode}")
         trainer.execute_epochs(total_epochs)
+        torch.cuda.empty_cache()
 
         # BenchMark de Inferência
         trainer.benchmark_inference(eval_loader, device)
+        torch.cuda.empty_cache()
 
         # 6. Finalização: Poda estrutural do SoRA, extração de pesos treinados e do modelo compacto
         trainable_state_dict, post_prunning_model = trainer.finalize()
@@ -105,8 +108,10 @@ def main():
         # 7. Avaliação do modelo compacto
         print("Iniciando a avaliação do modelo compacto:")
         final_trainer.execute_epochs(total_epochs)
+        torch.cuda.empty_cache()
         
         final_trainer.benchmark_inference(eval_loader, device)
+        torch.cuda.empty_cache()
 
         # 8. Quantização INT8 para redução drástica de tamanho
         print(f"Tamanho antes da quantização: {sys.getsizeof(pickle.dumps(trainable_state_dict)) / 1024**2:.2f} MB")

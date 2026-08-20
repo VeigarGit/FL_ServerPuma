@@ -14,6 +14,17 @@ model:
       - k_proj
       - v_proj
       - out_proj
+
+  adalora:
+    init_r: 8
+    target_r: 1
+    tinit: 100
+    tfinal: 100
+    deltaT: 10
+    beta1: 0.85
+    beta2: 0.85
+    orth_reg_weight: 0.5
+    total_step: 500
   paca:                     # ← NOVO
     enabled: true
     #Testar para todas as camadas com fine tuning
@@ -21,13 +32,14 @@ model:
     upper_layers: null    # se quiser desabilitar
   sora:
     sparse_lambda: 0.001
-    sparse_lambda_2: 3.0e-4 # Testar para 3.0e-4
-    sparse_lr: null
+    sparse_lambda_2: 0.10    # Aumentado de 0.05 (pressão inicial moderada)
+    sparse_lr: 0.01
     lambda_schedule: linear
-    max_lambda: 7.0e-4
-    lambda_num: 2
+    max_lambda: 0.20         # Aumentado de 0.05 (força os gates desnecessários para 0)
+    lambda_num: 10           # Aumentado de 2 (progressão mais suave e longa)
     schedule_epochs: 1
-    pre_prune_ratio: 0.25   # 50% dos ranks serão removidos antes do treino
+    pre_prune_ratio: 0.0     # Zerado para começar com a mesma capacidade do LoRA e reter acurácia
+    min_rank: 2              # Rank mínimo por módulo SoRA (evita over-pruning)
   
 training:
   batch_size: 32

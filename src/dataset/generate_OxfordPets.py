@@ -11,7 +11,7 @@ from pathlib import Path
 random.seed(1)
 np.random.seed(1)
 # Você pode aumentar isso aqui se quiser simular mais clientes futuramente
-num_clients = 10
+num_clients = 22
 dir_path = Path(__file__).parent / "OxfordPets"
 
 def generate_dataset(dir_path: Path, num_clients, niid, balance, partition):

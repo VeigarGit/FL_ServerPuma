@@ -55,6 +55,7 @@ echo "▶️ [2/4] Executando: SoRA (PaCA 12, Com Pruning)"
     --strategy sora_with_schedule \
     --paca $PACA \
     --prune 0 \
+    --sora-prune \
     --prune-freq 1 \
     --rank $RANK
 
@@ -79,6 +80,7 @@ echo "▶️ [3/4] Executando: SoRA (PaCA Adaptativo, Com Pruning)"
     --paca $PACA \
     --adaptive-paca \
     --prune 0 \
+    --sora-prune \
     --prune-freq 1 \
     --rank $RANK
 

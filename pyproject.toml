@@ -34,14 +34,17 @@ dependencies = [
     "higher",
     "diffusers",
     "accelerate",
-    "transformers",
+    "transformers>=4.49.0",
     "datasets>=4.8.5",
     "pyyaml>=6.0.3",
     "peft>=0.19.1",
     "pillow>=12.1.1",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-    "torchaudio>=2.11.0",
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "torchaudio>=2.1.0",
+    "traci>=1.27.1",
+    "sumolib>=1.27.1",
+    "qwen-vl-utils[decord]>=0.0.14",
 ]
 
 [tool.ruff]
@@ -55,8 +58,12 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu118"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
 [tool.hatch.build.targets.wheel]
 packages = ["src/system", "src/dataset", "src/utils"]

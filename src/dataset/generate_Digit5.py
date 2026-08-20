@@ -25,6 +25,7 @@ from os import path
 from scipy.io import loadmat
 from PIL import Image
 from torch.utils.data import DataLoader
+from pathlib import Path
 
 
 # https://github.com/FengHZ/KD3A/blob/master/datasets/DigitFive.py
@@ -209,9 +210,9 @@ def generate_dataset(dir_path):
         os.makedirs(dir_path)
         
     # Setup directory for train/test data
-    config_path = dir_path + "config.json"
-    train_path = dir_path + "train/"
-    test_path = dir_path + "test/"
+    config_path = Path(dir_path) / "config.json"
+    train_path = Path(dir_path) / "train/"
+    test_path = Path(dir_path) / "test/"
 
     if not os.path.exists(train_path):
         os.makedirs(train_path)

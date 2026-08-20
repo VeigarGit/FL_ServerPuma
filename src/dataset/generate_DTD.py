@@ -12,7 +12,7 @@ from pathlib import Path
 random.seed(1)
 np.random.seed(1)
 num_clients = 20
-dir_path = "StanfordCars/"
+dir_path = "DTD/"
 
 
 # Allocate data to users
@@ -31,7 +31,7 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
     dataset_image = []
     dataset_label = []
         
-    # Get StanfordCars data
+    # Get DTD data
     transform = transforms.Compose(
         [transforms.Resize((64, 64)), 
         transforms.ToTensor(), 
@@ -39,7 +39,7 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
     )
 
     def load_data(split="train"):
-        trainset = torchvision.datasets.StanfordCars(
+        trainset = torchvision.datasets.DTD(
             root=dir_path+"rawdata", split=split, download=True, transform=transform)
         trainloader = torch.utils.data.DataLoader(
             trainset, batch_size=len(trainset), shuffle=False)
@@ -49,6 +49,7 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
         dataset_label.extend(trainset.targets.cpu().detach().numpy())
 
     load_data("train")
+    load_data("val")
     load_data("test")
 
     dataset_image = np.array(dataset_image)
@@ -58,7 +59,7 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
     print(f'Number of classes: {num_classes}')
 
     X, y, statistic = separate_data((dataset_image, dataset_label), num_clients, num_classes, 
-                                    niid, balance, partition, class_per_client=20)
+                                    niid, balance, partition, class_per_client=10)
     train_data, test_data = split_data(X, y)
     save_file(config_path, train_path, test_path, train_data, test_data, num_clients, num_classes, 
         statistic, niid, balance, partition)

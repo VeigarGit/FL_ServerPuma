@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import yaml
 from datasets import ClassLabel, load_dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, AdaLoraConfig, get_peft_model
 from sklearn.metrics import accuracy_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
@@ -13,10 +13,17 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import CLIPModel, CLIPProcessor
 
-from .sora import SoRAWrappedLinear, SparseAdamW
+from .sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
 
 DEFAULT_CONFIG_PATH = Path("train_config.yml")
-VALID_LORA_MODES = {"with_lora", "without_lora", "both", "with_sora_no_schedule", "with_sora_schedule"}
+VALID_LORA_MODES = {
+    "with_lora",
+    "with_adalora",
+    "without_lora",
+    "both",
+    "with_sora_no_schedule",
+    "with_sora_schedule",
+}
 SORA_MODES = {"with_sora_no_schedule", "with_sora_schedule"}
 
 class CLIPForClassification(nn.Module):
@@ -209,7 +216,7 @@ def apply_sora(model, lora_config, upper_k=None):
         for target in target_modules:
             if not name.endswith(target):
                 continue
-            
+
             # Filtro PaCA: Verifica se a camada está entre as últimas 'upper_k'
             if upper_k is not None:
                 if "encoder.layers." not in name:
@@ -234,6 +241,135 @@ def apply_sora(model, lora_config, upper_k=None):
         setattr(parent, child_name, wrapped)
 
     print(f"SoRA aplicado a {len(replacements)} módulos (Últimas {upper_k or 'todas'} camadas)")
+
+
+def _get_encoder_layers(model):
+    """Encontra as camadas do encoder em modelos PEFT-wrapped ou raw."""
+    vision = model.vision_model
+    # PEFT envolve o modelo: base_model.model contém o original
+    if hasattr(vision, 'base_model') and hasattr(vision.base_model, 'model'):
+        return vision.base_model.model.encoder.layers
+    return vision.encoder.layers
+
+
+def _apply_paca_gradient_boundary(model, upper_k):
+    """
+    Registra um forward hook que interrompe a propagação de gradientes
+    nas camadas abaixo do boundary do PaCA.
+    
+    Referência teórica: Em partial fine-tuning, camadas inferiores sem
+    parâmetros treináveis não precisam de gradientes de ativação.
+    (Head2Toe — Evci et al. 2022, Ladder Side-Tuning — Sung et al. 2022)
+    """
+    encoder_layers = _get_encoder_layers(model)
+    total_layers = len(encoder_layers)
+    
+    if upper_k >= total_layers:
+        return  # PaCA cobre todas as camadas, nada a cortar
+    
+    boundary_idx = total_layers - upper_k - 1
+    
+    def detach_hook(module, input, output):
+        # Só interrompe gradientes durante treino; em eval é no-op
+        if not module.training:
+            return output
+        # CLIPEncoderLayer retorna (hidden_states,) ou (hidden_states, attn_weights)
+        if isinstance(output, tuple):
+            return (output[0].detach(),) + output[1:]
+        return output.detach()
+    
+    handle = encoder_layers[boundary_idx].register_forward_hook(detach_hook)
+    # Armazena o handle no modelo para poder remover se necessário
+    if not hasattr(model, '_paca_hooks'):
+        model._paca_hooks = []
+    model._paca_hooks.append(handle)
+    
+    print(f"PaCA gradient boundary: camadas 0-{boundary_idx} não propagarão gradientes "
+          f"(economia de ~{(boundary_idx + 1) / total_layers * 100:.0f}% no backward pass)")
+
+
+def update_paca_runtime(model, new_upper_k):
+    """
+    Atualiza o PaCA em runtime sem reconstruir o modelo.
+
+    Chamado pelo cliente quando o servidor ajusta o PaCA adaptativamente.
+    Garante que a economia computacional reflita o novo valor de PaCA,
+    atualizando tanto o corte de gradientes quanto o estado dos adaptadores.
+
+    Operações:
+      1. Remove os forward hooks de gradiente existentes (_paca_hooks)
+      2. Registra novo hook de boundary na posição correta
+      3. Congela adaptadores (SoRA/LoRA) em camadas fora do novo PaCA
+      4. Descongela adaptadores dentro do novo PaCA (necessário quando PaCA sobe)
+
+    Referência teórica: PaCA (Partial Calibration) restringe o fine-tuning
+    às últimas upper_k camadas do encoder. Camadas abaixo do boundary não
+    precisam de gradientes, e seus adaptadores não devem ser atualizados.
+
+    Args:
+        model: O modelo CLIPForClassification com adaptadores injetados.
+        new_upper_k: Número de camadas superiores a treinar (novo valor PaCA).
+                     Se None, todas as camadas ficam ativas.
+    """
+    encoder_layers = _get_encoder_layers(model)
+    total_layers = len(encoder_layers)
+
+    # --- 1. REMOVE HOOKS ANTIGOS ---
+    # Os hooks são armazenados em model._paca_hooks pelo _apply_paca_gradient_boundary.
+    # Remover antes de registrar novos evita hooks duplicados ou conflitantes.
+    if hasattr(model, '_paca_hooks'):
+        for handle in model._paca_hooks:
+            handle.remove()
+        model._paca_hooks = []
+
+    # --- 2. REGISTRA NOVO HOOK NA POSIÇÃO CORRETA ---
+    # _apply_paca_gradient_boundary já lida com o caso upper_k >= total_layers
+    # (retorna sem registrar hook, permitindo backward completo).
+    if new_upper_k is not None:
+        _apply_paca_gradient_boundary(model, new_upper_k)
+
+    # --- 3/4. FREEZE/UNFREEZE DE ADAPTADORES ---
+    # Camadas abaixo do boundary não precisam de gradientes nos adaptadores.
+    # Congelar seus parâmetros traz 3 benefícios:
+    #   a) PyTorch não constrói o grafo de autograd para esses ops (menos memória)
+    #   b) O optimizer não itera sobre eles (menos overhead por step)
+    #   c) get_trainable_state_dict não os inclui (menos dados enviados ao servidor)
+    if new_upper_k is None or new_upper_k >= total_layers:
+        boundary_layer = 0  # Todas as camadas estão ativas
+    else:
+        boundary_layer = total_layers - new_upper_k
+
+    frozen_count = 0
+    unfrozen_count = 0
+
+    for name, param in model.named_parameters():
+        # Filtra apenas parâmetros de adaptadores (SoRA ou LoRA via PEFT)
+        if "sora" not in name and "lora" not in name:
+            continue
+        # Filtra apenas parâmetros dentro de encoder layers
+        if "encoder.layers." not in name:
+            continue
+
+        try:
+            layer_idx = int(name.split("encoder.layers.")[1].split(".")[0])
+        except (ValueError, IndexError):
+            continue
+
+        if layer_idx < boundary_layer:
+            # Camada fora do PaCA: congelar adaptador
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen_count += 1
+        else:
+            # Camada dentro do PaCA: garantir que o adaptador está ativo
+            if not param.requires_grad:
+                param.requires_grad = True
+                unfrozen_count += 1
+
+    if frozen_count > 0 or unfrozen_count > 0:
+        print(f"PaCA runtime update: upper_k={new_upper_k}, "
+              f"boundary=layer {boundary_layer}/{total_layers}, "
+              f"frozen={frozen_count} params, unfrozen={unfrozen_count} params")
 
 
 def build_model(config, num_classes, device):
@@ -263,16 +399,73 @@ def build_model(config, num_classes, device):
     upper_k = paca_config.get("upper_layers") if paca_config.get("enabled") else None
 
     if mode == "with_lora":
+        # PaCA: restringe LoRA às últimas upper_k camadas do encoder
+        # Referência: PEFT LoraConfig.layers_to_transform (documentação oficial HuggingFace)
+        total_layers = len(vision_model.encoder.layers)
+        layers_to_transform = list(range(total_layers - upper_k, total_layers)) if upper_k else None
+        
         peft_config = LoraConfig(
             r=lora_config["r"],
             lora_alpha=lora_config["alpha"],
             target_modules=lora_config["target_modules"],
             lora_dropout=lora_config["dropout"],
             bias=lora_config["bias"],
+            layers_to_transform=layers_to_transform,
         )
         model.vision_model = get_peft_model(model.vision_model, peft_config)
+    elif mode == "with_adalora":
+        # PaCA: restringe LoRA às últimas upper_k camadas do encoder
+        # Referência: PEFT LoraConfig.layers_to_transform (documentação oficial HuggingFace)
+        total_layers = len(vision_model.encoder.layers)
+        layers_to_transform = list(range(total_layers - upper_k, total_layers)) if upper_k else None
+        adalora_config = config["model"]["adalora"]
+
+        peft_config = AdaLoraConfig(
+            r=lora_config["r"],
+            init_r=adalora_config["init_r"],
+            target_r=adalora_config["target_r"],
+            tinit=adalora_config["tinit"],
+            tfinal=adalora_config["tfinal"],
+            deltaT=adalora_config["deltaT"],
+            beta1=adalora_config["beta1"],
+            beta2=adalora_config["beta2"],
+            total_step=adalora_config["total_step"],
+            orth_reg_weight=adalora_config.get("orth_reg_weight", 0.5),
+            lora_alpha=lora_config["alpha"],
+            target_modules=lora_config["target_modules"],
+            lora_dropout=lora_config["dropout"],
+            bias=lora_config["bias"],
+            layers_to_transform=layers_to_transform,
+        )
+        model.vision_model = get_peft_model(model.vision_model, peft_config)
+
+    # elif mode == "with_adalora":
+    #     total_layers = len(vision_model.encoder.layers)
+    #     layers_to_transform = list(range(total_layers - upper_k, total_layers)) if upper_k else None
+    #     
+    #     adalora_config = config["model"].get("adalora", {})
+    #     
+    #     peft_config = AdaLoraConfig(
+    #         init_r=lora_config["r"],
+    #         target_r=adalora_config.get("target_r", lora_config["r"]),
+    #         tinit=adalora_config.get("tinit", 200),
+    #         tfinal=adalora_config.get("tfinal", 1000),
+    #         deltaT=adalora_config.get("deltaT", 10),
+    #         beta1=adalora_config.get("beta1", 0.85),
+    #         beta2=adalora_config.get("beta2", 0.85),
+    #         total_step=adalora_config.get("total_step", 1500),
+    #         lora_alpha=lora_config["alpha"],
+    #         target_modules=lora_config["target_modules"],
+    #         lora_dropout=lora_config["dropout"],
+    #         layers_to_transform=layers_to_transform,
+    #     )
+    #     model.vision_model = get_peft_model(model.vision_model, peft_config)
     elif mode in SORA_MODES:
         apply_sora(model, lora_config, upper_k=upper_k)
+
+    # PaCA: Registra hook para interromper backward pass nas camadas inferiores
+    if upper_k is not None:
+        _apply_paca_gradient_boundary(model, upper_k)
 
     # Função auxiliar externa para resumo de parâmetros (omitida no snippet por brevidade)
     # print_trainable_summary(model, mode) 
@@ -368,13 +561,22 @@ def build_optimizer(model, config):
         if not other_params and not gate_params:
             raise ValueError("No trainable parameters found.")
 
-        main_optimizer = AdamW(
-            other_params,
-            lr=optimizer_config["lr"],
-            weight_decay=optimizer_config["weight_decay"],
-        )
-
         sparse_lr = sora_config.get("sparse_lr") or optimizer_config["lr"]
+
+        # --- OTIMIZAÇÃO FL: Otimizador Unificado ---
+        # Antes: 2 otimizadores separados (AdamW + SparseAdamW)
+        #   → 2× zero_grad(), 2× step(), 2× estado interno (momentum/variância)
+        # Agora: 1 AdamW com 2 param_groups + GateSparsifier leve
+        #   → 1× zero_grad(), 1× step(), 1× estado + softshrink
+        #
+        # A matemática do SoRA (Proximal Gradient Descent) é preservada:
+        #   Passo 1: AdamW atualiza TODOS os params (adapters + gates) → grupo unificado
+        #   Passo 2: GateSparsifier aplica softshrink nos gates → proximal step do L1
+        unified_optimizer = AdamW([
+            {'params': other_params, 'lr': optimizer_config["lr"],
+             'weight_decay': optimizer_config["weight_decay"]},
+            {'params': gate_params, 'lr': sparse_lr, 'weight_decay': 0.0},
+        ])
 
         if mode == "with_sora_schedule":
             lambda_schedule = sora_config.get("lambda_schedule")
@@ -385,19 +587,20 @@ def build_optimizer(model, config):
             max_lambda = None
             lambda_num = None
 
-        sparse_optimizer = SparseAdamW(
+        # GateSparsifier: aplica APENAS o proximal step (softshrink) nos gates.
+        # Substitui o SparseAdamW completo, que era um AdamW inteiro + softshrink.
+        gate_sparsifier = GateSparsifier(
+            gate_params=gate_params,
             sparse_lambda=sora_config.get("sparse_lambda_2", 3e-4),
+            gate_lr=sparse_lr,
             lambda_schedule=lambda_schedule,
             max_lambda=max_lambda,
             lambda_num=lambda_num,
-            params=gate_params,
-            lr=sparse_lr,
-            weight_decay=0.0,
         )
 
-        print(f"Gate params: {sum(p.numel() for p in gate_params):,}")
-        print(f"Other trainable params: {sum(p.numel() for p in other_params):,}")
-        return main_optimizer, sparse_optimizer
+        # print(f"Gate params: {sum(p.numel() for p in gate_params):,}")
+        # print(f"Other trainable params: {sum(p.numel() for p in other_params):,}")
+        return unified_optimizer, gate_sparsifier
 
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     if not trainable_params:
@@ -433,40 +636,78 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     
     device = next(model.parameters()).device
 
-    for pixel_values, labels in tqdm(loader, desc="train", leave=False):
-        pixel_values = pixel_values.to(device, dtype=next(model.parameters()).dtype)
+    # Ativa o schedule linear de lambda (ex: 3e-4 → 7e-4) para aumentar a pressão
+    # de esparsidade. No FL, o otimizador é recriado a cada rodada, então avançamos
+    # o schedule imediatamente para usar o lambda mais forte.
+    if sparse_optimizer is not None and hasattr(sparse_optimizer, 'step_lambda'):
+        sparse_optimizer.step_lambda()
+
+    # Cache dos gate_params: evita scan de named_parameters() a cada batch
+    # Os objetos Parameter não mudam de identidade durante o treino, apenas seus .data
+    if sparse_optimizer is not None and sparse_lambda > 0:
+        gate_params = [p for n, p in model.named_parameters() if "sora" in n and "gate" in n]
+        gate_params_total = sum(p.numel() for p in gate_params)
+    else:
+        gate_params = []
+        gate_params_total = 0
+
+    # Cache: evita chamada a next(model.parameters()) a cada batch
+    model_dtype = next(model.parameters()).dtype
+
+    # Identifica o AdaLoRA do PEFT, que envolve apenas o vision_model.
+    is_adalora = (
+        hasattr(model, "vision_model")
+        and hasattr(model.vision_model, "base_model")
+        and hasattr(model.vision_model.base_model, "update_and_allocate")
+    )
+    if is_adalora and not hasattr(model, "adalora_global_step"):
+        model.adalora_global_step = 0
+
+    for pixel_values, labels in tqdm(loader, desc="train", leave=False, disable=True):
+        pixel_values = pixel_values.to(device, dtype=model_dtype)
         labels = labels.to(device)
         
-        optimizer.zero_grad()
+        # set_to_none=True: mais rápido que zerar tensores (evita alocação de zeros na GPU)
+        optimizer.zero_grad(set_to_none=True)
+        # GateSparsifier.zero_grad() é no-op (gates estão no otimizador unificado).
+        # Mantido para compatibilidade com SparseAdamW no trainer standalone (main.py).
         if sparse_optimizer is not None:
-            sparse_optimizer.zero_grad()
+            sparse_optimizer.zero_grad(set_to_none=True)
 
         outputs = model(pixel_values=pixel_values, labels=labels)
         ce_loss = outputs["loss"]
         loss = ce_loss
 
-        sparse_loss_val = 0.0
-        if sparse_optimizer is not None and sparse_lambda > 0:
-            gate_params = [p for n, p in model.named_parameters() if "sora" in n and "gate" in n]
-            sparse_loss = sum(torch.sum(torch.abs(p)) for p in gate_params)
-            p_total = sum(p.numel() for p in gate_params)
-            if p_total > 0:
-                sparse_loss_val = sparse_loss.item() / p_total
-                loss = ce_loss + sparse_lambda * sparse_loss / p_total
-
         loss.backward()
         optimizer.step()
+
+        if is_adalora:
+            model.vision_model.base_model.update_and_allocate(model.adalora_global_step)
+            model.adalora_global_step += 1
+        # GateSparsifier.step(): aplica APENAS softshrink (proximal step)
+        # SparseAdamW.step(): AdamW completo + softshrink (trainer standalone)
         if sparse_optimizer is not None:
             sparse_optimizer.step()
+            
+        # # Poda dinâmica do AdaLoRA (PEFT)
+        # if is_adalora:
+        #     model.base_model.update_and_allocate(model.adalora_global_step)
+        #     model.adalora_global_step += 1
 
         total_ce_loss += ce_loss.item()
-        total_sparse_loss += sparse_loss_val
         total_loss += loss.item()
+
+    # Calcula a esparsidade APENAS 1 vez no final da época (Remove o gargalo de I/O da GPU)
+    sparse_loss_val = 0.0
+    if gate_params_total > 0:
+        with torch.no_grad():
+            sparse_loss = sum(torch.sum(torch.abs(p)) for p in gate_params)
+            sparse_loss_val = sparse_loss.item() / gate_params_total
 
     n = max(len(loader), 1)
     return {
         "ce_loss": total_ce_loss / n,
-        "sparse_loss": total_sparse_loss / n,
+        "sparse_loss": sparse_loss_val,
         "total_loss": total_loss / n,
     }
 
@@ -492,7 +733,7 @@ def evaluate(model, loader):
         device = next(model.parameters()).device
         model_dtype = next(model.parameters()).dtype
         
-        for pixel_values, labels in tqdm(loader, desc="eval", leave=False):
+        for pixel_values, labels in tqdm(loader, desc="eval", leave=False, disable=True):
             pixel_values = pixel_values.to(device, dtype=model_dtype)
             outputs = model(pixel_values=pixel_values)
             logits = outputs["logits"]

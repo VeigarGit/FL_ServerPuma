@@ -3,6 +3,7 @@ import os
 import numpy as np
 import random
 from utils.language_utils import word_to_indices, letter_to_index
+from pathlib import Path
 
 
 random.seed(1)
@@ -24,8 +25,8 @@ def process_y(raw_y_batch):
 
 # Allocate data to users
 def generate_dataset(dir_path):
-    train_path = dir_path + "train/"
-    test_path = dir_path + "test/"
+    train_path = Path(dir_path) / "train/"
+    test_path = Path(dir_path) / "test/"
     
     dir_path = os.path.dirname(train_path)
     if not os.path.exists(dir_path):
