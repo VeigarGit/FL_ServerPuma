@@ -877,7 +877,7 @@ def main():
                             
                             # Envia para todos os vizinhos
                             for c in other_clients:
-                                target_host = f"fl-client-v2x-{c}"
+                                target_host = f"fl-client-v2v-{c}"
                                 sent = False
                                 for attempt in range(poll_timeout):
                                     try:
