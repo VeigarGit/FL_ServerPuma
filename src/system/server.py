@@ -59,6 +59,7 @@ from prunning_nisp import prune_fc1
 from prunning_snip import snip_pruning, apply_mask
 from utils.network_utils import send_data, recv_data
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
+from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
 
 # --- CONFIGURAÇÃO DE OBSERVABILIDADE (LOGGING) ---
 logging.basicConfig(
@@ -188,6 +189,10 @@ class FederatedLearningServer:
         self.trainable_params_per_round = []
         self.bit = []
         self.complexity_calculated = False
+        
+        # LHDQ: cache do estado anterior por cliente (para delta coding)
+        self.previous_sent_state = {}   # client_id → state_dict enviado na rodada anterior
+        self.previous_recv_state = {}   # client_id → state_dict recebido na rodada anterior
         
         if self.args.model == 'slm':
             alpha_list, beta_list = [0], [0]
@@ -900,9 +905,22 @@ class FederatedLearningServer:
             # --- Medição granular: quantização do servidor ---
             server_quant_start = time.time()
             comm_start = time.time()
+            
+            # Decide se usa LHDQ ou int8
+            use_lhdq = (getattr(self.args, 'delta_coding', False) 
+                        and round_num >= 2 
+                        and client_id in self.previous_sent_state)
+            
             if round_num >= 2 and self.prune == 1 and self.args.model == 'cnn':
+                # LHDQ: cachear antes de codificar (branch CNN pruning)
+                if getattr(self.args, 'delta_coding', False):
+                    self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in g_model_pruned.items()}
+                
                 size_before = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
-                g_model_pruned = quantization(g_model_pruned)
+                if use_lhdq:
+                    g_model_pruned = lhdq_encode(g_model_pruned, self.previous_sent_state[client_id])
+                else:
+                    g_model_pruned = quantization(g_model_pruned)
                 size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
@@ -913,8 +931,15 @@ class FederatedLearningServer:
                 send_data(conn, self.prune)
                 send_data(conn, max_amount)
             else:
+                # Salva cópia pré-quantização para cache LHDQ
+                if getattr(self.args, 'delta_coding', False):
+                    self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in current_global_state.items()}
+                
                 size_before = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
-                current_global_state = quantization(current_global_state)
+                if use_lhdq:
+                    current_global_state = lhdq_encode(current_global_state, self.previous_sent_state[client_id])
+                else:
+                    current_global_state = quantization(current_global_state)
                 size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
@@ -942,8 +967,16 @@ class FederatedLearningServer:
             
             # --- Medição granular: dequantização do servidor ---
             server_dequant_start = time.time()
-            updated_state = dequantization(updated_state)
+            if is_lhdq_encoded(updated_state):
+                prev_recv = self.previous_recv_state.get(client_id, {})
+                updated_state = lhdq_decode(updated_state, prev_recv)
+            else:
+                updated_state = dequantization(updated_state)
             server_dequant_time = time.time() - server_dequant_start
+            
+            # LHDQ: cachear o update recebido para a próxima rodada
+            if getattr(self.args, 'delta_coding', False) and updated_state is not None:
+                self.previous_recv_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
             
             data, rate = recv_data(conn)
             self.client_data[client_id] = data
@@ -1356,6 +1389,7 @@ def parse_args():
     parser.add_argument('--allow-rank-upscale', action='store_true', help='Permite a subida de Rank (por padrão apenas desce)')
     parser.add_argument('--min-rank', type=int, default=2, help='Rank mínimo permitido por módulo SoRA durante poda iterativa')
     parser.add_argument('--sora-prune', action='store_true', help='Ativa poda iterativa de rank do SoRA (independente do --prune CNN)')
+    parser.add_argument('--delta-coding', action='store_true', help='Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8')
     return parser.parse_args()
 
 def main():

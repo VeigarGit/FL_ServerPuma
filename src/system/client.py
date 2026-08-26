@@ -48,6 +48,7 @@ from model import SimpleModel
 from utils.network_utils import send_data, recv_data
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
 from utils.fl_math import resize_model_to_pruned
+from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
 
 # --- CONFIGURAÇÃO DE OBSERVABILIDADE (LOGGING ENXUTO) ---
 logging.basicConfig(
@@ -396,6 +397,7 @@ def parse_args():
     parser.add_argument('--prune', type=int, default=1, choices=[0, 1], help='Habilitar pruning adaptativo (0=sim, 1=não, default: 1)')
     parser.add_argument('--mode', type=str, default='centralized', choices=['centralized', 'decentralized'])
     parser.add_argument('--max-epochs', type=int, default=0, help='Limite de epocas no modo descentralizado (0 = infinito)')
+    parser.add_argument('--delta-coding', action='store_true', help='Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8')
     
     # --- Otimização de Avaliação ---
     parser.add_argument('--skip-post-eval', action='store_true', help='Pula todas as avaliações pós-treino no cliente (local_test_acc e train_acc) para máxima velocidade, mantendo apenas Global Model Test Acc')
@@ -556,6 +558,10 @@ def main():
             else:
                 s.settimeout(120)
             
+            # LHDQ: cache do estado anterior (para delta coding)
+            previous_recv_state = {}  # estado global recebido na rodada anterior
+            previous_sent_state = {}  # update enviado na rodada anterior
+            
             send_data(s, args.client_idx)
             logger.info(f"Connected to server {args.host}:{args.port}")
             for round_num in range(args.rounds):
@@ -601,8 +607,15 @@ def main():
                     
                 logger.info("Received global model.")
                 client_dequant_start = time.time()
-                global_state = dequantization(global_state)
+                if is_lhdq_encoded(global_state):
+                    global_state = lhdq_decode(global_state, previous_recv_state)
+                else:
+                    global_state = dequantization(global_state)
                 client_dequant_time = time.time() - client_dequant_start
+                
+                # LHDQ: cachear o estado global recebido (já decodificado) para a próxima rodada
+                if args.delta_coding:
+                    previous_recv_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()}
                 
                 
                 if round_num + 1 >= 2 and prune == 1 and args.model == 'cnn':
@@ -680,7 +693,16 @@ def main():
                 client_post_eval_time = time.time() - post_eval_start
                 
                 quant_start = time.time()
-                updated_state = quantization(updated_state)
+                use_lhdq = (args.delta_coding and round_num >= 1 and previous_sent_state)
+                if use_lhdq:
+                    # LHDQ: cachear antes de codificar
+                    current_plain_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
+                    updated_state = lhdq_encode(updated_state, previous_sent_state)
+                    previous_sent_state = current_plain_state
+                else:
+                    if args.delta_coding:
+                        previous_sent_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
+                    updated_state = quantization(updated_state)
                 client_quant_time = time.time() - quant_start
                 
                 # Tempo total de avaliação (pré + pós treinamento) e dequantização no cliente

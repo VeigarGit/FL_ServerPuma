@@ -81,6 +81,9 @@ LOAD_MODEL_FLAG=""
 SKIP_POST_EVAL=0
 SKIP_TRAIN_EVAL=0
 
+# Delta Coding (LHDQ)
+DELTA_CODING=0
+
 # ---- Função de Ajuda ----
 show_help() {
     cat << 'EOF'
@@ -149,6 +152,9 @@ Persistência de Modelo:
 Otimização de Avaliação:
   --skip-post-eval            Pular todas as avaliações pós-treino (mantém apenas Global Model Test Acc)
   --skip-train-eval           Pular apenas a avaliação no conjunto de treino pós-treino
+
+Compressão:
+  --delta-coding              Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8
 
 Outros:
   --help                      Exibir esta mensagem
@@ -240,6 +246,9 @@ while [ $# -gt 0 ]; do
         # Otimização de Avaliação
         --skip-post-eval) SKIP_POST_EVAL=1; shift 1 ;;
         --skip-train-eval) SKIP_TRAIN_EVAL=1; shift 1 ;;
+
+        # Delta Coding (LHDQ)
+        --delta-coding) DELTA_CODING=1; shift 1 ;;
 
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
@@ -333,6 +342,7 @@ fi
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
+if [ "$DELTA_CODING" -eq 1 ]; then echo "  🗜️  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; else echo "  🗜️  Compressão: INT8 padrão (8 bits/param)"; fi
 echo "===================================="
 
 # ---- Preparação do Dataset ----
@@ -364,6 +374,10 @@ else
         EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_pacalist"
     else
         EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_paca${PACA}"
+    fi
+    # Sufixo de compressão LHDQ
+    if [ "$DELTA_CODING" -eq 1 ]; then
+        EXP_NAME="${EXP_NAME}_deltacoding"
     fi
 fi
 echo "📁 Diretório de Resultados: ../results/$EXP_NAME"
@@ -405,6 +419,9 @@ for RUN in $(seq $START_RUN $END_RUN); do
     if [ "$SORA_PRUNE" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --sora-prune"
     fi
+    if [ "$DELTA_CODING" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --delta-coding"
+    fi
     SERVER_CMD="$SERVER_CMD 2>&1 | tee $LOG_DIR/server.log"
 
     if [ "$AUTO_NEXT" -eq 1 ]; then
@@ -441,7 +458,11 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS $EVAL_FLAGS --config \"$CONFIG_FILE\" --num-classes $NUM_CLASSES --in-features $IN_FEATURES --run-id $RUN --exp-name $EXP_NAME --timestamp $TIMESTAMP 2>&1 | tee $LOG_DIR/client_$i.log"
+        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS $EVAL_FLAGS --config \"$CONFIG_FILE\" --num-classes $NUM_CLASSES --in-features $IN_FEATURES --run-id $RUN --exp-name $EXP_NAME --timestamp $TIMESTAMP"
+        if [ "$DELTA_CODING" -eq 1 ]; then
+            CLIENT_CMD="$CLIENT_CMD --delta-coding"
+        fi
+        CLIENT_CMD="$CLIENT_CMD 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
             CLIENT_CMD="$CLIENT_CMD ; read"
         fi
