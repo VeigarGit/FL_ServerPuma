@@ -101,7 +101,7 @@ def map_sequential_to_simplemodel(state_dict):
 #             quantized_state_dict[k] = v
 #     return quantized_state_dict
 
-def local_training(model, state_dict, prune, train_loader, test_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None, model_type='cnn', run_config=None):
+def local_training(model, state_dict, prune, train_loader, test_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None, model_type='cnn', run_config=None, model_lock=None):
     # Verifica se os pesos precisam ser desquantizados (se não forem tensores)
     if state_dict and not isinstance(next(iter(state_dict.values())), torch.Tensor):
         state_dict = dequantization(state_dict)
@@ -202,20 +202,29 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
                 x = x.to(device)
             y = y.to(device)
             
-            optimizer.zero_grad()
-            if sparse_optimizer is not None:
-                sparse_optimizer.zero_grad()
+            # Adquirir lock por batch para permitir interrupcao imediata
+            # pela thread de encontro V2V. O lock e liberado apos cada
+            # batch, dando uma janela para a thread watcher reagir.
+            if model_lock:
+                model_lock.acquire()
+            try:
+                optimizer.zero_grad()
+                if sparse_optimizer is not None:
+                    sparse_optimizer.zero_grad()
+                    
+                output = model(x)
+                if isinstance(output, dict):
+                    output = output["logits"]
+                    
+                loss = loss_fn(output, y)
+                loss.backward()
+                optimizer.step()
                 
-            output = model(x)
-            if isinstance(output, dict):
-                output = output["logits"]
-                
-            loss = loss_fn(output, y)
-            loss.backward()
-            optimizer.step()
-            
-            if sparse_optimizer is not None:
-                sparse_optimizer.step()
+                if sparse_optimizer is not None:
+                    sparse_optimizer.step()
+            finally:
+                if model_lock:
+                    model_lock.release()
     
     # --- 2. SELEÇÃO DOS PESOS QUE SERÃO ENVIADOS PARA O SERVIDOR ---
     if model_type in ['clip', 'slm']:
@@ -747,23 +756,36 @@ def main():
 
         logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
 
-        # Contador do ultimo encontro processado. Garante que cada encontro
-        # so e processado uma unica vez, mesmo que o JSON persista no disco.
-        last_processed_encounter = 0
-
         # Caminho para a pasta de sinalizacao P2P (volume compartilhado Docker).
         encounters_dir = Path(__file__).resolve().parents[1] / "results" / "encounters"
-        
+
+        # ── Estado compartilhado entre threads ────────────────────────────
+        # Lock para sincronizar acesso ao modelo entre treino e troca P2P.
+        # No local_training da CNN, e adquirido/liberado a cada batch,
+        # permitindo que a thread watcher interrompa o treino quase
+        # instantaneamente (espera no maximo a duracao de 1 batch).
+        model_lock = threading.Lock()
+
+        # Dicionario que armazena pesos recebidos via TCP, indexado por
+        # (encounter_id, sender_client_id). Protegido pelo in_memory_lock.
         in_memory_weights = {}
         in_memory_lock = threading.Lock()
-        
+
+        # Contador thread-safe do ultimo encontro processado.
+        last_processed_encounter = 0
+        encounter_counter_lock = threading.Lock()
+
+        # ── Thread P2P Server (TCP Listener) ──────────────────────────────
+        # Roda em background aceitando conexoes TCP dos vizinhos.
+        # Armazena os pesos recebidos em in_memory_weights para a thread
+        # watcher consumir. NAO toca no modelo diretamente.
         def p2p_server_thread():
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind(('0.0.0.0', 9000))
             server_socket.listen(50)
             logger.info(f"Client {args.client_idx}: P2P Server listening on port 9000")
-            
+
             while True:
                 try:
                     conn, addr = server_socket.accept()
@@ -778,9 +800,176 @@ def main():
                     conn.close()
                 except Exception as e:
                     logger.error(f"Erro no P2P Server: {e}")
-                    
+
         threading.Thread(target=p2p_server_thread, daemon=True).start()
 
+        # ── Thread Encounter Watcher ──────────────────────────────────────
+        # Roda em background fazendo polling da pasta de encontros a cada 1s.
+        # Quando detecta um encontro novo para este cliente:
+        #   1. Adquire model_lock (espera no maximo 1 batch do treino)
+        #   2. Faz snapshot dos pesos atuais do modelo
+        #   3. Libera model_lock (treino retoma)
+        #   4. Envia snapshot para vizinhos via TCP
+        #   5. Aguarda pesos dos vizinhos (poll_timeout = ETC - margem)
+        #   6. Agrega via media D-PSGD
+        #   7. Adquire model_lock e aplica os pesos agregados no modelo
+        #   8. Escreve .done_enc_* para destravar o orquestrador
+        def encounter_watcher_thread():
+            nonlocal last_processed_encounter
+
+            while True:
+                time.sleep(1)  # Polling de 1 segundo
+
+                if not encounters_dir.exists():
+                    continue
+
+                encounter_files = list(encounters_dir.glob("encounter_*.json"))
+                if not encounter_files:
+                    continue
+
+                # Funcao auxiliar para extrair o ID do encontro do JSON
+                def extract_id(filepath):
+                    try:
+                        with open(filepath, "r") as json_f:
+                            return json.load(json_f).get("encounter_id", 0)
+                    except Exception:
+                        return 0
+
+                encounter_files.sort(key=extract_id)
+
+                for ef in encounter_files:
+                    try:
+                        with open(ef, "r") as f:
+                            data = json.load(f)
+
+                        enc_id = data.get("encounter_id", 0)
+                        clients_in_encounter = data.get("clients", [])
+                        etc_seconds = data.get("etc_seconds", 60)
+
+                        with encounter_counter_lock:
+                            if enc_id <= last_processed_encounter:
+                                continue
+                            if args.client_idx not in clients_in_encounter:
+                                continue
+
+                        if isinstance(etc_seconds, str) and etc_seconds == "Carros Parados":
+                            poll_timeout = 115 # MAX_ETC (120) - 5
+                        else:
+                            poll_timeout = max(5, int(etc_seconds - 5))
+
+                        etc_display = f"{etc_seconds}" if isinstance(etc_seconds, str) else f"{etc_seconds:.1f}"
+                        logger.info(
+                            f"Client {args.client_idx}: [WATCHER] Encontro {enc_id} detectado! "
+                            f"ETC={etc_display}s, timeout={poll_timeout}s. "
+                            f"Pausando treino para D-PSGD."
+                        )
+
+                        # ── SNAPSHOT: Adquirir lock e copiar pesos ─────────
+                        # O treino libera o lock a cada batch, entao esta
+                        # aquisicao espera no maximo a duracao de 1 batch.
+                        with model_lock:
+                            if args.model == 'clip':
+                                snapshot = get_trainable_state_dict(model)
+                            else:
+                                snapshot = copy.deepcopy(model.state_dict())
+                        # Lock liberado: treino pode continuar enquanto
+                        # fazemos a troca P2P pela rede.
+
+                        logger.info(f"Client {args.client_idx}: [WATCHER] Snapshot dos pesos capturado. Treino retomado.")
+
+                        # ── ENVIO DE PESOS (TCP) ──────────────────────────
+                        other_clients = [c for c in clients_in_encounter if c != args.client_idx]
+
+                        for c in other_clients:
+                            target_host = f"fl-client-v2v-{c}"
+                            sent = False
+                            for attempt in range(poll_timeout):
+                                try:
+                                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                                        s.settimeout(2.0)
+                                        s.connect((target_host, 9000))
+                                        send_data(s, (args.client_idx, enc_id, snapshot))
+                                        sent = True
+                                        break
+                                except Exception as e:
+                                    if attempt % 10 == 0:
+                                        logger.warning(
+                                            f"Client {args.client_idx}: Tentativa {attempt+1}/{poll_timeout} "
+                                            f"para Cliente {c} falhou: {e}"
+                                        )
+                                    time.sleep(1)
+                            if not sent:
+                                logger.warning(f"Client {args.client_idx}: Falha ao enviar para Cliente {c} no encontro {enc_id}")
+
+                        # ── POLLING dos pesos dos vizinhos na MEMÓRIA ─────
+                        logger.info(f"Client {args.client_idx}: [WATCHER] Aguardando vizinhos {other_clients} (timeout={poll_timeout}s)...")
+
+                        all_received = False
+                        other_states = []
+
+                        for tick in range(poll_timeout):
+                            with in_memory_lock:
+                                enc_weights = in_memory_weights.get(enc_id, {})
+                                if all(c in enc_weights for c in other_clients):
+                                    all_received = True
+                                    other_states = [enc_weights[c] for c in other_clients]
+                                    break
+                            time.sleep(1)
+
+                        # ── AGREGACAO D-PSGD (Media Simples) ──────────────
+                        if all_received:
+                            logger.info(
+                                f"Client {args.client_idx}: [WATCHER] Pesos de {len(other_states)} "
+                                f"vizinhos recebidos! Aplicando consenso (Media)."
+                            )
+
+                            avg_state = {}
+                            for key in snapshot.keys():
+                                avg_state[key] = snapshot[key].clone()
+                                for neighbor_state in other_states:
+                                    avg_state[key] += neighbor_state[key].to(device)
+                                avg_state[key] = avg_state[key] / (1 + len(other_states))
+
+                            # Adquirir lock para aplicar pesos agregados no modelo
+                            with model_lock:
+                                if args.model == 'clip':
+                                    resize_model_to_pruned(model, avg_state)
+                                else:
+                                    model.load_state_dict(avg_state, strict=False)
+
+                            logger.info(f"Client {args.client_idx}: [WATCHER] Agregacao P2P do encontro {enc_id} concluida!")
+
+                            # Limpar memoria
+                            with in_memory_lock:
+                                if enc_id in in_memory_weights:
+                                    del in_memory_weights[enc_id]
+
+                            # Sinalizar ao orquestrador
+                            done_file = encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
+                            done_file.touch()
+                        else:
+                            # ── FALLBACK: timeout expirado ────────────────
+                            logger.warning(
+                                f"Client {args.client_idx}: [WATCHER] Timeout no encontro {enc_id}. "
+                                f"Descartando rodada P2P."
+                            )
+                            # Sinalizar ao orquestrador mesmo no timeout
+                            # para nao travar a simulacao por 300s
+                            done_file = encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
+                            done_file.touch()
+
+                        # Marcar encontro como processado
+                        with encounter_counter_lock:
+                            last_processed_encounter = enc_id
+
+                    except Exception as e:
+                        logger.error(f"Erro processando encontro {ef}: {e}")
+
+        threading.Thread(target=encounter_watcher_thread, daemon=True).start()
+
+        # ── LOOP PRINCIPAL: TREINO CONTÍNUO ───────────────────────────────
+        # O treino roda continuamente. A thread watcher cuida dos encontros
+        # em paralelo, interrompendo o treino por batches conforme necessario.
         epoch = 1
         max_epochs = args.max_epochs if args.max_epochs > 0 else float('inf')
         while epoch <= max_epochs:
@@ -798,9 +987,10 @@ def main():
             else:
                 dummy_state = model.state_dict()
 
-            # ── TREINO LOCAL ─────────────────────────────────────────────
+            # ── TREINO LOCAL ──────────────────────────────────────────────
             # Acontece SEMPRE, independente de haver encontro ou nao.
-            # O modelo melhora continuamente com os dados locais.
+            # O model_lock e passado para que a CNN libere a trava a cada
+            # batch, permitindo a thread watcher interromper rapidamente.
             train_start = time.time()
             updated_state, personalized_acc = local_training(
                 model=model,
@@ -813,7 +1003,8 @@ def main():
                 alaarg=args.ala,
                 ala=ala,
                 model_type=args.model,
-                run_config=run_config if args.model in ['clip', 'slm'] else None
+                run_config=run_config if args.model in ['clip', 'slm'] else None,
+                model_lock=model_lock if args.model == 'cnn' else None,
             )
             client_training_time = time.time() - train_start
             logger.info(
@@ -821,133 +1012,7 @@ def main():
                 f"{client_training_time:.2f}s."
             )
 
-            # ── VERIFICAR SINAIS DE ENCONTRO ─────────────────────────────
-            # Apos o treino local, verificar se o orquestrador gerou algum
-            # sinal de encontro novo na pasta compartilhada.
-            if encounters_dir.exists():
-                encounter_files = list(encounters_dir.glob("encounter_*.json"))
-
-                # Funcao auxiliar para extrair o ID do encontro do JSON.
-                # Usada para ordenar os arquivos e processa-los na sequencia.
-                def extract_id(filepath):
-                    try:
-                        with open(filepath, "r") as json_f:
-                            return json.load(json_f).get("encounter_id", 0)
-                    except Exception:
-                        return 0
-
-                # Ordenar por ID para processar na sequencia correta
-                encounter_files.sort(key=extract_id)
-
-                for ef in encounter_files:
-                    try:
-                        with open(ef, "r") as f:
-                            data = json.load(f)
-
-                        enc_id = data.get("encounter_id", 0)
-                        clients_in_encounter = data.get("clients", [])
-
-                        # ── Ler ETC do JSON gerado pelo orquestrador ─────
-                        # O campo etc_seconds contem o Tempo Estimado de
-                        # Contato calculado via TraCI no momento do encontro.
-                        # Usado como timeout para o polling de pesos dos vizinhos.
-                        # Default de 60s caso o campo nao exista (compatibilidade).
-                        etc_seconds = data.get("etc_seconds", 60)
-
-                        # Verificar se:
-                        # 1. Este encontro e NOVO (ID > ultimo processado)
-                        # 2. Este cliente FAZ PARTE do encontro
-                        if enc_id > last_processed_encounter and args.client_idx in clients_in_encounter:
-
-                            # Calcular timeout de polling baseado no ETC.
-                            # Subtrair 5 segundos como margem de seguranca
-                            # para garantir que a agregacao complete antes
-                            # dos veiculos sairem do raio de comunicacao.
-                            # Minimo de 5 segundos para nao abortar instantaneamente.
-                            poll_timeout = max(5, int(etc_seconds - 5))
-
-                            logger.info(
-                                f"Client {args.client_idx}: Encontro {enc_id} detectado! "
-                                f"ETC={etc_seconds:.1f}s, timeout_polling={poll_timeout}s. "
-                                f"Iniciando D-PSGD."
-                            )
-
-                            # ── ENVIO DE PESOS (CLIENTE TCP) ─────────
-                            other_clients = [c for c in clients_in_encounter if c != args.client_idx]
-                            
-                            # Envia para todos os vizinhos
-                            for c in other_clients:
-                                target_host = f"fl-client-v2v-{c}"
-                                sent = False
-                                for attempt in range(poll_timeout):
-                                    try:
-                                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                                            s.settimeout(2.0)
-                                            s.connect((target_host, 9000))
-                                            # Envia (meu_id, id_do_encontro, pesos)
-                                            send_data(s, (args.client_idx, enc_id, updated_state))
-                                            sent = True
-                                            break
-                                    except Exception as e:
-                                        if attempt % 10 == 0:
-                                            logger.warning(f"Client {args.client_idx}: Tentativa {attempt+1}/{poll_timeout} para Cliente {c} falhou: {e}")
-                                        time.sleep(1)
-                                if not sent:
-                                    logger.warning(f"Client {args.client_idx}: Falha ao enviar para Cliente {c} no encontro {enc_id}")
-
-                            # ── POLLING dos pesos dos vizinhos na MEMÓRIA ───────────
-                            logger.info(f"Client {args.client_idx}: Aguardando vizinhos {other_clients} (timeout={poll_timeout}s)...")
-                            
-                            all_received = False
-                            other_states = []
-                            
-                            for tick in range(poll_timeout):
-                                with in_memory_lock:
-                                    enc_weights = in_memory_weights.get(enc_id, {})
-                                    if all(c in enc_weights for c in other_clients):
-                                        all_received = True
-                                        other_states = [enc_weights[c] for c in other_clients]
-                                        break
-                                time.sleep(1)
-
-                            # ── AGREGACAO D-PSGD (Media Simples) ─────────
-                            if all_received:
-                                logger.info(f"Client {args.client_idx}: Pesos de {len(other_states)} vizinhos recebidos via rede! Aplicando consenso (Media).")
-                                
-                                avg_state = {}
-                                for key in updated_state.keys():
-                                    avg_state[key] = updated_state[key].clone()
-                                    for neighbor_state in other_states:
-                                        avg_state[key] += neighbor_state[key].to(device)
-                                    avg_state[key] = avg_state[key] / (1 + len(other_states))
-
-                                if args.model in ['clip', 'slm']:
-                                    resize_model_to_pruned(model, avg_state)
-                                else:
-                                    model.load_state_dict(avg_state, strict=False)
-
-                                logger.info(f"Client {args.client_idx}: Agregacao P2P do encontro {enc_id} concluida com sucesso.")
-                                
-                                # Limpar memória para não vazar RAM
-                                with in_memory_lock:
-                                    if enc_id in in_memory_weights:
-                                        del in_memory_weights[enc_id]
-                                        
-                                # Sinaliza ao orquestrador que terminou criando arquivo vazio
-                                done_file = encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
-                                done_file.touch()
-                            else:
-                                # ── FALLBACK: timeout expirado ───────────
-                                logger.warning(f"Client {args.client_idx}: Timeout (ETC expirado) no encontro {enc_id}. Descartando rodada P2P.")
-
-                            # Marcar este encontro como processado para nao
-                            # tentar novamente na proxima epoca
-                            last_processed_encounter = enc_id
-
-                    except Exception as e:
-                        logger.error(f"Erro processando encontro {ef}: {e}")
-
-            # ── AVALIACAO POS-EPOCA ──────────────────────────────────────
+            # ── AVALIACAO POS-EPOCA ───────────────────────────────────────
             # Avaliar o modelo (com ou sem agregacao P2P) nos dados locais
             local_test_acc, local_test_loss = evaluate_model(model, test_loader)
             train_accuracy, train_loss = evaluate_model(model, train_loader)

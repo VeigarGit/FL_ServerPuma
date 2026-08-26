@@ -189,7 +189,7 @@ def estimate_contact_time(
         avg_speed = (v1.speed + v2.speed) / 2.0
         if avg_speed < 0.1:
             # Ambos realmente parados — ETC alto e correto
-            return MAX_ETC
+            return "Carros Parados"
         # Se tem velocidade mas e quase igual (movendo juntos),
         # estimar pela margem restante do raio dividida pela
         # velocidade media. Pessimista mas muito melhor que MAX_ETC.
@@ -221,23 +221,35 @@ def estimate_contact_time(
 def cluster_etc(
     cluster: list[VehicleState],
     radius: float,
-) -> float:
+) -> float | str:
     """Calcula o ETC de um cluster inteiro.
     
     O ETC do cluster e o MINIMO entre todos os pares de veiculos,
     pois basta um par se separar para quebrar a conectividade.
     
     Args:
-        cluster: Lista de estados dos veiculos no cluster
-        radius: Raio de comunicacao em metros
-    
+        cluster: Lista de estados dos veiculos no agrupamento.
+        radius: Raio de comunicacao (metros).
+        
     Returns:
         float: ETC minimo do cluster em segundos
     """
+    if len(cluster) < 2:
+        return 0.0
+
     min_etc = float('inf')
+    carros_parados = False
     for v1, v2 in itertools.combinations(cluster, 2):
         etc = estimate_contact_time(v1, v2, radius)
-        min_etc = min(min_etc, etc)
+        if isinstance(etc, str) and etc == "Carros Parados":
+            carros_parados = True
+        else:
+            min_etc = min(min_etc, etc)
+
+    if min_etc == float('inf'):
+        if carros_parados:
+            return "Carros Parados"
+        return 0.0
     return min_etc
 
 
@@ -591,7 +603,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     etc = cluster_etc(best_cluster, args.radius)
 
                     # ── Filtro de viabilidade baseado no ETC ──────────────
-                    if etc < args.min_contact_time:
+                    if not isinstance(etc, str) and etc < args.min_contact_time:
                         # ETC insuficiente: ignorar este cluster
                         rejected_count += 1
                         log.info(
@@ -620,10 +632,11 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     # ── ETC suficiente: gerar sinal de encontro ───────────
                     encounter_count += 1
 
+                    etc_display = f"{etc}" if isinstance(etc, str) else f"{etc:.1f}s"
                     log.info(
-                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%.1fs",
+                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%s",
                         encounter_count, args.encounters,
-                        veh_names, c_indices, etc,
+                        veh_names, c_indices, etc_display,
                     )
 
                     # Montar dados do encontro com ETC para os clientes usarem
@@ -646,7 +659,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         vehicles=veh_names,
                         details={
                             "clients": c_indices,
-                            "etc_seconds": round(etc, 1),
+                            "etc_seconds": etc if isinstance(etc, str) else round(etc, 1),
                         },
                     ))
 
