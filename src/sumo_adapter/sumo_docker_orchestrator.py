@@ -185,9 +185,16 @@ def estimate_contact_time(
 
     # Caso especial: A ≈ 0 significa que a velocidade relativa e
     # praticamente zero (veiculos parados ou com mesma velocidade).
-    # Neste caso, a distancia nao muda e o ETC e o maximo possivel.
     if A < 1e-9:
-        return MAX_ETC
+        avg_speed = (v1.speed + v2.speed) / 2.0
+        if avg_speed < 0.1:
+            # Ambos realmente parados — ETC alto e correto
+            return MAX_ETC
+        # Se tem velocidade mas e quase igual (movendo juntos),
+        # estimar pela margem restante do raio dividida pela
+        # velocidade media. Pessimista mas muito melhor que MAX_ETC.
+        remaining = radius - dist
+        return min(remaining / avg_speed, MAX_ETC)
 
     # Discriminante: sempre positivo quando C < 0 e A > 0
     discriminante = B * B - 4.0 * A * C
