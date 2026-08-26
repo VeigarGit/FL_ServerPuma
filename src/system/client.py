@@ -11,6 +11,13 @@ import logging
 import random
 from pathlib import Path
 
+# Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -44,7 +51,7 @@ from utils.fl_math import resize_model_to_pruned
 
 # --- CONFIGURAÇÃO DE OBSERVABILIDADE (LOGGING ENXUTO) ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(message)s',
     datefmt='%H:%M:%S'
 )
@@ -105,24 +112,20 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
             state_dict = map_sequential_to_simplemodel(state_dict)
     # === CORREÇÃO ESTRUTURAL PARA CLIP E SLM ===
     if model_type in ['clip', 'slm']:
-        # 1. 'model' contém nossos pesos locais. 
-        # Criamos o 'global_model' copiando a estrutura atual.
-        global_model = copy.deepcopy(model)
+        # FedALA_LoRA só se aplica a CLIP (model_type != 'slm').
+        # Evita deepcopy desnecessário do SLM inteiro (~4-6 GB).
+        needs_ala = (alaarg == 0 and round_num >= 2 and model_type != 'slm')
         
-        # 2. Injetamos os pesos do servidor (state_dict) APENAS no global_model
-        global_model = resize_model_to_pruned(global_model, state_dict)
-        
-        # 3. Agora temos os mundos perfeitamente isolados:
-        
-        if alaarg == 0 and round_num >= 2:
+        if needs_ala:
+            global_model = copy.deepcopy(model)
+            global_model = resize_model_to_pruned(global_model, state_dict)
             logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
             local_initialization(ala, global_model, model)
             personalized_acc, _ = evaluate_model(model, test_loader)
             logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
+            del global_model
         else:
             resize_model_to_pruned(model, state_dict)
-            
-        del global_model
         
     else:
         # --- LÓGICA ANTIGA PARA CNN MANTIDA INTACTA ---
@@ -166,7 +169,7 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
         if model_type == 'slm':
             if hasattr(model, "slm_model") and hasattr(model.slm_model, "gradient_checkpointing_enable"):
                 model.slm_model.gradient_checkpointing_enable()
-                logger.info("Gradient Checkpointing ativado no SLM (Redução de VRAM).")
+                # logger.debug("Gradient Checkpointing ativado no SLM (Redução de VRAM).")
         
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
         is_sora = run_config["model"]["lora"]["mode"] in ["with_sora_no_schedule", "with_sora_schedule"]
@@ -244,10 +247,18 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
         
         slm_data = []
         for x_tensor, y_tensor in zip(X, y):
-            x_tensor = x_tensor.cpu()
+            x_tensor = x_tensor.cpu().float()
             
-            # Se o tensor estiver normalizado (ex: CIFAR [-1, 1]), desfazemos a normalização
-            if x_tensor.min() < 0:
+            # Se o tensor vier com normalização do CLIP (valores negativos < -0.1)
+            if x_tensor.min() < -0.1:
+                clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
+                clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
+                if x_tensor.shape[0] == 3:
+                    x_tensor = x_tensor * clip_std + clip_mean
+                else:
+                    x_tensor = x_tensor * 0.5 + 0.5
+            elif x_tensor.min() < 0:
+                # Normalização padrão [-1, 1]
                 x_tensor = x_tensor * 0.5 + 0.5
                 
             if x_tensor.max() <= 1.0:
@@ -257,7 +268,7 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
             x_tensor = torch.clamp(x_tensor, 0, 255)
             x_numpy = x_tensor.byte().numpy()
             
-            if x_numpy.shape[0] in [1, 3]: # (C, H, W)
+            if x_numpy.shape[0] in [1, 3]: # (C, H, W) -> (H, W, C)
                 x_numpy = np.transpose(x_numpy, (1, 2, 0))
             if x_numpy.shape[-1] == 1:
                 x_numpy = np.squeeze(x_numpy, axis=-1)
@@ -268,12 +279,22 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
             
             slm_data.append({"image": pil_img, "label": y_tensor.item()})
             
-        return DataLoader(slm_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        pin_mem = True if hasattr(device, 'type') and device.type == 'cuda' else False
+        return DataLoader(slm_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=pin_mem)
 
-    # Redimensionamento vital para o CLIP não quebrar
+    # Redimensionamento e normalização vitais para o CLIP
     if is_clip:
-        resize = T.Resize((224, 224), antialias=True)
-        X = resize(X)
+        if X.shape[-2:] != (224, 224):
+            resize = T.Resize((224, 224), antialias=True)
+            X = resize(X)
+        if not X.is_floating_point():
+            X = X.float() / 255.0
+        elif X.max() > 1.0:
+            X = X / 255.0
+        # Se os dados não tiverem normalização do CLIP, aplica a normalização oficial do CLIP
+        if X.min() >= 0.0:
+            normalize = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+            X = normalize(X)
         
     # Garante que o rótulo é inteiro longo e move os dados INTEIROS para a GPU
     X = X.to(device)
@@ -287,9 +308,10 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
 def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0):
     b = "FedALA" if argalgo == 0 else "FedAVG"
     
-    paca_val = args.paca if (args.paca is not None and args.paca > 0) else 0
+    paca_val = args.paca if (isinstance(args.paca, (int, float)) and not isinstance(args.paca, bool) and args.paca > 0) else 0
+    rank_val = args.rank if (isinstance(args.rank, (int, float)) and not isinstance(args.rank, bool) and args.rank > 0) else 8
     ts_suffix = f"_{args.timestamp}" if hasattr(args, 'timestamp') and args.timestamp else ""
-    algo = f"client_{idx}_{args.dataset}_{args.strategy}_rank{args.rank}_paca{paca_val}_{b}_run{args.run_id}{ts_suffix}"
+    algo = f"client_{idx}_{args.dataset}_{args.strategy}_rank{rank_val}_paca{paca_val}_{b}_run{args.run_id}{ts_suffix}"
     
     current_dir = Path(__file__).resolve().parent
     result_path = current_dir.parent / "results" / args.exp_name
@@ -374,6 +396,10 @@ def parse_args():
     parser.add_argument('--prune', type=int, default=1, choices=[0, 1], help='Habilitar pruning adaptativo (0=sim, 1=não, default: 1)')
     parser.add_argument('--mode', type=str, default='centralized', choices=['centralized', 'decentralized'])
     parser.add_argument('--max-epochs', type=int, default=0, help='Limite de epocas no modo descentralizado (0 = infinito)')
+    
+    # --- Otimização de Avaliação ---
+    parser.add_argument('--skip-post-eval', action='store_true', help='Pula todas as avaliações pós-treino no cliente (local_test_acc e train_acc) para máxima velocidade, mantendo apenas Global Model Test Acc')
+    parser.add_argument('--skip-train-eval', action='store_true', help='Pula apenas a avaliação demorada no conjunto de treino pós-treino')
     
     return parser.parse_args()
 
@@ -525,35 +551,52 @@ def main():
             # Timeout de segurança: evita que o client fique preso
             # indefinidamente caso o server feche a conexão (race condition
             # no último round)
-            s.settimeout(120)
+            if args.model == 'slm':
+                s.settimeout(1800)
+            else:
+                s.settimeout(120)
             
             send_data(s, args.client_idx)
             logger.info(f"Connected to server {args.host}:{args.port}")
             for round_num in range(args.rounds):
                 logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
                 
-                # --- Problema #4: Recebe PaCA dinâmico do servidor (apenas para CLIP) ---
-                if args.model == 'clip':
+                # --- Recebe PaCA e Rank dinâmicos do servidor (CLIP e SLM) ---
+                if args.model in ['clip', 'slm']:
                     server_paca, _ = recv_data(s)
-                    if server_paca is not None and server_paca != args.paca:
-                        logger.info(f"PaCA adaptativo: servidor ajustou {args.paca} -> {server_paca}")
-                        args.paca = server_paca
-                        # Atualiza o run_config para que o treino use o novo PaCA
-                        run_config["model"]["paca"]["upper_layers"] = server_paca
+                    if server_paca is None or server_paca == "end":
+                        logger.warning(f"Sinal de término ou desconexão recebido ao aguardar PaCA ({server_paca}). Encerrando cliente.")
+                        break
+                    if isinstance(server_paca, int) and not isinstance(server_paca, bool):
+                        if server_paca != args.paca:
+                            logger.info(f"PaCA adaptativo: servidor ajustou {args.paca} -> {server_paca}")
+                            args.paca = server_paca
+                            if "paca" in run_config.get("model", {}):
+                                run_config["model"]["paca"]["upper_layers"] = server_paca
+                    else:
+                        logger.warning(f"Valor inesperado de PaCA recebido: {server_paca} ({type(server_paca)}). Mantendo PaCA={args.paca}")
 
-                    # fazer a mesma coisa para receber um valor do server para o r
                     server_r, _ = recv_data(s)
-                    if server_r is not None and server_r != args.rank:
-                        logger.info(f"r adaptativo: servidor ajustou {args.rank} -> {server_r}")
-                        args.rank = server_r
-                        # Atualiza o run_config para que o treino use o novo r
-                        run_config["model"]["lora"]["r"] = server_r
+                    if server_r is None or server_r == "end":
+                        logger.warning(f"Sinal de término ou desconexão recebido ao aguardar Rank ({server_r}). Encerrando cliente.")
+                        break
+                    if isinstance(server_r, int) and not isinstance(server_r, bool):
+                        if server_r != args.rank:
+                            logger.info(f"r adaptativo: servidor ajustou {args.rank} -> {server_r}")
+                            args.rank = server_r
+                            if "lora" in run_config.get("model", {}):
+                                run_config["model"]["lora"]["r"] = server_r
+                    else:
+                        logger.warning(f"Valor inesperado de Rank recebido: {server_r} ({type(server_r)}). Mantendo Rank={args.rank}")
 
                 global_state, _ = recv_data(s)
+                if global_state is None or global_state == "end" or not isinstance(global_state, dict):
+                    logger.warning(f"Sinal de término ou payload inesperado recebido ({type(global_state)}): {global_state}. Encerrando cliente com segurança.")
+                    break
+
                 prune, _ = recv_data(s)
-                
-                if global_state is None:
-                    logger.warning("Failed to receive global model. Connection may be closed.")
+                if prune is None or prune == "end":
+                    logger.warning(f"Sinal de término ou desconexão recebido ao aguardar Prune ({prune}). Encerrando cliente.")
                     break
                     
                 logger.info("Received global model.")
@@ -562,18 +605,18 @@ def main():
                 client_dequant_time = time.time() - client_dequant_start
                 
                 
-                if round_num + 1 >= 2 and prune == 1 and args.model != 'clip':
+                if round_num + 1 >= 2 and prune == 1 and args.model == 'cnn':
                     ammount, _ = recv_data(s)
                 
                 eval_start = time.time()
                 if round_num + 1 >= 2:
-                    if args.model == 'clip':
+                    if args.model in ['clip', 'slm']:
                         old_local_weights = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
 
                     local = resize_model_to_pruned(model, global_state)
                     test_accuracy, test_loss = evaluate_model(local, test_loader)
                     
-                    if args.model == 'clip':
+                    if args.model in ['clip', 'slm']:
                         for n, p in model.named_parameters():
                             if p.requires_grad and n in old_local_weights:
                                 if p.data.shape == old_local_weights[n].shape:
@@ -601,7 +644,7 @@ def main():
                     alaarg=args.ala, 
                     ala=ala,
                     model_type=args.model, 
-                    run_config=run_config if args.model == 'clip' else None
+                    run_config=run_config if args.model in ['clip', 'slm'] else None
                 )
                 client_training_time = time.time() - train_start
                 
@@ -614,16 +657,27 @@ def main():
 
                 logger.info(f"Local training completed in {client_training_time:.2f}s.")
 
-                # Acurácia logo após o treinamento local (avaliado no conjunto de teste para comparação justa)
+                # Avaliações pós-treino (opcionalmente puladas para acelerar SLM/LLM)
                 post_eval_start = time.time()
-                local_test_acc, local_test_loss = evaluate_model(model, test_loader)
-                rs_local_acc.append(local_test_acc)
-                
-                train_accuracy, train_loss = evaluate_model(model, train_loader)
-                rs_train_acc.append(train_accuracy)
+                if not args.skip_post_eval:
+                    local_test_acc, local_test_loss = evaluate_model(model, test_loader)
+                    rs_local_acc.append(local_test_acc)
+                    
+                    if not args.skip_train_eval:
+                        train_accuracy, train_loss = evaluate_model(model, train_loader)
+                        rs_train_acc.append(train_accuracy)
+                    else:
+                        train_accuracy = 0.0
+                        rs_train_acc.append(0.0)
+                        
+                    logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
+                else:
+                    local_test_acc = test_accuracy
+                    train_accuracy = 0.0
+                    rs_local_acc.append(test_accuracy)
+                    rs_train_acc.append(0.0)
+                    logger.info(f"Client {args.client_idx}: Avaliação pós-treino pulada (--skip-post-eval). Usando Global Test Acc={test_accuracy:.2f}%")
                 client_post_eval_time = time.time() - post_eval_start
-
-                logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
                 
                 quant_start = time.time()
                 updated_state = quantization(updated_state)
@@ -637,7 +691,7 @@ def main():
                 
                 try:
                     send_data(s, updated_state)
-                    send_data(s, len(train_loader))
+                    send_data(s, len(train_loader.dataset))
                     send_data(s, args.ala)
                     send_data(s, client_training_time)
                     
@@ -650,7 +704,13 @@ def main():
                     
                     logger.info("Client update sent.")
                     
-                    s.recv(3)
+                    if args.model == 'slm':
+                        round_ack, _ = recv_data(s)
+                        if round_ack is None:
+                            logger.warning("Conexão fechada pelo servidor ou timeout ao aguardar confirmação de round. Finalizando.")
+                            break
+                    else:
+                        s.recv(3)
                     logger.info("Ready for next round...")
                 except (OSError, BrokenPipeError, ConnectionResetError, socket.timeout) as e:
                     logger.warning(f"Conexão fechada pelo servidor ou timeout ({type(e).__name__}). Finalizando.")
@@ -705,9 +765,14 @@ def main():
             logger.info(f"\n--- Iniciando Epoca {epoch}{f'/{args.max_epochs}' if args.max_epochs > 0 else ''} ---")
 
             # Obter o state_dict atual do modelo para usar como base do treino.
-            # Para CLIP, usa apenas os parametros treinaveis (LoRA/SoRA).
-            if args.model == 'clip':
-                dummy_state = get_trainable_state_dict(model)
+            # Para CLIP/SLM, usa apenas os parametros treinaveis (LoRA/SoRA).
+            if args.model in ['clip', 'slm']:
+                if args.model == 'slm':
+                    from lora_slm.sora import get_trainable_state_dict as get_trainable_state_dict_slm
+                    dummy_state = get_trainable_state_dict_slm(model)
+                else:
+                    from lora_clip.sora import get_trainable_state_dict as get_trainable_state_dict_clip
+                    dummy_state = get_trainable_state_dict_clip(model)
             else:
                 dummy_state = model.state_dict()
 
@@ -726,7 +791,7 @@ def main():
                 alaarg=args.ala,
                 ala=ala,
                 model_type=args.model,
-                run_config=run_config if args.model == 'clip' else None
+                run_config=run_config if args.model in ['clip', 'slm'] else None
             )
             client_training_time = time.time() - train_start
             logger.info(
@@ -834,7 +899,7 @@ def main():
                                         avg_state[key] += neighbor_state[key].to(device)
                                     avg_state[key] = avg_state[key] / (1 + len(other_states))
 
-                                if args.model == 'clip':
+                                if args.model in ['clip', 'slm']:
                                     resize_model_to_pruned(model, avg_state)
                                 else:
                                     model.load_state_dict(avg_state, strict=False)

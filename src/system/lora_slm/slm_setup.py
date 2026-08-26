@@ -13,7 +13,10 @@ from tqdm import tqdm
 from transformers import AutoProcessor, AutoModel
 from PIL import Image
 
-from sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
+try:
+    from sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
+except ImportError:
+    from lora_slm.sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
 
 DEFAULT_CONFIG_PATH = Path("train_config.yml")
 VALID_LORA_MODES = {
@@ -67,7 +70,7 @@ class SLMForClassification(nn.Module):
         
         # Seleciona o representation do ÚLTIMO token não-pad da sequência de cada exemplo no batch
         if attention_mask is not None:
-            sequence_lengths = attention_mask.sum(dim=1) - 1
+            sequence_lengths = attention_mask.cumsum(dim=1).argmax(dim=1)
             batch_size = last_hidden_state.shape[0]
             pooled_output = last_hidden_state[torch.arange(batch_size, device=last_hidden_state.device), sequence_lengths]
         else:
@@ -121,7 +124,15 @@ class CustomCollator:
                     {"type": "text", "text": self.prompt_text}
                 ]}
             ]
-            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            try:
+                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except ValueError:
+                # Fallback para modelos base (não-instruct) que não possuem chat template
+                # Tenta o formato Qwen2-VL primeiro, se não, usa Qwen-VL
+                if hasattr(self.processor.tokenizer, 'added_tokens_encoder') and '<|vision_start|>' in self.processor.tokenizer.added_tokens_encoder:
+                    text = f"<|vision_start|><|image_pad|><|vision_end|>{self.prompt_text}"
+                else:
+                    text = f"<image>{self.prompt_text}"
             texts.append(text)
             
         # O processor cria input_ids, attention_mask, pixel_values e image_grid_thw
@@ -283,11 +294,11 @@ def build_model(config, num_classes, device):
     model_config = config["model"]
     lora_config = model_config["lora"]
     
-    torch_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     
     slm_base = AutoModel.from_pretrained(
         model_config["name"],
-        torch_dtype=torch_dtype,
+        dtype=model_dtype,
         attn_implementation="sdpa" 
     )
     
@@ -299,7 +310,7 @@ def build_model(config, num_classes, device):
 
     if mode == "with_lora":
         total_layers = len(_get_encoder_layers(model))
-        layers_to_transform = list(range(total_layers - upper_k, total_layers)) if upper_k else None
+        layers_to_transform = None  # Allows dynamic expansion of PaCA in runtime
         peft_config = LoraConfig(
             r=lora_config["r"],
             lora_alpha=lora_config["alpha"],
@@ -311,7 +322,7 @@ def build_model(config, num_classes, device):
         )
         model.slm_model = get_peft_model(model.slm_model, peft_config)
     elif mode in SORA_MODES:
-        apply_sora(model, lora_config, upper_k=upper_k)
+        apply_sora(model, lora_config, upper_k=None)  # Allows dynamic expansion of PaCA in runtime
 
     if upper_k is not None:
         _apply_paca_gradient_boundary(model, upper_k)

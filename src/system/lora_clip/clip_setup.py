@@ -385,7 +385,7 @@ def build_model(config, num_classes, device):
     clip_model = CLIPModel.from_pretrained(
             model_config["name"], 
             attn_implementation="sdpa",
-            torch_dtype=torch.float32
+            dtype=torch.float32
         )    
     vision_model = clip_model.vision_model
     del clip_model

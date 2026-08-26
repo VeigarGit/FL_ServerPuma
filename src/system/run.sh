@@ -7,6 +7,10 @@
 # Execute ./run.sh --help para ver todos os argumentos disponíveis.
 # =============================================================================
 
+# Hugging Face: modo offline por padrão para evitar chamadas de rede redundantes a cada cliente/servidor
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
+
 # ---- Valores Padrão ----
 
 # Rede
@@ -31,7 +35,7 @@ AUTO_NEXT=0
 MODEL="cnn"
 STRATEGY="lora"
 RANK=8
-CONFIG_FILE="lora_clip/train_config.yml"
+CONFIG_FILE=""
 
 # Dispositivo
 DEVICE="cuda"
@@ -55,10 +59,12 @@ TEST_CLIENT_IDX=0
 
 # PaCA
 PACA=12
+CUSTOM_PACA=0
 ADAPTIVE_PACA=0
 RANDOM_PACA=0
 PACA_MIN=1
 PACA_MAX=12
+CUSTOM_PACA_MAX=0
 PACA_LIST=""
 
 # Rank Adaptativo
@@ -70,6 +76,10 @@ ADAPTIVE_RANK_MAX=8
 WEIGHTS_DIR="saved_weights"
 SAVE_MODEL_FLAG=""
 LOAD_MODEL_FLAG=""
+
+# Otimização de Avaliação
+SKIP_POST_EVAL=0
+SKIP_TRAIN_EVAL=0
 
 # ---- Função de Ajuda ----
 show_help() {
@@ -136,6 +146,10 @@ Persistência de Modelo:
   --save [path]               Salvar modelo (path opcional, gera nome automático)
   --load [path]               Carregar modelo (path opcional, gera nome automático)
 
+Otimização de Avaliação:
+  --skip-post-eval            Pular todas as avaliações pós-treino (mantém apenas Global Model Test Acc)
+  --skip-train-eval           Pular apenas a avaliação no conjunto de treino pós-treino
+
 Outros:
   --help                      Exibir esta mensagem
 EOF
@@ -191,17 +205,19 @@ while [ $# -gt 0 ]; do
         -t|--test-client-idx) TEST_CLIENT_IDX="$2"; shift 2 ;;
 
         # PaCA
-        --paca) PACA="$2"; shift 2 ;;
+        --paca) PACA="$2"; CUSTOM_PACA=1; shift 2 ;;
         --adaptive-paca) ADAPTIVE_PACA=1; shift 1 ;;
         --random-paca) RANDOM_PACA=1; shift 1 ;;
         --paca-min) PACA_MIN="$2"; shift 2 ;;
-        --paca-max) PACA_MAX="$2"; shift 2 ;;
+        --paca-max) PACA_MAX="$2"; CUSTOM_PACA_MAX=1; shift 2 ;;
         --paca-list) PACA_LIST="$2"; shift 2 ;;
 
         # Rank Adaptativo
         --adaptive-rank) ADAPTIVE_RANK=1; shift 1 ;;
         --adaptive-rank-min) ADAPTIVE_RANK_MIN="$2"; shift 2 ;;
         --adaptive-rank-max) ADAPTIVE_RANK_MAX="$2"; shift 2 ;;
+        --allow-paca-upscale) ALLOW_PACA_UPSCALE=1; shift 1 ;;
+        --allow-rank-upscale) ALLOW_RANK_UPSCALE=1; shift 1 ;;
 
         # Persistência de Modelo
         --save)
@@ -220,6 +236,10 @@ while [ $# -gt 0 ]; do
             fi
             LOAD_MODEL_FLAG="--load-model $LOAD_MODEL_PATH"
             ;;
+
+        # Otimização de Avaliação
+        --skip-post-eval) SKIP_POST_EVAL=1; shift 1 ;;
+        --skip-train-eval) SKIP_TRAIN_EVAL=1; shift 1 ;;
 
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
@@ -261,9 +281,24 @@ if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ]; then
     if [ -z "$CONFIG_FILE" ]; then
         if [ "$MODEL" = "slm" ]; then
             CONFIG_FILE="lora_slm/train_config.yml"
-        else
-            echo "❌ Erro: Ao usar --model $MODEL, forneça o caminho do YAML usando --config."
-            exit 1
+        elif [ "$MODEL" = "clip" ]; then
+            CONFIG_FILE="lora_clip/train_config.yml"
+        fi
+    fi
+    
+    # Auto-ajuste de PaCA conforme o modelo (SLM=28 camadas, CLIP=12 camadas)
+    if [ "$CUSTOM_PACA" -eq 0 ]; then
+        if [ "$MODEL" = "slm" ]; then
+            PACA=28
+        elif [ "$MODEL" = "clip" ]; then
+            PACA=12
+        fi
+    fi
+    if [ "$CUSTOM_PACA_MAX" -eq 0 ]; then
+        if [ "$MODEL" = "slm" ]; then
+            PACA_MAX=28
+        elif [ "$MODEL" = "clip" ]; then
+            PACA_MAX=12
         fi
     fi
 fi
@@ -305,7 +340,7 @@ cd ../dataset || exit 1
     # Encontra o script ignorando case
     SCRIPT_NAME=$(find . -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
     if [ -n "$SCRIPT_NAME" ]; then
-        uv run "$SCRIPT_NAME" noniid - dir
+        uv run "$SCRIPT_NAME" noniid - dir "$CLIENT_COUNT"
     else
         echo "❌ Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
         exit 1
@@ -361,6 +396,12 @@ for RUN in $(seq $START_RUN $END_RUN); do
     if [ "$ADAPTIVE_RANK" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-rank --adaptive-rank-min $ADAPTIVE_RANK_MIN --adaptive-rank-max $ADAPTIVE_RANK_MAX"
     fi
+    if [ "${ALLOW_PACA_UPSCALE:-0}" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --allow-paca-upscale"
+    fi
+    if [ "${ALLOW_RANK_UPSCALE:-0}" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --allow-rank-upscale"
+    fi
     if [ "$SORA_PRUNE" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --sora-prune"
     fi
@@ -383,6 +424,14 @@ for RUN in $(seq $START_RUN $END_RUN); do
             PACA_FLAGS="--paca-list $PACA_LIST"
         fi
 
+        # Flags de Otimização de Avaliação
+        EVAL_FLAGS=""
+        if [ "$SKIP_POST_EVAL" -eq 1 ]; then
+            EVAL_FLAGS="$EVAL_FLAGS --skip-post-eval"
+        elif [ "$SKIP_TRAIN_EVAL" -eq 1 ]; then
+            EVAL_FLAGS="$EVAL_FLAGS --skip-train-eval"
+        fi
+
         # Distribuição round-robin de GPUs
         if [ "$CUSTOM_DID" -eq 1 ]; then
             CLIENT_DEVICE_ID=$DEVICE_ID
@@ -392,7 +441,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --num-classes $NUM_CLASSES --in-features $IN_FEATURES --run-id $RUN --exp-name $EXP_NAME --timestamp $TIMESTAMP 2>&1 | tee $LOG_DIR/client_$i.log"
+        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS $EVAL_FLAGS --config \"$CONFIG_FILE\" --num-classes $NUM_CLASSES --in-features $IN_FEATURES --run-id $RUN --exp-name $EXP_NAME --timestamp $TIMESTAMP 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
             CLIENT_CMD="$CLIENT_CMD ; read"
         fi
