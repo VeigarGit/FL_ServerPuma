@@ -66,7 +66,7 @@ DEFAULT_WARMUP = 60
 # Segundos de cooldown entre encontros consecutivos.
 # Impede que mudancas incrementais na composicao do cluster
 # (entra/sai 1 veiculo) consumam o contador de encontros.
-DEFAULT_COOLDOWN = 30
+DEFAULT_COOLDOWN = 15
 
 # Raiz do projeto (FL_ServerPuma/)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -709,6 +709,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                                 "Aguardando 5s para retomada...",
                                 len(expected_done_files), exchange_time,
                             )
+                            event_log[-1].details["exchange_time"] = round(exchange_time, 1)
                             # Dar tempo extra para garantia
                             time.sleep(5)
                             break
@@ -722,6 +723,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                             exchange_timeout, encounter_count,
                             received_count, len(expected_done_files),
                         )
+                        event_log[-1].details["exchange_time"] = round(exchange_time, 1)
 
                     log.info("SUMO RETOMADO.")
 
