@@ -210,6 +210,10 @@ class FederatedLearningServer:
         self.bit = []
         self.complexity_calculated = False
         
+        # Performance tracking variables
+        self.time_threshold = 0.0
+        self.mean_training_time = 0.0
+        
         # LHDQ: cache do estado anterior por cliente (para delta coding)
         self.previous_sent_state = {}   # client_id → state_dict enviado na rodada anterior
         self.previous_recv_state = {}   # client_id → state_dict recebido na rodada anterior
@@ -564,7 +568,7 @@ class FederatedLearningServer:
             return accuracy_signal
 
         # --- CRITÉRIO 1: LATÊNCIA (per-client em relação à média do cluster) ---
-        # Subir PaCA se o cliente for significativamente mais rápido que a média (>20% mais rápido)
+        # Increase PaCA if client is significantly faster than the cluster average (>20% faster)
         if total_time < mean_time * 0.80 and current_paca < max_paca:
             if getattr(self.args, 'allow_paca_upscale', False):
                 new_paca = min(current_paca + 1, max_paca)
@@ -684,7 +688,7 @@ class FederatedLearningServer:
     def _check_accuracy_signal_rank(self, client_id, current_rank, rank_min, max_rank, in_cooldown=False):
         """
         Verifica se a acurácia indica que o Rank pode ser ajustado.
-        - Reversão (Pânico): SEMPRE ativa. Se a acurácia caiu >2pp após redução, reverte +2.
+        - Fallback mechanism: Revert PaCA layer count if accuracy drops by more than 2% after a reduction.
         - Plateau: APENAS fora do cooldown. Se estabilizou, reduz -1.
         """
         acc_history = self.rs_test_acc
@@ -750,8 +754,8 @@ class FederatedLearningServer:
         mean_acc = sum(recent) / len(recent)
         std_acc = (sum((x - mean_acc) ** 2 for x in recent) / len(recent)) ** 0.5
         
-        # --- SEGURANÇA: acurácia caiu após redução? Reverte com +2. ---
-        # (SEMPRE ativo, mesmo em cooldown — é uma rede de segurança)
+        # --- Safety check: Revert PaCA reduction if accuracy drops significantly ---
+        # (Always active, even during cooldown periods)
         paca_before_last_change = self.clients_info[client_id].get('paca_before_change')
         if paca_before_last_change is not None and paca_before_last_change > current_paca:
             # PaCA foi reduzido. Verificar se a acurácia caiu.
@@ -809,8 +813,23 @@ class FederatedLearningServer:
         bandwidth = client_info.get('bandwidth', 1.0)
         training_time = client_info.get('training_time', 60.0)
         
-        bw_factor = 0.8 if bandwidth < 0.5 else 0.6 if bandwidth < 5.0 else 0.4 if bandwidth < 20.0 else 0.2
-        time_factor = 0.2 if training_time < 30 else 0.4 if training_time < 60 else 0.6 if training_time < 120 else 0.8
+        if bandwidth < 0.5:
+            bw_factor = 0.8
+        elif bandwidth < 5.0:
+            bw_factor = 0.6
+        elif bandwidth < 20.0:
+            bw_factor = 0.4
+        else:
+            bw_factor = 0.2
+            
+        if training_time < 30:
+            time_factor = 0.2
+        elif training_time < 60:
+            time_factor = 0.4
+        elif training_time < 120:
+            time_factor = 0.6
+        else:
+            time_factor = 0.8
         
         pruning_rate = (bw_factor + time_factor) / 2
         return max(0.2, min(0.85, pruning_rate))
@@ -825,7 +844,12 @@ class FederatedLearningServer:
         last_training_time = client_info.get('last_training_time', training_time)
         client_info['last_training_time'] = training_time
         
-        adjustment = 0.05 if training_time > last_training_time * 1.5 else (0.03 if training_time > getattr(self, 'time_threshold', 0) * 1.2 else 0.0)
+        if training_time > last_training_time * 1.5:
+            adjustment = 0.05
+        elif training_time > self.time_threshold * 1.2:
+            adjustment = 0.03
+        else:
+            adjustment = 0.0
         return max(0.2, min(0.85, base_pruning_rate + adjustment))
     
     def handle_client(self, conn, client_updates, client_weights, round_num, client_id, client_accuracies, client_losses):
@@ -936,8 +960,8 @@ class FederatedLearningServer:
                 if use_lhdq:
                     prev_state = self.previous_sent_state.get(client_id, {})
                     g_model_pruned = lhdq_encode(g_model_pruned, prev_state)
-                    # Re-decodifica para obter exatamente o que o cliente vai reconstruir,
-                    # garantindo que ambos os lados usem a mesma referência base.
+                    # Re-decode to ensure identical reference state with the client.
+                    # This guarantees both sides use the same base reference for future deltas.
                     self.previous_sent_state[client_id] = lhdq_decode(g_model_pruned, prev_state)
                 else:
                     if getattr(self.args, 'delta_coding', False):
@@ -958,8 +982,8 @@ class FederatedLearningServer:
                 if use_lhdq:
                     prev_state = self.previous_sent_state.get(client_id, {})
                     current_global_state = lhdq_encode(current_global_state, prev_state)
-                    # Re-decodifica para obter exatamente o que o cliente vai reconstruir,
-                    # garantindo que ambos os lados usem a mesma referência base.
+                    # Re-decode to ensure identical reference state with the client.
+                    # This guarantees both sides use the same base reference for future deltas.
                     self.previous_sent_state[client_id] = lhdq_decode(current_global_state, prev_state)
                 else:
                     if getattr(self.args, 'delta_coding', False):

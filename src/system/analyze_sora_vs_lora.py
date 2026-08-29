@@ -4,11 +4,19 @@ import h5py
 import numpy as np
 import glob
 import os
+import argparse
 
-results_base = '../results'
-lora_dir = os.path.join(results_base, 'david_clip_lora_prune1_ala1_20260716_173830')
-sora_dir = os.path.join(results_base, 'sora_rankminimo_v2')
-sora_v2_dir = os.path.join(results_base, 'david_v2_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260718_155430')
+def parse_args():
+    parser = argparse.ArgumentParser(description="Analyze Sora vs Lora trajectory")
+    parser.add_argument("--lora-dir", required=True, help="Directory containing LoRA results")
+    parser.add_argument("--sora-dir", required=True, help="Directory containing SoRA results")
+    parser.add_argument("--sora-v2-dir", required=True, help="Directory containing SoRA v2 results")
+    return parser.parse_args()
+
+args = parse_args()
+lora_dir = args.lora_dir
+sora_dir = args.sora_dir
+sora_v2_dir = args.sora_v2_dir
 
 def load_acc_loss_params(exp_dir):
     files = sorted(glob.glob(os.path.join(exp_dir, 'server_*.h5')))

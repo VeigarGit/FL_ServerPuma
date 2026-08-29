@@ -274,7 +274,7 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
             if x_tensor.max() <= 1.0:
                 x_tensor = x_tensor * 255.0
                 
-            # Clamp de segurança para garantir [0, 255]
+            # Clamp to [0, 255] range
             x_tensor = torch.clamp(x_tensor, 0, 255)
             x_numpy = x_tensor.byte().numpy()
             
@@ -559,7 +559,7 @@ def main():
                 logger.exception("Connection failed after multiple attempts")
                 sys.exit(1)
                 
-            # Timeout de segurança: evita que o client fique preso
+            # Network timeout configuration
             # indefinidamente caso o server feche a conexão (race condition
             # no último round)
             if args.model == 'slm':
@@ -567,7 +567,7 @@ def main():
             else:
                 s.settimeout(120)
             
-            # LHDQ: cache do estado anterior (para delta coding)
+            # LHDQ: previous state cache for delta coding
             previous_recv_state = {}  # estado global recebido na rodada anterior
             previous_sent_state = {}  # update enviado na rodada anterior
             
@@ -618,7 +618,7 @@ def main():
                 client_dequant_start = time.time()
                 if is_lhdq_encoded(global_state):
                     global_state = lhdq_decode(global_state, previous_recv_state)
-                    # LHDQ: cachear o estado global recebido (já decodificado) para a próxima rodada
+                    # LHDQ: cache the decoded global state for the next round
                     previous_recv_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()}
                 else:
                     if args.delta_coding:
@@ -706,8 +706,7 @@ def main():
                 quant_start = time.time()
                 use_lhdq = (args.delta_coding and round_num >= 1 and previous_sent_state)
                 if use_lhdq:
-                    # LHDQ: codifica e cacheia a versão reconstruída (não a exata)
-                    # para manter sincronização com o receptor.
+                    # LHDQ: encode and cache the reconstructed version to maintain reference sync
                     updated_state = lhdq_encode(updated_state, previous_sent_state)
                     previous_sent_state = lhdq_decode(updated_state, previous_sent_state)
                 else:
