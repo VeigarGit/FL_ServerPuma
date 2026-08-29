@@ -13,6 +13,7 @@ Uso:
     recovered = lhdq_decode(encoded, previous_state)
 """
 
+import math
 import torch
 import numpy as np
 import logging
@@ -45,36 +46,39 @@ DECODE_SECOND_BIT_IS_0 = 2  # → símbolo +1
 def _huffman_pack(symbols: np.ndarray) -> tuple:
     """
     Empacota um array de símbolos {0, 1, 2} em bytes usando Huffman.
+    Implementação 100% vetorizada com Numpy para máxima performance.
     
     Returns:
         (packed_bytes: bytes, total_bits: int)
     """
-    buf = bytearray()
-    current_byte = 0
-    bit_pos = 0  # quantos bits já foram escritos no byte atual (0-7)
-    total_bits = 0
+    # Define os tamanhos: símbolo 1 usa 1 bit, os demais usam 2 bits
+    lens = np.full(symbols.shape, 2, dtype=np.int32)
+    lens[symbols == 1] = 1
     
-    for sym in symbols:
-        code, n_bits = HUFFMAN_CODES[sym]
-        total_bits += n_bits
-        
-        # Escreve os bits do código no buffer, MSB first
-        for i in range(n_bits - 1, -1, -1):
-            bit = (code >> i) & 1
-            current_byte = (current_byte << 1) | bit
-            bit_pos += 1
-            
-            if bit_pos == 8:
-                buf.append(current_byte)
-                current_byte = 0
-                bit_pos = 0
+    total_bits = int(lens.sum())
     
-    # Flush do último byte parcial (padding com zeros à direita)
-    if bit_pos > 0:
-        current_byte <<= (8 - bit_pos)
-        buf.append(current_byte)
+    # Aloca um array de bits preenchido com zeros
+    bits = np.zeros(total_bits, dtype=np.uint8)
     
-    return bytes(buf), total_bits
+    # Calcula os índices iniciais de cada símbolo no array flat
+    starts = np.empty_like(lens)
+    starts[0] = 0
+    np.cumsum(lens[:-1], out=starts[1:])
+    
+    # O primeiro bit é 1 para sym==1, e 0 para os demais
+    bits[starts] = (symbols == 1)
+    
+    # O segundo bit só existe para símbolos != 1
+    mask_2bits = (symbols != 1)
+    starts_2bits = starts[mask_2bits]
+    
+    # Símbolo 0 vira '01' (segundo bit = 1)
+    # Símbolo 2 vira '00' (segundo bit = 0)
+    bits[starts_2bits + 1] = (symbols[mask_2bits] == 0)
+    
+    # O np.packbits automaticamente agrupa os bits em bytes MSB e faz o padding do último byte com zeros
+    packed_bytes = np.packbits(bits).tobytes()
+    return packed_bytes, total_bits
 
 
 def _huffman_unpack(packed_bytes: bytes, total_bits: int, n_elements: int) -> np.ndarray:
@@ -125,67 +129,73 @@ def _huffman_unpack(packed_bytes: bytes, total_bits: int, n_elements: int) -> np
 
 def _quantize_delta_3level(delta: torch.Tensor) -> tuple:
     """
-    Quantiza um tensor delta em 3 níveis baseados na distribuição normal.
-    
-    Divide a distribuição em 3 regiões de igual probabilidade:
-    - Região inferior (prob 1/3): atribui representante -p_delta
-    - Região central  (prob 1/3): atribui representante 0 (sem mudança relativa)
-    - Região superior (prob 1/3): atribui representante +p_delta
-    
-    Os limites são: mu ± 0.4307 * sigma (inversa da CDF normal para 1/3 e 2/3).
-    O representante p_delta é a média condicional da região extrema.
+    Quantiza um tensor delta em 3 níveis baseado em percentis reais (quantiles).
+    Garante que a distribuição será dividida em terços independentemente 
+    do formato (normal, cauda longa, concentrada, etc.).
     
     Returns:
-        (symbols: np.ndarray de {0,1,2}, mu: float, sigma: float, p_delta: float)
-        onde 0→negativo, 1→zero, 2→positivo
+        (symbols, mu, sigma) — o p_delta é recalculado pelo receptor.
     """
     delta_flat = delta.float().flatten()
     
     mu = delta_flat.mean().item()
     sigma = delta_flat.std().item()
     
-    # Proteção contra sigma zero (todos os deltas iguais)
     if sigma < 1e-10:
         n = delta_flat.numel()
-        symbols = np.ones(n, dtype=np.int8)  # tudo é "sem mudança"
-        return symbols, mu, sigma, 0.0
+        symbols = np.ones(n, dtype=np.int8)
+        return symbols, mu, sigma
     
-    # Limites para dividir em 3 regiões equiprováveis
-    # InvCDF(1/3) ≈ -0.4307, InvCDF(2/3) ≈ +0.4307
-    TERCILE_Z = 0.4307
-    lower_bound = mu - TERCILE_Z * sigma
-    upper_bound = mu + TERCILE_Z * sigma
+    # Usa percentis reais para definir os limites de cada terço
+    quantiles = torch.quantile(delta_flat, torch.tensor([0.3333, 0.6667], device=delta_flat.device))
+    lower_bound = quantiles[0].item()
+    upper_bound = quantiles[1].item()
     
-    # p_delta: representante da região extrema (média condicional)
-    # Para distribuição normal, E[X | X > upper] ≈ mu + sigma * φ(z) / (1 - Φ(z))
-    # onde z = TERCILE_Z, φ(z) ≈ 0.3637, 1-Φ(z) = 1/3
-    # Simplificado: p_delta ≈ sigma * 0.3637 / (1/3) = sigma * 1.0911
-    p_delta = sigma * 1.0911
+    # Previne limites idênticos em distribuições extremamente concentradas
+    if lower_bound >= upper_bound:
+        lower_bound = mu - 1e-8
+        upper_bound = mu + 1e-8
+        
+    # Computa símbolos diretamente na GPU (muito mais rápido e transfere 4x menos dados)
+    symbols_pt = torch.ones_like(delta_flat, dtype=torch.uint8)
+    symbols_pt[delta_flat < lower_bound] = 0
+    symbols_pt[delta_flat > upper_bound] = 2
     
-    # Classificação vetorizada
-    delta_np = delta_flat.cpu().numpy()
-    symbols = np.ones(len(delta_np), dtype=np.int8)  # default: 0 (região central)
-    symbols[delta_np < lower_bound] = 0   # região inferior → -1
-    symbols[delta_np > upper_bound] = 2   # região superior → +1
+    # Transfere apenas o array uint8 final para a CPU
+    symbols = symbols_pt.cpu().numpy()
+        
+    return symbols, mu, sigma
+
+
+def _compute_p_delta(mu: float, sigma: float) -> float:
+    """
+    Calcula o valor de reconstrução p_delta conforme a literatura LHDQ:
+        p_delta = mu + 0.88 * sigma * sqrt(2)
     
-    return symbols, mu, sigma, p_delta
+    Este valor divide a PDF normal em 3 terços equiprováveis.
+    """
+    return mu + 0.88 * sigma * math.sqrt(2)
 
 
 def _dequantize_3level(symbols: np.ndarray, mu: float, sigma: float, 
-                        p_delta: float, shape: tuple, device, dtype) -> torch.Tensor:
+                        shape: tuple, device, dtype) -> torch.Tensor:
     """
     Reconstrói o tensor delta a partir dos símbolos quantizados.
     
+    O p_delta é recalculado a partir de μ e σ (recebidos em float16).
     Mapeamento: 0 → -p_delta,  1 → 0,  2 → +p_delta
-    (todos relativos à média mu)
     """
-    # Mapeia símbolos para valores de delta
-    delta_values = np.zeros(len(symbols), dtype=np.float32)
-    delta_values[symbols == 0] = mu - p_delta   # região inferior
-    delta_values[symbols == 1] = mu              # região central
-    delta_values[symbols == 2] = mu + p_delta   # região superior
+    p_delta = _compute_p_delta(mu, sigma)
     
-    return torch.from_numpy(delta_values).reshape(shape).to(device=device, dtype=dtype)
+    # Transfere os símbolos (uint8) para a GPU antes de mapear
+    symbols_pt = torch.from_numpy(symbols).to(device=device)
+    
+    # Cria o tensor final diretamente na GPU
+    delta_values = torch.zeros(len(symbols), device=device, dtype=dtype)
+    delta_values[symbols_pt == 0] = -p_delta
+    delta_values[symbols_pt == 2] = +p_delta
+    
+    return delta_values.reshape(shape)
 
 
 def lhdq_encode(current_state: dict, previous_state: dict) -> dict:
@@ -206,9 +216,8 @@ def lhdq_encode(current_state: dict, previous_state: dict) -> dict:
                     'total_bits': int,
                     'n_elements': int,
                     'shape': tuple,
-                    'mu': float,
-                    'sigma': float,
-                    'p_delta': float,
+                    'mu': float,          # quantizado em float16
+                    'sigma': float,       # quantizado em float16
                     'dtype': torch.dtype,
                     'device': str,
                 }
@@ -239,14 +248,18 @@ def lhdq_encode(current_state: dict, previous_state: dict) -> dict:
         delta = current_val.float() - prev_val.float().to(current_val.device)
         
         # Quantiza em 3 níveis
-        symbols, mu, sigma, p_delta = _quantize_delta_3level(delta)
+        symbols, mu, sigma = _quantize_delta_3level(delta)
+        
+        # Quantiza μ e σ em float16 conforme a literatura (16 bits cada)
+        mu_f16 = torch.tensor(mu, dtype=torch.float16).item()
+        sigma_f16 = torch.tensor(sigma, dtype=torch.float16).item()
         
         # Empacota com Huffman
         packed_bytes, total_bits = _huffman_pack(symbols)
         
         # Estatísticas de compressão
         original_bytes = current_val.numel() * current_val.element_size()
-        compressed_bytes = len(packed_bytes) + 12  # +12 bytes para mu/sigma/p_delta (3 floats)
+        compressed_bytes = len(packed_bytes) + 4  # +4 bytes para mu/sigma (2 × float16)
         total_original_bytes += original_bytes
         total_compressed_bytes += compressed_bytes
         
@@ -255,9 +268,8 @@ def lhdq_encode(current_state: dict, previous_state: dict) -> dict:
             'total_bits': total_bits,
             'n_elements': current_val.numel(),
             'shape': tuple(current_val.shape),
-            'mu': mu,
-            'sigma': sigma,
-            'p_delta': p_delta,
+            'mu': mu_f16,
+            'sigma': sigma_f16,
             'dtype': current_val.dtype,
             'device': str(current_val.device),
         }
@@ -310,12 +322,11 @@ def lhdq_decode(encoded_state: dict, previous_state: dict) -> dict:
             device = torch.device(entry.get('device', 'cpu'))
             dtype = entry.get('dtype', torch.float32)
         
-        # Reconstrói o delta
+        # Reconstrói o delta (p_delta é recalculado a partir de μ e σ)
         reconstructed_delta = _dequantize_3level(
             symbols, 
             entry['mu'], 
             entry['sigma'], 
-            entry['p_delta'],
             entry['shape'],
             device,
             dtype

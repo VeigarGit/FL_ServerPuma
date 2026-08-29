@@ -618,13 +618,15 @@ def main():
                 client_dequant_start = time.time()
                 if is_lhdq_encoded(global_state):
                     global_state = lhdq_decode(global_state, previous_recv_state)
-                else:
-                    global_state = dequantization(global_state)
-                client_dequant_time = time.time() - client_dequant_start
-                
-                # LHDQ: cachear o estado global recebido (já decodificado) para a próxima rodada
-                if args.delta_coding:
+                    # LHDQ: cachear o estado global recebido (já decodificado) para a próxima rodada
                     previous_recv_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()}
+                else:
+                    if args.delta_coding:
+                        previous_recv_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()}
+                        # Pula a dequantização int8 no round 1 do delta_coding
+                    else:
+                        global_state = dequantization(global_state)
+                client_dequant_time = time.time() - client_dequant_start
                 
                 
                 if round_num + 1 >= 2 and prune == 1 and args.model == 'cnn':
@@ -704,14 +706,16 @@ def main():
                 quant_start = time.time()
                 use_lhdq = (args.delta_coding and round_num >= 1 and previous_sent_state)
                 if use_lhdq:
-                    # LHDQ: cachear antes de codificar
-                    current_plain_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
+                    # LHDQ: codifica e cacheia a versão reconstruída (não a exata)
+                    # para manter sincronização com o receptor.
                     updated_state = lhdq_encode(updated_state, previous_sent_state)
-                    previous_sent_state = current_plain_state
+                    previous_sent_state = lhdq_decode(updated_state, previous_sent_state)
                 else:
                     if args.delta_coding:
                         previous_sent_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
-                    updated_state = quantization(updated_state)
+                        # Pula a quantização int8 no round 1 do delta_coding
+                    else:
+                        updated_state = quantization(updated_state)
                 client_quant_time = time.time() - quant_start
                 
                 # Tempo total de avaliação (pré + pós treinamento) e dequantização no cliente

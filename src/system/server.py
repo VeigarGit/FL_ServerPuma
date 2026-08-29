@@ -70,6 +70,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # -------------------------------------------------
 
+def get_state_dict_size_mb(state):
+    """Calcula matematicamente o tamanho em MB sem serializar em pickle, evitando travar o GIL e a CPU."""
+    total_bytes = 0
+    if hasattr(state, 'state_dict'):
+        state = state.state_dict()
+        
+    if isinstance(state, dict) and state.get('__lhdq__'):
+        for k, v in state['keys'].items():
+            if 'raw' in v:
+                total_bytes += v['raw'].numel() * v['raw'].element_size()
+            else:
+                total_bytes += len(v['packed']) + 4  # 4 bytes for mu/sigma (float16)
+    elif isinstance(state, dict):
+        for v in state.values():
+            if isinstance(v, torch.Tensor):
+                total_bytes += v.numel() * v.element_size()
+            elif isinstance(v, (int, float)):
+                total_bytes += 8
+    return total_bytes / (1024 * 1024)
+
 class FederatedLearningServer:
     def __init__(self, args):
         self.args = args
@@ -877,7 +897,7 @@ class FederatedLearningServer:
                 else:
                     max_amount = self.clients_info[client_id]['pruning_rate']
                 
-                self.clients_info[client_id]['original_model_size'] = sys.getsizeof(pickle.dumps(self.global_model)) / (1024 * 1024)
+                self.clients_info[client_id]['original_model_size'] = get_state_dict_size_mb(self.global_model)
                 logger.info(f"--- SERVER: Calculated pruning rate: {max_amount:.4f}")
                 
                 g_model_pruned = copy.deepcopy(self.global_model)
@@ -912,16 +932,19 @@ class FederatedLearningServer:
                         and client_id in self.previous_sent_state)
             
             if round_num >= 2 and self.prune == 1 and self.args.model == 'cnn':
-                # LHDQ: cachear antes de codificar (branch CNN pruning)
-                if getattr(self.args, 'delta_coding', False):
-                    self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in g_model_pruned.items()}
-                
-                size_before = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
+                size_before = get_state_dict_size_mb(g_model_pruned)
                 if use_lhdq:
-                    g_model_pruned = lhdq_encode(g_model_pruned, self.previous_sent_state[client_id])
+                    prev_state = self.previous_sent_state.get(client_id, {})
+                    g_model_pruned = lhdq_encode(g_model_pruned, prev_state)
+                    # Re-decodifica para obter exatamente o que o cliente vai reconstruir,
+                    # garantindo que ambos os lados usem a mesma referência base.
+                    self.previous_sent_state[client_id] = lhdq_decode(g_model_pruned, prev_state)
                 else:
-                    g_model_pruned = quantization(g_model_pruned)
-                size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
+                    if getattr(self.args, 'delta_coding', False):
+                        self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in g_model_pruned.items()}
+                    if not getattr(self.args, 'delta_coding', False):
+                        g_model_pruned = quantization(g_model_pruned)
+                size_after = get_state_dict_size_mb(g_model_pruned)
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
@@ -931,16 +954,19 @@ class FederatedLearningServer:
                 send_data(conn, self.prune)
                 send_data(conn, max_amount)
             else:
-                # Salva cópia pré-quantização para cache LHDQ
-                if getattr(self.args, 'delta_coding', False):
-                    self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in current_global_state.items()}
-                
-                size_before = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
+                size_before = get_state_dict_size_mb(current_global_state)
                 if use_lhdq:
-                    current_global_state = lhdq_encode(current_global_state, self.previous_sent_state[client_id])
+                    prev_state = self.previous_sent_state.get(client_id, {})
+                    current_global_state = lhdq_encode(current_global_state, prev_state)
+                    # Re-decodifica para obter exatamente o que o cliente vai reconstruir,
+                    # garantindo que ambos os lados usem a mesma referência base.
+                    self.previous_sent_state[client_id] = lhdq_decode(current_global_state, prev_state)
                 else:
-                    current_global_state = quantization(current_global_state)
-                size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
+                    if getattr(self.args, 'delta_coding', False):
+                        self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in current_global_state.items()}
+                    if not getattr(self.args, 'delta_coding', False):
+                        current_global_state = quantization(current_global_state)
+                size_after = get_state_dict_size_mb(current_global_state)
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
@@ -956,7 +982,7 @@ class FederatedLearningServer:
             updated_state, rate = recv_data(conn)
             bit_rate.append(rate)
             if updated_state is not None:
-                recv_size_mb = sys.getsizeof(pickle.dumps(updated_state)) / (1024 * 1024)
+                recv_size_mb = get_state_dict_size_mb(updated_state)
                 with self.lock:
                     self.received_ammount.append(self.received_ammount[-1] + recv_size_mb)
             
@@ -971,7 +997,8 @@ class FederatedLearningServer:
                 prev_recv = self.previous_recv_state.get(client_id, {})
                 updated_state = lhdq_decode(updated_state, prev_recv)
             else:
-                updated_state = dequantization(updated_state)
+                if not getattr(self.args, 'delta_coding', False):
+                    updated_state = dequantization(updated_state)
             server_dequant_time = time.time() - server_dequant_start
             
             # LHDQ: cachear o update recebido para a próxima rodada

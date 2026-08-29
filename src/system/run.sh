@@ -11,6 +11,22 @@
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
 
+# Previne que o PyTorch tente usar todos os núcleos (100+ threads) para cada um dos 10 clientes, o que causa Thrashing
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export VECLIB_MAXIMUM_THREADS=4
+export NUMEXPR_NUM_THREADS=4
+
+# Compilador C: necessário para o Triton (JIT de kernels CUDA em modelos Transformers)
+# Usa o gcc do micromamba local se o sistema não tiver um instalado
+if [ -z "$CC" ] && ! command -v cc &>/dev/null && ! command -v gcc &>/dev/null; then
+    MAMBA_GCC="$HOME/.local/micromamba/envs/gcc/bin/x86_64-conda-linux-gnu-gcc"
+    if [ -x "$MAMBA_GCC" ]; then
+        export CC="$MAMBA_GCC"
+    fi
+fi
+
 # ---- Valores Padrão ----
 
 # Rede

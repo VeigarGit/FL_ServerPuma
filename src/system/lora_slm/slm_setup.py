@@ -195,8 +195,8 @@ def build_dataloaders(config, processor, device):
     class_names, label_to_idx = resolve_label_metadata(dataset["train"])
     collate_fn = CustomCollator(processor=processor, label_to_idx=label_to_idx)
     batch_size = training_config["batch_size"]
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
-    eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=0, pin_memory=True)
+    eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0, pin_memory=True)
     return train_loader, eval_loader, class_names
 
 def apply_sora(model, lora_config, upper_k=None):
@@ -318,7 +318,7 @@ def build_model(config, num_classes, device):
             lora_dropout=lora_config["dropout"],
             bias=lora_config["bias"],
             layers_to_transform=layers_to_transform,
-            layers_pattern="layers",
+            layers_pattern="layers" if layers_to_transform is not None else None,
         )
         model.slm_model = get_peft_model(model.slm_model, peft_config)
     elif mode in SORA_MODES:
