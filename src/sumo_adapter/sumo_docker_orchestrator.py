@@ -2,7 +2,7 @@
 """
 sumo_docker_orchestrator.py
 ============================
-Orquestrador V2X para Treinamento Federado.
+Orquestrador V2V para Treinamento Federado.
 
 Metodologia baseada no MobFedLS:
   1. Inicia TODOS os conteineres dos clientes (veiculos) no inicio.
@@ -27,7 +27,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from sumo_adapter.generate_v2x_compose import generate as compose_generate
+from sumo_adapter.generate_v2v_compose import generate as compose_generate
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -35,11 +35,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("v2x_orchestrator")
+log = logging.getLogger("v2v_orchestrator")
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
-# Raio de comunicacao DSRC/C-V2X padrao (metros)
+# Raio de comunicacao DSRC padrao (metros)
 DEFAULT_COMM_RADIUS = 300.0
 
 # Minimo de veiculos para formar um cluster valido
@@ -66,7 +66,7 @@ DEFAULT_WARMUP = 60
 # Segundos de cooldown entre encontros consecutivos.
 # Impede que mudancas incrementais na composicao do cluster
 # (entra/sai 1 veiculo) consumam o contador de encontros.
-DEFAULT_COOLDOWN = 30
+DEFAULT_COOLDOWN = 15
 
 # Raiz do projeto (FL_ServerPuma/)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -95,8 +95,8 @@ class VehicleState:
 
 
 @dataclass
-class V2XEvent:
-    """Evento de log da simulacao V2X para analise posterior.
+class V2VEvent:
+    """Evento de log da simulacao V2V para analise posterior.
     
     Atributos:
         sim_time: Tempo de simulacao do SUMO em segundos
@@ -185,9 +185,16 @@ def estimate_contact_time(
 
     # Caso especial: A ≈ 0 significa que a velocidade relativa e
     # praticamente zero (veiculos parados ou com mesma velocidade).
-    # Neste caso, a distancia nao muda e o ETC e o maximo possivel.
     if A < 1e-9:
-        return MAX_ETC
+        avg_speed = (v1.speed + v2.speed) / 2.0
+        if avg_speed < 0.1:
+            # Ambos realmente parados — ETC alto e correto
+            return "Carros Parados"
+        # Se tem velocidade mas e quase igual (movendo juntos),
+        # estimar pela margem restante do raio dividida pela
+        # velocidade media. Pessimista mas muito melhor que MAX_ETC.
+        remaining = radius - dist
+        return min(remaining / avg_speed, MAX_ETC)
 
     # Discriminante: sempre positivo quando C < 0 e A > 0
     discriminante = B * B - 4.0 * A * C
@@ -214,23 +221,35 @@ def estimate_contact_time(
 def cluster_etc(
     cluster: list[VehicleState],
     radius: float,
-) -> float:
+) -> float | str:
     """Calcula o ETC de um cluster inteiro.
     
     O ETC do cluster e o MINIMO entre todos os pares de veiculos,
     pois basta um par se separar para quebrar a conectividade.
     
     Args:
-        cluster: Lista de estados dos veiculos no cluster
-        radius: Raio de comunicacao em metros
-    
+        cluster: Lista de estados dos veiculos no agrupamento.
+        radius: Raio de comunicacao (metros).
+        
     Returns:
         float: ETC minimo do cluster em segundos
     """
+    if len(cluster) < 2:
+        return 0.0
+
     min_etc = float('inf')
+    carros_parados = False
     for v1, v2 in itertools.combinations(cluster, 2):
         etc = estimate_contact_time(v1, v2, radius)
-        min_etc = min(min_etc, etc)
+        if isinstance(etc, str) and etc == "Carros Parados":
+            carros_parados = True
+        else:
+            min_etc = min(min_etc, etc)
+
+    if min_etc == float('inf'):
+        if carros_parados:
+            return "Carros Parados"
+        return 0.0
     return min_etc
 
 
@@ -248,7 +267,7 @@ def find_clusters(
     
     Args:
         vehicles: Lista de estados dos veiculos ativos na simulacao
-        radius: Raio de comunicacao V2X em metros
+        radius: Raio de comunicacao V2V em metros
         min_size: Tamanho minimo do cluster para ser considerado valido
     
     Returns:
@@ -361,7 +380,7 @@ def docker_compose_up(compose_file: str, project_root: Path, build: bool = False
     """Inicia todos os conteineres (veiculos) de uma vez no inicio da simulacao.
     
     Args:
-        compose_file: Caminho para o docker-compose.v2x.yml
+        compose_file: Caminho para o docker-compose.v2v.yml
         project_root: Raiz do projeto (FL_ServerPuma/)
         build: Se True, forca o rebuild das imagens (adiciona --build)
     
@@ -404,11 +423,11 @@ def docker_compose_down(compose_file: str, project_root: Path) -> None:
 # ── Loop Principal ───────────────────────────────────────────────────────────
 
 def run_orchestrator(args: argparse.Namespace) -> None:
-    """Loop principal do orquestrador V2X.
+    """Loop principal do orquestrador V2V.
     
     Fluxo:
       1. Limpa pasta de encontros e pesos anteriores
-      2. Gera docker-compose.v2x.yml e inicia conteineres
+      2. Gera docker-compose.v2v.yml e inicia conteineres
       3. Inicia SUMO e conecta via TraCI
       4. A cada step do SUMO:
          a) Coleta posicao, velocidade e angulo de cada veiculo
@@ -479,7 +498,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         rounds=3,
         prune=args.prune,
         ala=args.ala,
-        exp_name='default_exp_v2x',
+        exp_name='default_exp_v2v',
         max_epochs=args.max_epochs,
         model=args.model,
         config=args.config,
@@ -511,7 +530,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     # Contadores e estado da simulacao
     encounter_count = 0                            # Encontros viaveis gerados
     rejected_count = 0                             # Encontros rejeitados por ETC insuficiente
-    event_log: list[V2XEvent] = []                 # Log de todos os eventos V2X
+    event_log: list[V2VEvent] = []                 # Log de todos os eventos V2V
     prev_cluster_key: frozenset[str] | None = None # Chave do cluster anterior (para detectar mudanca)
     veh_to_client_idx: dict[str, int] = {}         # Mapa veiculo SUMO -> indice do conteiner
     next_client_idx = 0                            # Proximo indice de conteiner disponivel
@@ -584,7 +603,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     etc = cluster_etc(best_cluster, args.radius)
 
                     # ── Filtro de viabilidade baseado no ETC ──────────────
-                    if etc < args.min_contact_time:
+                    if not isinstance(etc, str) and etc < args.min_contact_time:
                         # ETC insuficiente: ignorar este cluster
                         rejected_count += 1
                         log.info(
@@ -595,7 +614,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         )
 
                         # Registrar evento de rejeicao para analise
-                        event_log.append(V2XEvent(
+                        event_log.append(V2VEvent(
                             sim_time=sim_time,
                             event_type="encounter_rejected",
                             vehicles=veh_names,
@@ -613,10 +632,11 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     # ── ETC suficiente: gerar sinal de encontro ───────────
                     encounter_count += 1
 
+                    etc_display = f"{etc}" if isinstance(etc, str) else f"{etc:.1f}s"
                     log.info(
-                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%.1fs",
+                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%s",
                         encounter_count, args.encounters,
-                        veh_names, c_indices, etc,
+                        veh_names, c_indices, etc_display,
                     )
 
                     # Montar dados do encontro com ETC para os clientes usarem
@@ -633,13 +653,13 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     write_encounter_signal(encounters_dir, encounter_data, encounter_count)
 
                     # Registrar evento para log de analise
-                    event_log.append(V2XEvent(
+                    event_log.append(V2VEvent(
                         sim_time=sim_time,
                         event_type="encounter_formed",
                         vehicles=veh_names,
                         details={
                             "clients": c_indices,
-                            "etc_seconds": round(etc, 1),
+                            "etc_seconds": etc if isinstance(etc, str) else round(etc, 1),
                         },
                     ))
 
@@ -689,6 +709,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                                 "Aguardando 5s para retomada...",
                                 len(expected_done_files), exchange_time,
                             )
+                            event_log[-1].details["exchange_time"] = round(exchange_time, 1)
                             # Dar tempo extra para garantia
                             time.sleep(5)
                             break
@@ -702,6 +723,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                             exchange_timeout, encounter_count,
                             received_count, len(expected_done_files),
                         )
+                        event_log[-1].details["exchange_time"] = round(exchange_time, 1)
 
                     log.info("SUMO RETOMADO.")
 
@@ -737,7 +759,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         log.info("=" * 60)
 
         # Salvar log de eventos em formato JSONL para analise posterior
-        log_path = PROJECT_ROOT / "src" / "results" / "v2x_events.jsonl"
+        log_path = PROJECT_ROOT / "src" / "results" / "v2v_events.jsonl"
         with open(log_path, "w") as f:
             for event in event_log:
                 f.write(json.dumps({
@@ -753,7 +775,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="V2X Opportunistic FL Orchestrator",
+        description="V2V Opportunistic FL Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -771,7 +793,7 @@ def main():
     )
     parser.add_argument(
         "--radius", type=float, default=DEFAULT_COMM_RADIUS,
-        help=f"Raio de comunicacao V2X em metros (default: {DEFAULT_COMM_RADIUS})",
+        help=f"Raio de comunicacao V2V em metros (default: {DEFAULT_COMM_RADIUS})",
     )
     parser.add_argument(
         "--min-clients", type=int, default=DEFAULT_MIN_CLIENTS,

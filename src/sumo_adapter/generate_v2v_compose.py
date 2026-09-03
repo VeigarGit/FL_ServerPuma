@@ -1,7 +1,7 @@
 """
-generate_v2x_compose.py
+generate_v2v_compose.py
 ========================
-Gerador de docker-compose.v2x.yml para o modo V2X descentralizado.
+Gerador de docker-compose.v2v.yml para o modo V2V descentralizado.
 
 Gera um arquivo Docker Compose contendo APENAS conteineres de clientes
 (veiculos). NAO inclui servidor — a troca de pesos e feita P2P via
@@ -9,14 +9,14 @@ arquivos .pt no volume compartilhado.
 
 Restricoes de rede (docker-tc) baseadas no padrao DSRC IEEE 802.11p:
   - Banda: 7 Mbit/s (taxa efetiva tipica do 802.11p)
-  - Latencia: 40ms (delay de comunicacao V2X)
+  - Latencia: 40ms (delay de comunicacao V2V)
   - Perda: 3% (perda de pacotes em cenario urbano)
 """
 
 from pathlib import Path
 
 # Nome do arquivo de saida gerado
-COMPOSE_FILE = "docker-compose.v2x.yml"
+COMPOSE_FILE = "docker-compose.v2v.yml"
 
 
 def generate(
@@ -33,7 +33,7 @@ def generate(
     rank: int = 8,
     paca: int = 12,
 ) -> str:
-    """Gera um docker-compose.yml customizado para o modo V2X descentralizado.
+    """Gera um docker-compose.yml customizado para o modo V2V descentralizado.
     
     Args:
         client_indices: Lista de indices dos clientes (ex: [0, 1, 2, 3, 4])
@@ -45,7 +45,7 @@ def generate(
         max_epochs: Limite de epocas (0 = sem limite)
     
     Returns:
-        Caminho absoluto do arquivo docker-compose.v2x.yml gerado
+        Caminho absoluto do arquivo docker-compose.v2v.yml gerado
     """
 
     # ── Template base (ancora YAML para reutilizar em todos os clientes) ──
@@ -91,7 +91,7 @@ x-client-template: &client
     - "com.docker-tc.enabled=1"
     # Taxa efetiva tipica do DSRC 802.11p (canal de servico SCH)
     - "com.docker-tc.limit=100mbit"
-    # Latencia de comunicacao V2X (propagacao + processamento)
+    # Latencia de comunicacao V2V (propagacao + processamento)
     - "com.docker-tc.delay=5ms"
     # Perda de pacotes em cenario urbano (interferencia + multipath)
     - "com.docker-tc.loss=3%"
@@ -105,9 +105,9 @@ services:
     for i, client_idx in enumerate(client_indices):
         epochs_line = f"\n      --max-epochs {max_epochs}" if max_epochs > 0 else ""
         template += f"""\
-  client-v2x-{i}:
+  client-v2v-{i}:
     <<: *client
-    container_name: fl-client-v2x-{i}
+    container_name: fl-client-v2v-{i}
     command: >-
       python client.py
       --mode decentralized

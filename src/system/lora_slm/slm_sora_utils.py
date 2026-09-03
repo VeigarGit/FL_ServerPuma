@@ -15,7 +15,7 @@ def reduce_sora_state_dict_rank(state_dict, threshold=1e-4, min_rank=2):
     ranks_info = []
     
     for gate_key in gate_keys:
-        base_key = gate_key.replace(".gate", "")
+        base_key = gate_key.rsplit(".gate", 1)[0]
         A_key = f"{base_key}.lora_A"
         B_key = f"{base_key}.lora_B"
         
@@ -33,6 +33,7 @@ def reduce_sora_state_dict_rank(state_dict, threshold=1e-4, min_rank=2):
         effective_min = min(min_rank, r_original)
         if len(keep_idx) < effective_min:
             keep_idx = torch.topk(gate_tensor.abs(), k=effective_min).indices
+            keep_idx, _ = torch.sort(keep_idx)  # Preserva ordem ordinal para alinhamento na agregação
             
         r_new = len(keep_idx)
         

@@ -100,6 +100,7 @@ def prune_sora_to_lora_and_report(model, min_rank=2):
         effective_min = min(min_rank, r_original)
         if r_new < effective_min:
             keep_idx = torch.topk(gate.abs(), k=effective_min).indices
+            keep_idx, _ = torch.sort(keep_idx)  # Preserva ordem ordinal
             r_new = len(keep_idx)
             print(f"    {name:<50} → Rank forçado para {r_new} (min_rank={min_rank})")
 
@@ -165,6 +166,7 @@ def prune_sora_iterative(model, min_rank=2):
         effective_min = min(min_rank, r_original)
         if r_new < effective_min:
             keep_idx = torch.topk(gate.abs(), k=effective_min).indices
+            keep_idx, _ = torch.sort(keep_idx)  # Preserva ordem ordinal
             r_new = len(keep_idx)
             print(f"    {name:<50} → Rank forçado para {r_new} (min_rank={min_rank})")
 

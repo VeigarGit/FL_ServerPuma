@@ -18,6 +18,7 @@
 import numpy as np
 import os
 import sys
+import argparse
 import random
 import torch
 import torchvision
@@ -28,7 +29,6 @@ from pathlib import Path
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 10
 dir_path = Path(__file__).parent / "MNIST"
 
 
@@ -94,8 +94,15 @@ def generate_dataset(dir_path: Path, num_clients, niid, balance, partition):
 
 
 if __name__ == "__main__":
-    niid = True if sys.argv[1] == "noniid" else False
-    balance = True if sys.argv[2] == "balance" else False
-    partition = sys.argv[3] if sys.argv[3] != "-" else None
+    parser = argparse.ArgumentParser()
+    parser.add_argument("niid", type=str)
+    parser.add_argument("balance", type=str)
+    parser.add_argument("partition", type=str)
+    parser.add_argument("--num-clients", type=int, default=10, help="Number of clients to partition the data for")
+    args = parser.parse_args()
 
-    generate_dataset(dir_path, num_clients, niid, balance, partition)
+    niid = True if args.niid == "noniid" else False
+    balance = True if args.balance == "balance" else False
+    partition = args.partition if args.partition != "-" else None
+
+    generate_dataset(dir_path, args.num_clients, niid, balance, partition)

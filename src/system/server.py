@@ -10,6 +10,12 @@ import os
 import logging
 from pathlib import Path
 
+# Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -53,15 +59,36 @@ from prunning_nisp import prune_fc1
 from prunning_snip import snip_pruning, apply_mask
 from utils.network_utils import send_data, recv_data
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
+from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
 
 # --- CONFIGURAÇÃO DE OBSERVABILIDADE (LOGGING) ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 # -------------------------------------------------
+
+def get_state_dict_size_mb(state):
+    """Calcula matematicamente o tamanho em MB sem serializar em pickle, evitando travar o GIL e a CPU."""
+    total_bytes = 0
+    if hasattr(state, 'state_dict'):
+        state = state.state_dict()
+        
+    if isinstance(state, dict) and state.get('__lhdq__'):
+        for k, v in state['keys'].items():
+            if 'raw' in v:
+                total_bytes += v['raw'].numel() * v['raw'].element_size()
+            else:
+                total_bytes += len(v['packed']) + 4  # 4 bytes for mu/sigma (float16)
+    elif isinstance(state, dict):
+        for v in state.values():
+            if isinstance(v, torch.Tensor):
+                total_bytes += v.numel() * v.element_size()
+            elif isinstance(v, (int, float)):
+                total_bytes += 8
+    return total_bytes / (1024 * 1024)
 
 class FederatedLearningServer:
     def __init__(self, args):
@@ -183,10 +210,21 @@ class FederatedLearningServer:
         self.bit = []
         self.complexity_calculated = False
         
-        calculator = LayerComplexityCalculator(self.global_model, self.input_size)
+        # Performance tracking variables
+        self.time_threshold = 0.0
+        self.mean_training_time = 0.0
         
-        # Calcular complexidade
-        alpha_list, beta_list = calculator.calculate_alpha_beta()
+        # LHDQ: cache do estado anterior por cliente (para delta coding)
+        self.previous_sent_state = {}   # client_id → state_dict enviado na rodada anterior
+        self.previous_recv_state = {}   # client_id → state_dict recebido na rodada anterior
+        
+        if self.args.model == 'slm':
+            alpha_list, beta_list = [0], [0]
+            logger.info("Cálculo de complexidade ignorado para SLM (forward multimodal complexo).")
+        else:
+            calculator = LayerComplexityCalculator(self.global_model, self.input_size)
+            alpha_list, beta_list = calculator.calculate_alpha_beta()
+            
         self.alpha_list = alpha_list
         self.beta_list = beta_list
         self.complexity_calculated = True
@@ -198,6 +236,10 @@ class FederatedLearningServer:
         # Detectar total de encoder layers dinamicamente (para PaCA)
         if hasattr(self.global_model, 'vision_model') and hasattr(self.global_model.vision_model, 'encoder'):
             self.total_encoder_layers = len(self.global_model.vision_model.encoder.layers)
+        elif self.args.model == 'slm':
+            from lora_slm.slm_setup import _get_encoder_layers
+            layers = _get_encoder_layers(self.global_model)
+            self.total_encoder_layers = len(layers) if layers else self.args.paca
         else:
             self.total_encoder_layers = self.args.paca  # fallback
         logger.info(f"Total encoder layers detectado: {self.total_encoder_layers}")
@@ -220,7 +262,7 @@ class FederatedLearningServer:
         
         for key in global_model.keys():
             weighted_sum = None
-            total_weight_for_key = 0.0
+            weight_mask = None
             global_val = global_model[key]
             
             for idx, model_state in enumerate(model_list):
@@ -228,7 +270,6 @@ class FederatedLearningServer:
                     local_val = model_state[key]
                     
                     if self._are_compatible_with_pruning(local_val, global_val, key):
-                        # GARANTINDO ALTA VELOCIDADE: Operações estritas na GPU/CPU via PyTorch (Fim do Numpy)
                         if not isinstance(global_val, torch.Tensor):
                             global_val = torch.tensor(global_val, device=self.args.device)
                         
@@ -241,16 +282,20 @@ class FederatedLearningServer:
                             local_val, global_val, key, model_state, idx
                         )
                         
+                        mask = self._get_mask(local_val, global_val)
                         weight = normalized_weights[idx]
                         
                         if weighted_sum is None:
-                            weighted_sum = torch.zeros_like(aligned_val)
+                            weighted_sum = torch.zeros_like(global_val)
+                            weight_mask = torch.zeros_like(global_val)
                         
                         weighted_sum += aligned_val * weight
-                        total_weight_for_key += weight
+                        weight_mask += mask * weight
             
-            if weighted_sum is not None and total_weight_for_key > 0:
-                agg_state[key] = weighted_sum / total_weight_for_key
+            if weighted_sum is not None:
+                valid_mask = weight_mask > 0
+                agg_state[key] = global_val.clone()
+                agg_state[key][valid_mask] = weighted_sum[valid_mask] / weight_mask[valid_mask]
         
         return agg_state
     
@@ -303,6 +348,21 @@ class FederatedLearningServer:
             slices = tuple(slice(0, min(l, g)) for l, g in zip(local_val.shape, global_val.shape))
             aligned[slices] = local_val[slices]
         return aligned
+
+    def _get_mask(self, local_val, global_val):
+        mask = torch.zeros_like(global_val)
+        if local_val.ndim == 2:
+            min_out = min(local_val.shape[0], global_val.shape[0])
+            min_in = min(local_val.shape[1], global_val.shape[1])
+            mask[:min_out, :min_in] = 1.0
+        elif local_val.ndim == 1:
+            min_len = min(local_val.shape[0], global_val.shape[0])
+            mask[:min_len] = 1.0
+        elif local_val.ndim == 4:
+            min_out = min(local_val.shape[0], global_val.shape[0])
+            min_in = min(local_val.shape[1], global_val.shape[1])
+            mask[:min_out, :min_in, :, :] = 1.0
+        return mask
     
     def _align_conv_weights(self, local_val, global_val):
         if local_val.ndim != 4 or global_val.ndim != 4:
@@ -328,7 +388,7 @@ class FederatedLearningServer:
         local_out, local_in = local_val.shape
         global_out, global_in = global_val.shape
         
-        aligned = global_val.clone()
+        aligned = torch.zeros_like(global_val)
         min_out = min(local_out, global_out)
         min_in = min(local_in, global_in)
         aligned[:min_out, :min_in] = local_val[:min_out, :min_in]
@@ -338,11 +398,8 @@ class FederatedLearningServer:
         if local_val.ndim != 1 or global_val.ndim != 1:
             return local_val
         
-        local_len = local_val.shape[0]
-        global_len = global_val.shape[0]
-        
-        aligned = global_val.clone()
-        min_len = min(local_len, global_len)
+        aligned = torch.zeros_like(global_val)
+        min_len = min(local_val.shape[0], global_val.shape[0])
         aligned[:min_len] = local_val[:min_len]
         return aligned
     
@@ -359,18 +416,51 @@ class FederatedLearningServer:
     def set_threshold(self):
         tot_time = 0
         clients_with_time = 0
+        max_client_time = 0.0
         for info in self.clients_info.values():
-            if info.get('training_time') is not None:
-                tot_time += info['training_time']
+            t_train = info.get('training_time', 0.0) or 0.0
+            t_eval = info.get('client_eval_time', 0.0) or 0.0
+            t_proc = info.get('server_processing_time', 0.0) or 0.0
+            t_comm = info.get('comm_time', 0.0) or 0.0
+            total_client_time = t_train + t_eval + t_proc + t_comm
+            
+            if total_client_time > 0:
+                tot_time += total_client_time
                 clients_with_time += 1
+                if total_client_time > max_client_time:
+                    max_client_time = total_client_time
         
         if clients_with_time == 0:
             logger.warning("No clients reported training time. Sticking to default threshold.")
             return
 
         mean_time = tot_time / clients_with_time
-        self.time_threshold = 0.9 * mean_time
-        logger.debug(f'time_threshold: {self.time_threshold}s')
+        self.mean_training_time = mean_time
+        
+        # Meta de latência adaptativa do cluster: média dos clientes + 15% de tolerância
+        # Utilizada pelo PaCA e Rank adaptativos para identificar stragglers relativos
+        self.target_latency = mean_time * 1.15
+        
+        # Pisos de segurança por tipo de modelo para evitar colapso de timeout em rodadas pontualmente rápidas
+        if self.args.model == 'slm':
+            min_floor = 1200.0
+            multiplier = 2.5
+        elif self.args.model == 'clip':
+            min_floor = 300.0
+            multiplier = 2.0
+        else:
+            min_floor = 60.0
+            multiplier = 1.5
+            
+        calculated_threshold = max(min_floor, multiplier * mean_time, 1.5 * max_client_time)
+        
+        # Amortecimento: impede quedas bruscas de timeout entre rodadas
+        if hasattr(self, 'time_threshold') and self.time_threshold is not None:
+            self.time_threshold = max(calculated_threshold, self.time_threshold * 0.8, min_floor)
+        else:
+            self.time_threshold = calculated_threshold
+            
+        logger.info(f"Limiares definidos: timeout_socket={self.time_threshold:.2f}s | target_latency={self.target_latency:.2f}s (mean_time={mean_time:.2f}s)")
     
     def new_set_amount_prune(self, client_id):
         # Filosofia EAFP: Tenta acessar direto e falha limpo
@@ -393,10 +483,11 @@ class FederatedLearningServer:
         client_info.setdefault('last_flops', total_beta)
         client_info.setdefault('last_params', total_alpha)
         
-        target_latency = getattr(self, 'time_threshold', 60.0)
+        target_latency = getattr(self, 'target_latency', getattr(self, 'time_threshold', 60.0))
         
         time_per_flop = (training_time / (dataset_size * total_beta)) if (training_time > 0 and total_beta > 0) else 1e-6
         bytes_per_param = 1
+        bandwidth = bandwidth or 10.0  # Fallback se None
         bandwidth_bytes = bandwidth * 1024 * 1024
         
         computational_component = dataset_size * total_beta * time_per_flop
@@ -425,13 +516,13 @@ class FederatedLearningServer:
         """
         Calcula o PaCA ideal para um cliente baseado em dois critérios:
         
-        1. LATÊNCIA: Se o cliente é gargalo (training_time > threshold), reduz PaCA.
+        1. LATÊNCIA RELATIVA: Se o cliente é gargalo (training_time > target_latency), reduz PaCA.
         2. ACURÁCIA: Se a acurácia estabilizou (plateau), reduz PaCA porque as camadas
            extras não estão contribuindo — menos camadas = menos comunicação de graça.
         
         Proteções:
         - Se a acurácia caiu após redução de PaCA, reverte (sobe de volta).
-        - Mínimo 50% das camadas (nunca abaixo de 4).
+        - Mínimo configurável (padrão: 2).
         - Máximo ±2 camadas de mudança por round.
         """
         try:
@@ -440,24 +531,30 @@ class FederatedLearningServer:
             return self.args.paca
 
         bandwidth = client_info.get('bandwidth')
-        training_time = client_info.get('training_time')
+        t_train = client_info.get('training_time', 0.0) or 0.0
+        t_eval = client_info.get('client_eval_time', 0.0) or 0.0
+        t_proc = client_info.get('server_processing_time', 0.0) or 0.0
+        t_comm = client_info.get('comm_time', 0.0) or 0.0
+        total_time = t_train + t_eval + t_proc + t_comm
+        
         current_paca = client_info.get('current_paca', self.args.paca)
         max_paca = self.args.paca  # O máximo possível (definido na CLI)
         paca_min = getattr(self.args, 'adaptive_paca_min', 2)  # Mínimo configurável (padrão: 2)
 
         # Sem dados suficientes, mantém o atual
-        if bandwidth is None or training_time is None:
+        if bandwidth is None or t_train == 0.0:
             return current_paca
 
-        target_latency = getattr(self, 'time_threshold', 60.0)
+        target_latency = getattr(self, 'target_latency', getattr(self, 'time_threshold', 60.0))
+        mean_time = getattr(self, 'mean_training_time', target_latency / 1.15)
         
         # --- COOLDOWN UNIFICADO: nenhuma redução dentro de 5 rounds ---
         # Alinhado com a janela de acurácia (window=5) para garantir que o
         # impacto de uma redução seja observável antes de reduzir novamente.
-        last_reduction_round = client_info.get('last_paca_any_reduction_round', 0)
+        last_reduction_round = client_info.get('last_paca_any_reduction_round', None)
         current_round = len(self.rs_test_acc)
         cooldown_rounds = 5
-        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
+        in_cooldown = (last_reduction_round is not None and (current_round - last_reduction_round) < cooldown_rounds)
         
         # --- CRITÉRIO 2: ACURÁCIA (verificado primeiro, é global) ---
         # Reversão por queda de acurácia SEMPRE permitida (mesmo em cooldown).
@@ -470,24 +567,31 @@ class FederatedLearningServer:
                 client_info['last_paca_any_reduction_round'] = current_round
             return accuracy_signal
 
-        # --- CRITÉRIO 1: LATÊNCIA (per-client) ---
-        # Subir PaCA é sempre permitido (mesmo em cooldown).
-        if training_time <= target_latency:
-            if training_time < target_latency * 0.7 and current_paca < max_paca:
+        # --- CRITÉRIO 1: LATÊNCIA (per-client em relação à média do cluster) ---
+        # Increase PaCA if client is significantly faster than the cluster average (>20% faster)
+        if total_time < mean_time * 0.80 and current_paca < max_paca:
+            if getattr(self.args, 'allow_paca_upscale', False):
                 new_paca = min(current_paca + 1, max_paca)
-                logger.debug(f"PaCA adaptativo {client_id}: subindo {current_paca} -> {new_paca} "
-                             f"(tempo={training_time:.1f}s << threshold={target_latency:.1f}s)")
+                logger.info(f"PaCA adaptativo {client_id}: subindo {current_paca} -> {new_paca} "
+                            f"(tempo_total={total_time:.1f}s < 80% da média={mean_time:.1f}s)")
                 return new_paca
+            else:
+                logger.info(f"PaCA adaptativo {client_id}: subida bloqueada por padrão (use --allow-paca-upscale para permitir) (tempo_total={total_time:.1f}s < 80%)")
+
+        # Se estiver dentro da tolerância do cluster, mantém
+        if total_time <= target_latency:
             return current_paca
 
         # Em cooldown: não reduzir por latência
         if in_cooldown:
             return current_paca
 
-        # Cliente está lento: calcular quantas camadas cabem no budget
-        time_per_paca_layer = training_time / max(current_paca, 1)
-        ideal_paca = int(target_latency / time_per_paca_layer) if time_per_paca_layer > 0 else current_paca
-
+        # Cliente está lento (straggler relativo): calcular quantas camadas cabem no budget
+        # Budget real para treinamento é o target_latency subtraindo os tempos fixos
+        fixed_overhead = t_eval + t_proc + t_comm
+        available_train_time = max(0.1, target_latency - fixed_overhead)
+        time_per_paca_layer = t_train / max(current_paca, 1)
+        ideal_paca = int(available_train_time / time_per_paca_layer) if time_per_paca_layer > 0 else current_paca
         ideal_paca = max(paca_min, min(max_paca, ideal_paca))
 
         # Suavização: não reduzir mais que 1 camada por round (evita cascata destrutiva)
@@ -496,7 +600,7 @@ class FederatedLearningServer:
             client_info['last_paca_any_reduction_round'] = current_round
 
         logger.info(f"PaCA adaptativo {client_id}: {current_paca} -> {ideal_paca} "
-                    f"(bw={bandwidth:.2f} MB/s, time={training_time:.1f}s, target={target_latency:.1f}s)")
+                    f"(tempo_total={total_time:.1f}s > target={target_latency:.1f}s, média={mean_time:.1f}s)")
         return ideal_paca
 
     def calculate_adaptive_rank(self, client_id):
@@ -506,22 +610,28 @@ class FederatedLearningServer:
             return self.args.rank
             
         bandwidth = client_info.get('bandwidth')
-        training_time = client_info.get('training_time')
+        t_train = client_info.get('training_time', 0.0) or 0.0
+        t_eval = client_info.get('client_eval_time', 0.0) or 0.0
+        t_proc = client_info.get('server_processing_time', 0.0) or 0.0
+        t_comm = client_info.get('comm_time', 0.0) or 0.0
+        total_time = t_train + t_eval + t_proc + t_comm
+        
         current_rank = client_info.get('current_rank', self.args.rank)
         max_rank = getattr(self.args, 'adaptive_rank_max', 8)
         min_rank = getattr(self.args, 'adaptive_rank_min', 2)
 
         # Sem dados suficientes, mantém o atual
-        if bandwidth is None or training_time is None:
+        if bandwidth is None or t_train == 0.0:
             return current_rank
 
-        target_latency = getattr(self, 'time_threshold', 60.0)
+        target_latency = getattr(self, 'target_latency', getattr(self, 'time_threshold', 60.0))
+        mean_time = getattr(self, 'mean_training_time', target_latency / 1.15)
         
         # --- 1. Sinal da Acurácia Global ---
-        last_reduction_round = client_info.get('last_rank_reduction_round', 0)
+        last_reduction_round = client_info.get('last_rank_reduction_round', None)
         current_round = len(self.rs_test_acc)
         cooldown_rounds = 5
-        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
+        in_cooldown = (last_reduction_round is not None and (current_round - last_reduction_round) < cooldown_rounds)
 
         acc_signal = self._check_accuracy_signal_rank(client_id, current_rank, min_rank, max_rank, in_cooldown)
         
@@ -538,8 +648,11 @@ class FederatedLearningServer:
         
         if is_difficult_client:
             if current_rank < max_rank:
-                logger.info(f"Rank adaptativo {client_id}: cliente difícil (loss={client_loss:.4f} > global={global_loss:.4f}*1.2). Forçando subida {current_rank} -> {current_rank + 1}")
-                return current_rank + 1
+                if getattr(self.args, 'allow_rank_upscale', False):
+                    logger.info(f"Rank adaptativo {client_id}: cliente difícil (loss={client_loss:.4f} > global={global_loss:.4f}*1.2). Forçando subida {current_rank} -> {current_rank + 1}")
+                    return current_rank + 1
+                else:
+                    logger.info(f"Rank adaptativo {client_id}: cliente difícil, mas subida bloqueada por padrão (use --allow-rank-upscale)")
             return current_rank
 
         # --- 3. Acurácia Estável (Platô) ---
@@ -547,21 +660,26 @@ class FederatedLearningServer:
             client_info['last_rank_reduction_round'] = current_round
             return acc_signal
 
-        # --- 4. Sinal de Latência (Padrão) ---
-        # Cliente está rápido: pode subir o rank (se não estiver no máximo)
-        if training_time <= target_latency:
-            if training_time < target_latency * 0.7 and current_rank < max_rank:
+        # --- 4. Sinal de Latência Relativa ---
+        # Cliente está rápido (>20% mais rápido que a média do cluster): pode subir o rank
+        if total_time < mean_time * 0.80 and current_rank < max_rank:
+            if getattr(self.args, 'allow_rank_upscale', False):
                 new_rank = min(current_rank + 1, max_rank)
-                logger.debug(f"Rank adaptativo {client_id}: subindo {current_rank} -> {new_rank} "
-                             f"(tempo={training_time:.1f}s << threshold={target_latency:.1f}s)")
+                logger.info(f"Rank adaptativo {client_id}: subindo {current_rank} -> {new_rank} "
+                            f"(tempo_total={total_time:.1f}s < 80% da média={mean_time:.1f}s)")
                 return new_rank
+            else:
+                logger.info(f"Rank adaptativo {client_id}: subida bloqueada por padrão (use --allow-rank-upscale para permitir) (tempo_total={total_time:.1f}s < 80%)")
+
+        # Se estiver dentro da tolerância normal, mantém
+        if total_time <= target_latency:
             return current_rank
 
-        # Cliente está lento: reduz o rank em 1
+        # Cliente está lento (> target_latency): reduz o rank em 1
         if current_rank > min_rank:
             new_rank = current_rank - 1
             logger.info(f"Rank adaptativo {client_id}: reduzindo {current_rank} -> {new_rank} "
-                        f"(tempo={training_time:.1f}s > threshold={target_latency:.1f}s)")
+                        f"(tempo_total={total_time:.1f}s > target={target_latency:.1f}s, média={mean_time:.1f}s)")
             client_info['last_rank_reduction_round'] = current_round
             return new_rank
 
@@ -570,7 +688,7 @@ class FederatedLearningServer:
     def _check_accuracy_signal_rank(self, client_id, current_rank, rank_min, max_rank, in_cooldown=False):
         """
         Verifica se a acurácia indica que o Rank pode ser ajustado.
-        - Reversão (Pânico): SEMPRE ativa. Se a acurácia caiu >2pp após redução, reverte +2.
+        - Fallback mechanism: Revert PaCA layer count if accuracy drops by more than 2% after a reduction.
         - Plateau: APENAS fora do cooldown. Se estabilizou, reduz -1.
         """
         acc_history = self.rs_test_acc
@@ -601,7 +719,8 @@ class FederatedLearningServer:
         best_acc = max(acc_history) if acc_history else 0.0
         min_acc_for_plateau = best_acc * 0.90
         
-        if (std_acc < 0.5 
+        is_plateau = (std_acc < 2.0 or (mean_acc > 0 and (std_acc / mean_acc) < 0.03))
+        if (is_plateau 
                 and current_rank > rank_min 
                 and mean_acc >= min_acc_for_plateau):
             new_rank = current_rank - 1
@@ -635,8 +754,8 @@ class FederatedLearningServer:
         mean_acc = sum(recent) / len(recent)
         std_acc = (sum((x - mean_acc) ** 2 for x in recent) / len(recent)) ** 0.5
         
-        # --- SEGURANÇA: acurácia caiu após redução? Reverte com +2. ---
-        # (SEMPRE ativo, mesmo em cooldown — é uma rede de segurança)
+        # --- Safety check: Revert PaCA reduction if accuracy drops significantly ---
+        # (Always active, even during cooldown periods)
         paca_before_last_change = self.clients_info[client_id].get('paca_before_change')
         if paca_before_last_change is not None and paca_before_last_change > current_paca:
             # PaCA foi reduzido. Verificar se a acurácia caiu.
@@ -657,7 +776,8 @@ class FederatedLearningServer:
             
         best_acc = max(acc_history) if acc_history else 0.0
         min_acc_for_plateau = best_acc * 0.90  # 90% da melhor acurácia observada
-        if (std_acc < 0.5 
+        is_plateau = (std_acc < 2.0 or (mean_acc > 0 and (std_acc / mean_acc) < 0.03))
+        if (is_plateau 
                 and current_paca > paca_min 
                 and mean_acc >= min_acc_for_plateau):
             new_paca = current_paca - 1
@@ -671,10 +791,15 @@ class FederatedLearningServer:
 
     def _is_excluded_by_paca(self, key, min_layer_idx):
         """Retorna True se a chave pertence a uma camada ABAIXO do PaCA mínimo."""
-        if "encoder.layers." not in key:
+        if "encoder.layers." not in key and ".layers." not in key:
             return False  # Head de classificação etc. sempre incluída
         try:
-            layer_idx = int(key.split("encoder.layers.")[1].split(".")[0])
+            if "encoder.layers." in key:
+                layer_idx = int(key.split("encoder.layers.")[1].split(".")[0])
+            elif ".layers." in key:
+                layer_idx = int(key.split(".layers.")[1].split(".")[0])
+            else:
+                return False
             return layer_idx < min_layer_idx
         except (ValueError, IndexError):
             return False
@@ -688,8 +813,23 @@ class FederatedLearningServer:
         bandwidth = client_info.get('bandwidth', 1.0)
         training_time = client_info.get('training_time', 60.0)
         
-        bw_factor = 0.8 if bandwidth < 0.5 else 0.6 if bandwidth < 5.0 else 0.4 if bandwidth < 20.0 else 0.2
-        time_factor = 0.2 if training_time < 30 else 0.4 if training_time < 60 else 0.6 if training_time < 120 else 0.8
+        if bandwidth < 0.5:
+            bw_factor = 0.8
+        elif bandwidth < 5.0:
+            bw_factor = 0.6
+        elif bandwidth < 20.0:
+            bw_factor = 0.4
+        else:
+            bw_factor = 0.2
+            
+        if training_time < 30:
+            time_factor = 0.2
+        elif training_time < 60:
+            time_factor = 0.4
+        elif training_time < 120:
+            time_factor = 0.6
+        else:
+            time_factor = 0.8
         
         pruning_rate = (bw_factor + time_factor) / 2
         return max(0.2, min(0.85, pruning_rate))
@@ -704,7 +844,12 @@ class FederatedLearningServer:
         last_training_time = client_info.get('last_training_time', training_time)
         client_info['last_training_time'] = training_time
         
-        adjustment = 0.05 if training_time > last_training_time * 1.5 else (0.03 if training_time > getattr(self, 'time_threshold', 0) * 1.2 else 0.0)
+        if training_time > last_training_time * 1.5:
+            adjustment = 0.05
+        elif training_time > self.time_threshold * 1.2:
+            adjustment = 0.03
+        else:
+            adjustment = 0.0
         return max(0.2, min(0.85, base_pruning_rate + adjustment))
     
     def handle_client(self, conn, client_updates, client_weights, round_num, client_id, client_accuracies, client_losses):
@@ -726,8 +871,8 @@ class FederatedLearningServer:
                 else:
                     current_global_state = self.global_state.copy()
             
-            # --- PaCA DINÂMICO (só para CLIP, a partir do round 2, se ativado) ---
-            if self.args.model == 'clip' and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            # --- PaCA DINÂMICO (para CLIP e SLM, a partir do round 2, se ativado) ---
+            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
                 ideal_paca = self.calculate_adaptive_paca(client_id)
                 self.clients_info[client_id]['current_paca'] = ideal_paca
                 
@@ -744,8 +889,8 @@ class FederatedLearningServer:
                         logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
                                     f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
 
-            # --- RANK ADAPTATIVO (só para CLIP, a partir do round 2, se ativado) ---
-            if self.args.model == 'clip' and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
+            # --- RANK ADAPTATIVO (para CLIP e SLM, a partir do round 2, se ativado) ---
+            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
                 ideal_rank = self.calculate_adaptive_rank(client_id)
                 self.clients_info[client_id]['current_rank'] = ideal_rank
                 
@@ -760,14 +905,14 @@ class FederatedLearningServer:
 
             
             # --- Problema #4: Envia PaCA dinâmico para que o cliente treine apenas as camadas necessárias ---
-            if self.args.model == 'clip':
+            if self.args.model in ['clip', 'slm']:
                 client_paca = self.clients_info[client_id].get('current_paca', self.args.paca) if getattr(self.args, 'adaptive_paca', False) else self.args.paca
                 send_data(conn, client_paca)
 
                 client_rank = self.clients_info[client_id].get('current_rank', self.args.rank) if getattr(self.args, 'adaptive_rank', False) else self.args.rank
                 send_data(conn, client_rank)
 
-            if round_num >= 2 and self.prune == 1 and self.args.model != 'clip':
+            if round_num >= 2 and self.prune == 1 and self.args.model == 'cnn':
                 logger.info("--- SERVER: PRUNING START (Round 2) ---")
                 cnn_prune_start = time.time()
                 if self.clients_info[client_id]['original_model_size'] is None:
@@ -776,7 +921,7 @@ class FederatedLearningServer:
                 else:
                     max_amount = self.clients_info[client_id]['pruning_rate']
                 
-                self.clients_info[client_id]['original_model_size'] = sys.getsizeof(pickle.dumps(self.global_model)) / (1024 * 1024)
+                self.clients_info[client_id]['original_model_size'] = get_state_dict_size_mb(self.global_model)
                 logger.info(f"--- SERVER: Calculated pruning rate: {max_amount:.4f}")
                 
                 g_model_pruned = copy.deepcopy(self.global_model)
@@ -804,10 +949,26 @@ class FederatedLearningServer:
             # --- Medição granular: quantização do servidor ---
             server_quant_start = time.time()
             comm_start = time.time()
-            if round_num >= 2 and self.prune == 1 and self.args.model != 'clip':
-                size_before = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
-                g_model_pruned = quantization(g_model_pruned)
-                size_after = sys.getsizeof(pickle.dumps(g_model_pruned)) / (1024 * 1024)
+            
+            # Decide se usa LHDQ ou int8
+            use_lhdq = (getattr(self.args, 'delta_coding', False) 
+                        and round_num >= 2 
+                        and client_id in self.previous_sent_state)
+            
+            if round_num >= 2 and self.prune == 1 and self.args.model == 'cnn':
+                size_before = get_state_dict_size_mb(g_model_pruned)
+                if use_lhdq:
+                    prev_state = self.previous_sent_state.get(client_id, {})
+                    g_model_pruned = lhdq_encode(g_model_pruned, prev_state)
+                    # Re-decode to ensure identical reference state with the client.
+                    # This guarantees both sides use the same base reference for future deltas.
+                    self.previous_sent_state[client_id] = lhdq_decode(g_model_pruned, prev_state)
+                else:
+                    if getattr(self.args, 'delta_coding', False):
+                        self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in g_model_pruned.items()}
+                    if not getattr(self.args, 'delta_coding', False):
+                        g_model_pruned = quantization(g_model_pruned)
+                size_after = get_state_dict_size_mb(g_model_pruned)
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
@@ -817,9 +978,19 @@ class FederatedLearningServer:
                 send_data(conn, self.prune)
                 send_data(conn, max_amount)
             else:
-                size_before = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
-                current_global_state = quantization(current_global_state)
-                size_after = sys.getsizeof(pickle.dumps(current_global_state)) / (1024 * 1024)
+                size_before = get_state_dict_size_mb(current_global_state)
+                if use_lhdq:
+                    prev_state = self.previous_sent_state.get(client_id, {})
+                    current_global_state = lhdq_encode(current_global_state, prev_state)
+                    # Re-decode to ensure identical reference state with the client.
+                    # This guarantees both sides use the same base reference for future deltas.
+                    self.previous_sent_state[client_id] = lhdq_decode(current_global_state, prev_state)
+                else:
+                    if getattr(self.args, 'delta_coding', False):
+                        self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in current_global_state.items()}
+                    if not getattr(self.args, 'delta_coding', False):
+                        current_global_state = quantization(current_global_state)
+                size_after = get_state_dict_size_mb(current_global_state)
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
@@ -829,13 +1000,13 @@ class FederatedLearningServer:
                 send_data(conn, self.prune)
 
             size_saved = size_before - size_after
-            logger.info(f"Tamanho antes: {size_before:.2f} MB | Tamanho depois: {size_after:.2f} MB | Economia: {size_saved:.2f} MB")
+            logger.debug(f"Tamanho antes: {size_before:.2f} MB | Tamanho depois: {size_after:.2f} MB | Economia: {size_saved:.2f} MB")
             logger.info(f"Round {round_num}: Sent global model to client {client_id}")
             
             updated_state, rate = recv_data(conn)
             bit_rate.append(rate)
             if updated_state is not None:
-                recv_size_mb = sys.getsizeof(pickle.dumps(updated_state)) / (1024 * 1024)
+                recv_size_mb = get_state_dict_size_mb(updated_state)
                 with self.lock:
                     self.received_ammount.append(self.received_ammount[-1] + recv_size_mb)
             
@@ -846,8 +1017,17 @@ class FederatedLearningServer:
             
             # --- Medição granular: dequantização do servidor ---
             server_dequant_start = time.time()
-            updated_state = dequantization(updated_state)
+            if is_lhdq_encoded(updated_state):
+                prev_recv = self.previous_recv_state.get(client_id, {})
+                updated_state = lhdq_decode(updated_state, prev_recv)
+            else:
+                if not getattr(self.args, 'delta_coding', False):
+                    updated_state = dequantization(updated_state)
             server_dequant_time = time.time() - server_dequant_start
+            
+            # LHDQ: cachear o update recebido para a próxima rodada
+            if getattr(self.args, 'delta_coding', False) and updated_state is not None:
+                self.previous_recv_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
             
             data, rate = recv_data(conn)
             self.client_data[client_id] = data
@@ -881,7 +1061,7 @@ class FederatedLearningServer:
             self.clients_info[client_id]['data'] = self.client_data[client_id]
             
             # --- PaCA DINÂMICO: Remove chaves devolvidas que o cliente NÃO treinou ---
-            if self.args.model == 'clip' and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
                 ideal_paca = self.clients_info[client_id].get('current_paca', self.args.paca)
                 min_layer = self.total_encoder_layers - ideal_paca
                 if min_layer > 0 and updated_state is not None:
@@ -966,9 +1146,10 @@ class FederatedLearningServer:
         a = "prune" if self.args.prune == 1 else "withou_Prune"
         b = "FedALA" if getattr(self, 'argalgo', 0) == 0 else "FedAVG"
         
-        paca_val = self.args.paca if (self.args.paca is not None and self.args.paca > 0) else 0
+        paca_val = self.args.paca if (isinstance(self.args.paca, (int, float)) and not isinstance(self.args.paca, bool) and self.args.paca > 0) else 0
+        rank_val = self.args.rank if (isinstance(self.args.rank, (int, float)) and not isinstance(self.args.rank, bool) and self.args.rank > 0) else 8
         ts_suffix = f"_{self.args.timestamp}" if hasattr(self.args, 'timestamp') and self.args.timestamp else ""
-        algo = f"{self.args.dataset}_{self.args.strategy}_rank{self.args.rank}_paca{paca_val}_{a}_freq{self.args.prune_freq}_{b}_run{self.args.run_id}{ts_suffix}"
+        algo = f"{self.args.dataset}_{self.args.strategy}_rank{rank_val}_paca{paca_val}_{a}_freq{self.args.prune_freq}_{b}_run{self.args.run_id}{ts_suffix}"
         
         current_dir = Path(__file__).resolve().parent
         result_path = current_dir.parent / "results" / self.args.exp_name
@@ -1003,7 +1184,12 @@ class FederatedLearningServer:
         logger.info(f"Total rounds: {self.args.rounds}")
         logger.info("=======================================")
         
-        self.time_threshold = 100
+        if self.args.model == 'slm':
+            self.time_threshold = 1800.0
+        elif self.args.model == 'clip':
+            self.time_threshold = 600.0
+        else:
+            self.time_threshold = 120.0
         
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1065,12 +1251,11 @@ class FederatedLearningServer:
                     threads.append(t)
                 
                 init_time = time.time()
-                if round_num == 1:
-                    for t in threads: t.join()
-                else:
-                    for t in threads: t.join(timeout=self.time_threshold)
+                for t in threads:
+                    remaining_time = max(0.0, self.time_threshold - (time.time() - init_time))
+                    t.join(timeout=remaining_time)
                 
-                if round_num == 0:
+                if round_num == 0 or (self.args.model == 'slm' and client_updates):
                     self.set_threshold()
                     
                 round_duration = time.time() - init_time
@@ -1090,7 +1275,7 @@ class FederatedLearningServer:
                     
                     aggregated_state = self.aggregate_models(safe_client_updates, self.global_state, safe_client_weights)
                     
-                    if self.args.model == 'clip' and 'sora' in self.args.strategy and self.args.prune_freq > 0:
+                    if self.args.model in ['clip', 'slm'] and 'sora' in self.args.strategy and self.args.prune_freq > 0:
                         # Verifica se a rodada atual é múltipla da frequência desejada
                         if (round_num + 1) % self.args.prune_freq == 0:
                             logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")
@@ -1103,7 +1288,13 @@ class FederatedLearningServer:
                             adaptive_threshold = 1e-3 * decay_factor
                             logger.info(f"   Adaptive threshold: {adaptive_threshold:.6f} (progress={progress:.2f})")
                             
-                            pruned_state, before, after, ranks_info = reduce_sora_state_dict_rank(
+                            if self.args.model == 'slm':
+                                from lora_slm.slm_sora_utils import reduce_sora_state_dict_rank as reduce_sora_state_dict_rank_slm
+                                prune_fn = reduce_sora_state_dict_rank_slm
+                            else:
+                                prune_fn = reduce_sora_state_dict_rank
+
+                            pruned_state, before, after, ranks_info = prune_fn(
                                 aggregated_state,
                                 threshold=adaptive_threshold,
                                 min_rank=self.args.min_rank
@@ -1169,14 +1360,17 @@ class FederatedLearningServer:
                     successful_notifications = 0
                     for conn in self.client_connections:
                         try:
-                            conn.send('end'.encode('utf-8'))
+                            if self.args.model == 'slm':
+                                send_data(conn, "end")
+                            else:
+                                conn.send('end'.encode('utf-8'))
                             successful_notifications += 1
-                        except OSError as e:
+                        except (OSError, BrokenPipeError, ConnectionResetError) as e:
                             logger.error(f"Error notifying client: {e}")
                     
                     logger.info(f"Round {round_num + 1}: Notified {successful_notifications} clients.")
                 else:
-                    logger.warning(f"Round {round_num + 1}: No client updates received.")
+                    logger.warning(f"Round {round_num + 1}: No client updates received (timeout or client failure).")
             
             logger.info(f"\nTraining completed after {self.args.rounds} rounds!")
             
@@ -1224,7 +1418,7 @@ def parse_args():
     parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('--experiments', type=int, default=1)
-    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip"])
+    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip", "slm"])
     parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
     parser.add_argument('--prune-freq', type=int, default=0)
     
@@ -1242,8 +1436,11 @@ def parse_args():
     parser.add_argument('--adaptive-rank', action='store_true', help='Ativa rank adaptativo: servidor ajusta automaticamente o rank por cliente baseado em latência')
     parser.add_argument('--adaptive-rank-min', type=int, default=2, help='Rank mínimo para o rank adaptativo')
     parser.add_argument('--adaptive-rank-max', type=int, default=8, help='Rank máximo para o rank adaptativo')
+    parser.add_argument('--allow-paca-upscale', action='store_true', help='Permite a subida de PaCA (por padrão apenas desce)')
+    parser.add_argument('--allow-rank-upscale', action='store_true', help='Permite a subida de Rank (por padrão apenas desce)')
     parser.add_argument('--min-rank', type=int, default=2, help='Rank mínimo permitido por módulo SoRA durante poda iterativa')
     parser.add_argument('--sora-prune', action='store_true', help='Ativa poda iterativa de rank do SoRA (independente do --prune CNN)')
+    parser.add_argument('--delta-coding', action='store_true', help='Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8')
     return parser.parse_args()
 
 def main():

@@ -18,6 +18,7 @@
 import numpy as np
 import os
 import sys
+import argparse
 import random
 import torch
 import torchvision
@@ -28,19 +29,17 @@ from pathlib import Path
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 6
-dir_path = "Cifar10/"
+dir_path = Path(__file__).parent / "Cifar10"
 
 
 # Allocate data to users
 def generate_dataset(dir_path, num_clients, niid, balance, partition):
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+    dir_path.mkdir(parents=True, exist_ok=True)
         
     # Setup directory for train/test data
-    config_path = Path(dir_path) / "config.json"
-    train_path = Path(dir_path) / "train/"
-    test_path = Path(dir_path) / "test/"
+    config_path = dir_path / "config.json"
+    train_path = dir_path / "train"
+    test_path = dir_path / "test"
 
     if check(config_path, train_path, test_path, num_clients, niid, balance, partition):
         return
@@ -50,9 +49,9 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
         [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
     trainset = torchvision.datasets.CIFAR10(
-        root=dir_path+"rawdata", train=True, download=True, transform=transform)
+        root=dir_path / "rawdata", train=True, download=True, transform=transform)
     testset = torchvision.datasets.CIFAR10(
-        root=dir_path+"rawdata", train=False, download=True, transform=transform)
+        root=dir_path / "rawdata", train=False, download=True, transform=transform)
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=len(trainset.data), shuffle=False)
     testloader = torch.utils.data.DataLoader(
@@ -89,8 +88,15 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
 
 
 if __name__ == "__main__":
-    niid = True if sys.argv[1] == "noniid" else False
-    balance = True if sys.argv[2] == "balance" else False
-    partition = sys.argv[3] if sys.argv[3] != "-" else None
+    parser = argparse.ArgumentParser()
+    parser.add_argument("niid", type=str)
+    parser.add_argument("balance", type=str)
+    parser.add_argument("partition", type=str)
+    parser.add_argument("--num-clients", type=int, default=10, help="Number of clients to partition the data for")
+    args = parser.parse_args()
 
-    generate_dataset(dir_path, num_clients, niid, balance, partition)
+    niid = True if args.niid == "noniid" else False
+    balance = True if args.balance == "balance" else False
+    partition = args.partition if args.partition != "-" else None
+
+    generate_dataset(dir_path, args.num_clients, niid, balance, partition)

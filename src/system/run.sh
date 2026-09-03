@@ -7,6 +7,28 @@
 # Execute ./run.sh --help para ver todos os argumentos disponíveis.
 # =============================================================================
 
+# Define script directory for cross-platform path resolution
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+# Hugging Face: modo offline por padrão para evitar chamadas de rede redundantes a cada cliente/servidor
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
+
+# Previne que o PyTorch tente usar todos os núcleos (100+ threads) para cada um dos 10 clientes, o que causa Thrashing
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+export VECLIB_MAXIMUM_THREADS=4
+export NUMEXPR_NUM_THREADS=4
+
+# Compilador C: necessário para o Triton (JIT de kernels CUDA em modelos Transformers)
+if [ -z "$CC" ] && ! command -v cc &>/dev/null && ! command -v gcc &>/dev/null; then
+    echo "[ERRO] Compilador C (gcc/cc) não encontrado. Ele é essencial para o JIT do Triton/PyTorch."
+    echo "Instale-o usando seu gerenciador de pacotes (ex: sudo apt install build-essential)."
+    exit 1
+fi
+
 # ---- Valores Padrão ----
 
 # Rede
@@ -14,7 +36,7 @@ HOST="localhost"
 PORT=9500
 
 # Sessão
-SESSION_NAME="david"
+SESSION_NAME="fl_puma"
 
 # Treinamento
 CLIENT_COUNT=2
@@ -31,7 +53,7 @@ AUTO_NEXT=0
 MODEL="cnn"
 STRATEGY="lora"
 RANK=8
-CONFIG_FILE="lora_clip/train_config.yml"
+CONFIG_FILE=""
 
 # Dispositivo
 DEVICE="cuda"
@@ -55,10 +77,12 @@ TEST_CLIENT_IDX=0
 
 # PaCA
 PACA=12
+CUSTOM_PACA=0
 ADAPTIVE_PACA=0
 RANDOM_PACA=0
 PACA_MIN=1
 PACA_MAX=12
+CUSTOM_PACA_MAX=0
 PACA_LIST=""
 
 # Rank Adaptativo
@@ -71,6 +95,13 @@ WEIGHTS_DIR="saved_weights"
 SAVE_MODEL_FLAG=""
 LOAD_MODEL_FLAG=""
 
+# Otimização de Avaliação
+SKIP_POST_EVAL=0
+SKIP_TRAIN_EVAL=0
+
+# Delta Coding (LHDQ)
+DELTA_CODING=0
+
 # ---- Função de Ajuda ----
 show_help() {
     cat << 'EOF'
@@ -81,7 +112,7 @@ Opções de Rede:
   -p, --port <port>           Porta do servidor (padrão: 9500)
 
 Opções de Sessão:
-  -s, --session <nome>        Nome da sessão tmux (padrão: david)
+  -s, --session <nome>        Nome da sessão tmux (padrão: fl_puma)
   --auto-next                 Não pausar entre simulações
 
 Opções de Treinamento:
@@ -135,6 +166,13 @@ Opções de Rank Adaptativo:
 Persistência de Modelo:
   --save [path]               Salvar modelo (path opcional, gera nome automático)
   --load [path]               Carregar modelo (path opcional, gera nome automático)
+
+Otimização de Avaliação:
+  --skip-post-eval            Pular todas as avaliações pós-treino (mantém apenas Global Model Test Acc)
+  --skip-train-eval           Pular apenas a avaliação no conjunto de treino pós-treino
+
+Compressão:
+  --delta-coding              Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8
 
 Outros:
   --help                      Exibir esta mensagem
@@ -191,17 +229,19 @@ while [ $# -gt 0 ]; do
         -t|--test-client-idx) TEST_CLIENT_IDX="$2"; shift 2 ;;
 
         # PaCA
-        --paca) PACA="$2"; shift 2 ;;
+        --paca) PACA="$2"; CUSTOM_PACA=1; shift 2 ;;
         --adaptive-paca) ADAPTIVE_PACA=1; shift 1 ;;
         --random-paca) RANDOM_PACA=1; shift 1 ;;
         --paca-min) PACA_MIN="$2"; shift 2 ;;
-        --paca-max) PACA_MAX="$2"; shift 2 ;;
+        --paca-max) PACA_MAX="$2"; CUSTOM_PACA_MAX=1; shift 2 ;;
         --paca-list) PACA_LIST="$2"; shift 2 ;;
 
         # Rank Adaptativo
         --adaptive-rank) ADAPTIVE_RANK=1; shift 1 ;;
         --adaptive-rank-min) ADAPTIVE_RANK_MIN="$2"; shift 2 ;;
         --adaptive-rank-max) ADAPTIVE_RANK_MAX="$2"; shift 2 ;;
+        --allow-paca-upscale) ALLOW_PACA_UPSCALE=1; shift 1 ;;
+        --allow-rank-upscale) ALLOW_RANK_UPSCALE=1; shift 1 ;;
 
         # Persistência de Modelo
         --save)
@@ -220,6 +260,13 @@ while [ $# -gt 0 ]; do
             fi
             LOAD_MODEL_FLAG="--load-model $LOAD_MODEL_PATH"
             ;;
+
+        # Otimização de Avaliação
+        --skip-post-eval) SKIP_POST_EVAL=1; shift 1 ;;
+        --skip-train-eval) SKIP_TRAIN_EVAL=1; shift 1 ;;
+
+        # Delta Coding (LHDQ)
+        --delta-coding) DELTA_CODING=1; shift 1 ;;
 
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
@@ -261,36 +308,51 @@ if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ]; then
     if [ -z "$CONFIG_FILE" ]; then
         if [ "$MODEL" = "slm" ]; then
             CONFIG_FILE="lora_slm/train_config.yml"
-        else
-            echo "❌ Erro: Ao usar --model $MODEL, forneça o caminho do YAML usando --config."
-            exit 1
+        elif [ "$MODEL" = "clip" ]; then
+            CONFIG_FILE="lora_clip/train_config.yml"
+        fi
+    fi
+    
+    # Auto-ajuste de PaCA conforme o modelo (SLM=28 camadas, CLIP=12 camadas)
+    if [ "$CUSTOM_PACA" -eq 0 ]; then
+        if [ "$MODEL" = "slm" ]; then
+            PACA=28
+        elif [ "$MODEL" = "clip" ]; then
+            PACA=12
+        fi
+    fi
+    if [ "$CUSTOM_PACA_MAX" -eq 0 ]; then
+        if [ "$MODEL" = "slm" ]; then
+            PACA_MAX=28
+        elif [ "$MODEL" = "clip" ]; then
+            PACA_MAX=12
         fi
     fi
 fi
 
 # ---- Exibição da Configuração ----
 echo "===================================="
-echo "⚙️ Configuração do Treinamento FL:"
+echo "[INFO] Configuração do Treinamento FL:"
 echo "===================================="
 echo "  Clientes: $CLIENT_COUNT | Rodadas: $ROUNDS | Simulações: $SIMULATIONS"
 echo "  Dataset: $DATASET | Prune: $PRUNE"
 echo "  ALA (0=FedALA, 1=FedAvg): $ALA"
 if [ "$MODEL" = "clip" ]; then
-    echo "  🔥 Modelo: CLIP | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
+    echo "  Modelo: CLIP | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 elif [ "$MODEL" = "slm" ]; then
-    echo "  🧠 Modelo: SLM (Qwen-VL) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
+    echo "  Modelo: SLM (Qwen-VL) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 else
-    echo "  🧊 Modelo: CNN Simples Padrão"
+    echo "  Modelo: CNN Simples Padrão"
 fi
 echo "  Device: $DEVICE ($DEVICE_ID) | Sessão TMUX: $SESSION_NAME"
 
 if [ "$RANDOM_PACA" -eq 1 ]; then
-    echo "  🎲 PaCA Heterogêneo: ATIVADO (aleatório entre $PACA_MIN e $PACA_MAX)"
+    echo "  PaCA Heterogêneo: ATIVADO (aleatório entre $PACA_MIN e $PACA_MAX)"
 elif [ -n "$PACA_LIST" ]; then
-    echo "  🎲 PaCA Heterogêneo: ATIVADO (lista: $PACA_LIST)"
+    echo "  PaCA Heterogêneo: ATIVADO (lista: $PACA_LIST)"
 else
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
-        echo "  PaCA: $PACA (MÁXIMO) | ⚡ PaCA Adaptativo (Server): ATIVADO"
+        echo "  PaCA: $PACA (MÁXIMO) | PaCA Adaptativo (Server): ATIVADO"
     else
         echo "  PaCA: $PACA (fixo para todos)"
     fi
@@ -298,19 +360,18 @@ fi
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
+if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; else echo "  Compressão: INT8 padrão (8 bits/param)"; fi
 echo "===================================="
 
 # ---- Preparação do Dataset ----
-cd ../dataset || exit 1
-    # Encontra o script ignorando case
-    SCRIPT_NAME=$(find . -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
-    if [ -n "$SCRIPT_NAME" ]; then
-        uv run "$SCRIPT_NAME" noniid - dir
-    else
-        echo "❌ Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
-        exit 1
-    fi
-cd ../system || exit 1
+# Busca o script no diretório dataset
+SCRIPT_PATH=$(find ../dataset -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
+if [ -n "$SCRIPT_PATH" ]; then
+    uv run "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
+else
+    echo "[ERRO] Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
+    exit 1
+fi
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then
     mkdir -p "$WEIGHTS_DIR"
@@ -330,14 +391,18 @@ else
     else
         EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_paca${PACA}"
     fi
+    # Sufixo de compressão LHDQ
+    if [ "$DELTA_CODING" -eq 1 ]; then
+        EXP_NAME="${EXP_NAME}_deltacoding"
+    fi
 fi
-echo "📁 Diretório de Resultados: ../results/$EXP_NAME"
+echo "[INFO] Diretório de Resultados: ../results/$EXP_NAME"
 
 # ---- Loop de Simulações ----
 END_RUN=$((START_RUN + SIMULATIONS - 1))
 for RUN in $(seq $START_RUN $END_RUN); do
     echo "========================================================="
-    echo "🚀 INICIANDO SIMULAÇÃO $RUN DE $SIMULATIONS"
+    echo "[INFO] INICIANDO SIMULAÇÃO $RUN DE $SIMULATIONS"
     echo "========================================================="
 
     # PaCA do servidor: se heterogêneo, usar o máximo
@@ -354,15 +419,49 @@ for RUN in $(seq $START_RUN $END_RUN); do
     mkdir -p "$LOG_DIR"
 
     # Comando do servidor
-    SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py --host $HOST --port $PORT --clients-per-round $CLIENT_COUNT --rounds $ROUNDS --dataset $DATASET --test-client-idx $TEST_CLIENT_IDX --in-features $IN_FEATURES --num-classes $NUM_CLASSES --dim $DIM --batch-size $BATCH_SIZE --max-clients $MAX_CLIENTS --prune $PRUNE --device $DEVICE -did $DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK --paca $SERVER_PACA --config \"$CONFIG_FILE\" --prune-freq $PRUNE_FREQ $SAVE_MODEL_FLAG $LOAD_MODEL_FLAG --run-id $RUN --exp-name $EXP_NAME --timestamp $TIMESTAMP"
+    SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py \
+        --host $HOST \
+        --port $PORT \
+        --clients-per-round $CLIENT_COUNT \
+        --rounds $ROUNDS \
+        --dataset $DATASET \
+        --test-client-idx $TEST_CLIENT_IDX \
+        --in-features $IN_FEATURES \
+        --num-classes $NUM_CLASSES \
+        --dim $DIM \
+        --batch-size $BATCH_SIZE \
+        --max-clients $MAX_CLIENTS \
+        --prune $PRUNE \
+        --device $DEVICE \
+        -did $DEVICE_ID \
+        --model $MODEL \
+        --strategy $STRATEGY \
+        --rank $RANK \
+        --paca $SERVER_PACA \
+        --config \"$CONFIG_FILE\" \
+        --prune-freq $PRUNE_FREQ \
+        $SAVE_MODEL_FLAG \
+        $LOAD_MODEL_FLAG \
+        --run-id $RUN \
+        --exp-name $EXP_NAME \
+        --timestamp $TIMESTAMP"
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-paca"
     fi
     if [ "$ADAPTIVE_RANK" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-rank --adaptive-rank-min $ADAPTIVE_RANK_MIN --adaptive-rank-max $ADAPTIVE_RANK_MAX"
     fi
+    if [ "${ALLOW_PACA_UPSCALE:-0}" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --allow-paca-upscale"
+    fi
+    if [ "${ALLOW_RANK_UPSCALE:-0}" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --allow-rank-upscale"
+    fi
     if [ "$SORA_PRUNE" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --sora-prune"
+    fi
+    if [ "$DELTA_CODING" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --delta-coding"
     fi
     SERVER_CMD="$SERVER_CMD 2>&1 | tee $LOG_DIR/server.log"
 
@@ -383,6 +482,14 @@ for RUN in $(seq $START_RUN $END_RUN); do
             PACA_FLAGS="--paca-list $PACA_LIST"
         fi
 
+        # Flags de Otimização de Avaliação
+        EVAL_FLAGS=""
+        if [ "$SKIP_POST_EVAL" -eq 1 ]; then
+            EVAL_FLAGS="$EVAL_FLAGS --skip-post-eval"
+        elif [ "$SKIP_TRAIN_EVAL" -eq 1 ]; then
+            EVAL_FLAGS="$EVAL_FLAGS --skip-train-eval"
+        fi
+
         # Distribuição round-robin de GPUs
         if [ "$CUSTOM_DID" -eq 1 ]; then
             CLIENT_DEVICE_ID=$DEVICE_ID
@@ -392,18 +499,41 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py --client-idx $i --host $HOST --port $PORT --dataset $DATASET --rounds $ROUNDS --ala $ALA --device $DEVICE --device_id $CLIENT_DEVICE_ID --model $MODEL --strategy $STRATEGY --rank $RANK $PACA_FLAGS --config \"$CONFIG_FILE\" --num-classes $NUM_CLASSES --in-features $IN_FEATURES --run-id $RUN --exp-name $EXP_NAME --timestamp $TIMESTAMP 2>&1 | tee $LOG_DIR/client_$i.log"
+        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py \
+            --client-idx $i \
+            --host $HOST \
+            --port $PORT \
+            --dataset $DATASET \
+            --rounds $ROUNDS \
+            --ala $ALA \
+            --device $DEVICE \
+            --device_id $CLIENT_DEVICE_ID \
+            --model $MODEL \
+            --strategy $STRATEGY \
+            --rank $RANK \
+            $PACA_FLAGS \
+            $EVAL_FLAGS \
+            --config \"$CONFIG_FILE\" \
+            --num-classes $NUM_CLASSES \
+            --in-features $IN_FEATURES \
+            --run-id $RUN \
+            --exp-name $EXP_NAME \
+            --timestamp $TIMESTAMP"
+        if [ "$DELTA_CODING" -eq 1 ]; then
+            CLIENT_CMD="$CLIENT_CMD --delta-coding"
+        fi
+        CLIENT_CMD="$CLIENT_CMD 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
             CLIENT_CMD="$CLIENT_CMD ; read"
         fi
         tmux new-window -t "$SESSION_NAME" -n "Client-$i" "$CLIENT_CMD"
     done
 
-    echo "⏳ Aguardando a simulação $RUN terminar em segundo plano..."
+    echo "[INFO] Aguardando a simulação $RUN terminar em segundo plano..."
     while tmux has-session -t "$SESSION_NAME" 2>/dev/null; do
         sleep 5
     done
 
-    echo "✅ Simulação $RUN concluída com sucesso!"
+    echo "[INFO] Simulação $RUN concluída com sucesso!"
     sleep 2
 done

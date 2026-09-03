@@ -11,6 +11,13 @@ import logging
 import random
 from pathlib import Path
 
+# Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -41,10 +48,11 @@ from model import SimpleModel
 from utils.network_utils import send_data, recv_data
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
 from utils.fl_math import resize_model_to_pruned
+from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
 
 # --- CONFIGURAÇÃO DE OBSERVABILIDADE (LOGGING ENXUTO) ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(message)s',
     datefmt='%H:%M:%S'
 )
@@ -93,7 +101,7 @@ def map_sequential_to_simplemodel(state_dict):
 #             quantized_state_dict[k] = v
 #     return quantized_state_dict
 
-def local_training(model, state_dict, prune, train_loader, test_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None, model_type='cnn', run_config=None):
+def local_training(model, state_dict, prune, train_loader, test_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None, model_type='cnn', run_config=None, model_lock=None):
     # Verifica se os pesos precisam ser desquantizados (se não forem tensores)
     if state_dict and not isinstance(next(iter(state_dict.values())), torch.Tensor):
         state_dict = dequantization(state_dict)
@@ -105,24 +113,20 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
             state_dict = map_sequential_to_simplemodel(state_dict)
     # === CORREÇÃO ESTRUTURAL PARA CLIP E SLM ===
     if model_type in ['clip', 'slm']:
-        # 1. 'model' contém nossos pesos locais. 
-        # Criamos o 'global_model' copiando a estrutura atual.
-        global_model = copy.deepcopy(model)
+        # FedALA_LoRA só se aplica a CLIP (model_type != 'slm').
+        # Evita deepcopy desnecessário do SLM inteiro (~4-6 GB).
+        needs_ala = (alaarg == 0 and round_num >= 2 and model_type != 'slm')
         
-        # 2. Injetamos os pesos do servidor (state_dict) APENAS no global_model
-        global_model = resize_model_to_pruned(global_model, state_dict)
-        
-        # 3. Agora temos os mundos perfeitamente isolados:
-        
-        if alaarg == 0 and round_num >= 2:
+        if needs_ala:
+            global_model = copy.deepcopy(model)
+            global_model = resize_model_to_pruned(global_model, state_dict)
             logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
             local_initialization(ala, global_model, model)
             personalized_acc, _ = evaluate_model(model, test_loader)
             logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
+            del global_model
         else:
             resize_model_to_pruned(model, state_dict)
-            
-        del global_model
         
     else:
         # --- LÓGICA ANTIGA PARA CNN MANTIDA INTACTA ---
@@ -166,7 +170,7 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
         if model_type == 'slm':
             if hasattr(model, "slm_model") and hasattr(model.slm_model, "gradient_checkpointing_enable"):
                 model.slm_model.gradient_checkpointing_enable()
-                logger.info("Gradient Checkpointing ativado no SLM (Redução de VRAM).")
+                # logger.debug("Gradient Checkpointing ativado no SLM (Redução de VRAM).")
         
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
         is_sora = run_config["model"]["lora"]["mode"] in ["with_sora_no_schedule", "with_sora_schedule"]
@@ -198,20 +202,29 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
                 x = x.to(device)
             y = y.to(device)
             
-            optimizer.zero_grad()
-            if sparse_optimizer is not None:
-                sparse_optimizer.zero_grad()
+            # Adquirir lock por batch para permitir interrupcao imediata
+            # pela thread de encontro V2V. O lock e liberado apos cada
+            # batch, dando uma janela para a thread watcher reagir.
+            if model_lock:
+                model_lock.acquire()
+            try:
+                optimizer.zero_grad()
+                if sparse_optimizer is not None:
+                    sparse_optimizer.zero_grad()
+                    
+                output = model(x)
+                if isinstance(output, dict):
+                    output = output["logits"]
+                    
+                loss = loss_fn(output, y)
+                loss.backward()
+                optimizer.step()
                 
-            output = model(x)
-            if isinstance(output, dict):
-                output = output["logits"]
-                
-            loss = loss_fn(output, y)
-            loss.backward()
-            optimizer.step()
-            
-            if sparse_optimizer is not None:
-                sparse_optimizer.step()
+                if sparse_optimizer is not None:
+                    sparse_optimizer.step()
+            finally:
+                if model_lock:
+                    model_lock.release()
     
     # --- 2. SELEÇÃO DOS PESOS QUE SERÃO ENVIADOS PARA O SERVIDOR ---
     if model_type in ['clip', 'slm']:
@@ -244,20 +257,28 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
         
         slm_data = []
         for x_tensor, y_tensor in zip(X, y):
-            x_tensor = x_tensor.cpu()
+            x_tensor = x_tensor.cpu().float()
             
-            # Se o tensor estiver normalizado (ex: CIFAR [-1, 1]), desfazemos a normalização
-            if x_tensor.min() < 0:
+            # Se o tensor vier com normalização do CLIP (valores negativos < -0.1)
+            if x_tensor.min() < -0.1:
+                clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
+                clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
+                if x_tensor.shape[0] == 3:
+                    x_tensor = x_tensor * clip_std + clip_mean
+                else:
+                    x_tensor = x_tensor * 0.5 + 0.5
+            elif x_tensor.min() < 0:
+                # Normalização padrão [-1, 1]
                 x_tensor = x_tensor * 0.5 + 0.5
                 
             if x_tensor.max() <= 1.0:
                 x_tensor = x_tensor * 255.0
                 
-            # Clamp de segurança para garantir [0, 255]
+            # Clamp to [0, 255] range
             x_tensor = torch.clamp(x_tensor, 0, 255)
             x_numpy = x_tensor.byte().numpy()
             
-            if x_numpy.shape[0] in [1, 3]: # (C, H, W)
+            if x_numpy.shape[0] in [1, 3]: # (C, H, W) -> (H, W, C)
                 x_numpy = np.transpose(x_numpy, (1, 2, 0))
             if x_numpy.shape[-1] == 1:
                 x_numpy = np.squeeze(x_numpy, axis=-1)
@@ -268,12 +289,22 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
             
             slm_data.append({"image": pil_img, "label": y_tensor.item()})
             
-        return DataLoader(slm_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        pin_mem = True if hasattr(device, 'type') and device.type == 'cuda' else False
+        return DataLoader(slm_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=pin_mem)
 
-    # Redimensionamento vital para o CLIP não quebrar
+    # Redimensionamento e normalização vitais para o CLIP
     if is_clip:
-        resize = T.Resize((224, 224), antialias=True)
-        X = resize(X)
+        if X.shape[-2:] != (224, 224):
+            resize = T.Resize((224, 224), antialias=True)
+            X = resize(X)
+        if not X.is_floating_point():
+            X = X.float() / 255.0
+        elif X.max() > 1.0:
+            X = X / 255.0
+        # Se os dados não tiverem normalização do CLIP, aplica a normalização oficial do CLIP
+        if X.min() >= 0.0:
+            normalize = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+            X = normalize(X)
         
     # Garante que o rótulo é inteiro longo e move os dados INTEIROS para a GPU
     X = X.to(device)
@@ -284,12 +315,13 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
 
 
 
-def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0):
+def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0, rs_post_p2p_acc=None, rs_post_p2p_encounter_ids=None):
     b = "FedALA" if argalgo == 0 else "FedAVG"
     
-    paca_val = args.paca if (args.paca is not None and args.paca > 0) else 0
+    paca_val = args.paca if (isinstance(args.paca, (int, float)) and not isinstance(args.paca, bool) and args.paca > 0) else 0
+    rank_val = args.rank if (isinstance(args.rank, (int, float)) and not isinstance(args.rank, bool) and args.rank > 0) else 8
     ts_suffix = f"_{args.timestamp}" if hasattr(args, 'timestamp') and args.timestamp else ""
-    algo = f"client_{idx}_{args.dataset}_{args.strategy}_rank{args.rank}_paca{paca_val}_{b}_run{args.run_id}{ts_suffix}"
+    algo = f"client_{idx}_{args.dataset}_{args.strategy}_rank{rank_val}_paca{paca_val}_{b}_run{args.run_id}{ts_suffix}"
     
     current_dir = Path(__file__).resolve().parent
     result_path = current_dir.parent / "results" / args.exp_name
@@ -305,6 +337,10 @@ def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, 
             hf.create_dataset('rs_ala_acc', data=rs_ala_acc)
         hf.create_dataset('rs_local_acc', data=rs_local_acc)
         hf.create_dataset('rs_train_acc', data=rs_train_acc)
+        if rs_post_p2p_acc is not None and len(rs_post_p2p_acc) > 0:
+            hf.create_dataset('rs_post_p2p_acc', data=rs_post_p2p_acc)
+        if rs_post_p2p_encounter_ids is not None and len(rs_post_p2p_encounter_ids) > 0:
+            hf.create_dataset('rs_post_p2p_encounter_ids', data=rs_post_p2p_encounter_ids)
         hf.attrs['paca_used'] = paca_val
 
 def local_initialization(ala, received_global_model, model, mask=None):
@@ -374,6 +410,11 @@ def parse_args():
     parser.add_argument('--prune', type=int, default=1, choices=[0, 1], help='Habilitar pruning adaptativo (0=sim, 1=não, default: 1)')
     parser.add_argument('--mode', type=str, default='centralized', choices=['centralized', 'decentralized'])
     parser.add_argument('--max-epochs', type=int, default=0, help='Limite de epocas no modo descentralizado (0 = infinito)')
+    parser.add_argument('--delta-coding', action='store_true', help='Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8')
+    
+    # --- Otimização de Avaliação ---
+    parser.add_argument('--skip-post-eval', action='store_true', help='Pula todas as avaliações pós-treino no cliente (local_test_acc e train_acc) para máxima velocidade, mantendo apenas Global Model Test Acc')
+    parser.add_argument('--skip-train-eval', action='store_true', help='Pula apenas a avaliação demorada no conjunto de treino pós-treino')
     
     return parser.parse_args()
 
@@ -488,6 +529,8 @@ def main():
     rs_ala_acc = []
     rs_local_acc = []
     rs_train_acc = []
+    rs_post_p2p_acc = []
+    rs_post_p2p_encounter_ids = []
     
     try:
         is_clip_flag = (args.model == 'clip')
@@ -522,58 +565,88 @@ def main():
                 logger.exception("Connection failed after multiple attempts")
                 sys.exit(1)
                 
-            # Timeout de segurança: evita que o client fique preso
+            # Network timeout configuration
             # indefinidamente caso o server feche a conexão (race condition
             # no último round)
-            s.settimeout(120)
+            if args.model == 'slm':
+                s.settimeout(1800)
+            else:
+                s.settimeout(120)
+            
+            # LHDQ: previous state cache for delta coding
+            previous_recv_state = {}  # estado global recebido na rodada anterior
+            previous_sent_state = {}  # update enviado na rodada anterior
             
             send_data(s, args.client_idx)
             logger.info(f"Connected to server {args.host}:{args.port}")
             for round_num in range(args.rounds):
                 logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
                 
-                # --- Problema #4: Recebe PaCA dinâmico do servidor (apenas para CLIP) ---
-                if args.model == 'clip':
+                # --- Recebe PaCA e Rank dinâmicos do servidor (CLIP e SLM) ---
+                if args.model in ['clip', 'slm']:
                     server_paca, _ = recv_data(s)
-                    if server_paca is not None and server_paca != args.paca:
-                        logger.info(f"PaCA adaptativo: servidor ajustou {args.paca} -> {server_paca}")
-                        args.paca = server_paca
-                        # Atualiza o run_config para que o treino use o novo PaCA
-                        run_config["model"]["paca"]["upper_layers"] = server_paca
+                    if server_paca is None or server_paca == "end":
+                        logger.warning(f"Sinal de término ou desconexão recebido ao aguardar PaCA ({server_paca}). Encerrando cliente.")
+                        break
+                    if isinstance(server_paca, int) and not isinstance(server_paca, bool):
+                        if server_paca != args.paca:
+                            logger.info(f"PaCA adaptativo: servidor ajustou {args.paca} -> {server_paca}")
+                            args.paca = server_paca
+                            if "paca" in run_config.get("model", {}):
+                                run_config["model"]["paca"]["upper_layers"] = server_paca
+                    else:
+                        logger.warning(f"Valor inesperado de PaCA recebido: {server_paca} ({type(server_paca)}). Mantendo PaCA={args.paca}")
 
-                    # fazer a mesma coisa para receber um valor do server para o r
                     server_r, _ = recv_data(s)
-                    if server_r is not None and server_r != args.rank:
-                        logger.info(f"r adaptativo: servidor ajustou {args.rank} -> {server_r}")
-                        args.rank = server_r
-                        # Atualiza o run_config para que o treino use o novo r
-                        run_config["model"]["lora"]["r"] = server_r
+                    if server_r is None or server_r == "end":
+                        logger.warning(f"Sinal de término ou desconexão recebido ao aguardar Rank ({server_r}). Encerrando cliente.")
+                        break
+                    if isinstance(server_r, int) and not isinstance(server_r, bool):
+                        if server_r != args.rank:
+                            logger.info(f"r adaptativo: servidor ajustou {args.rank} -> {server_r}")
+                            args.rank = server_r
+                            if "lora" in run_config.get("model", {}):
+                                run_config["model"]["lora"]["r"] = server_r
+                    else:
+                        logger.warning(f"Valor inesperado de Rank recebido: {server_r} ({type(server_r)}). Mantendo Rank={args.rank}")
 
                 global_state, _ = recv_data(s)
+                if global_state is None or global_state == "end" or not isinstance(global_state, dict):
+                    logger.warning(f"Sinal de término ou payload inesperado recebido ({type(global_state)}): {global_state}. Encerrando cliente com segurança.")
+                    break
+
                 prune, _ = recv_data(s)
-                
-                if global_state is None:
-                    logger.warning("Failed to receive global model. Connection may be closed.")
+                if prune is None or prune == "end":
+                    logger.warning(f"Sinal de término ou desconexão recebido ao aguardar Prune ({prune}). Encerrando cliente.")
                     break
                     
                 logger.info("Received global model.")
                 client_dequant_start = time.time()
-                global_state = dequantization(global_state)
+                if is_lhdq_encoded(global_state):
+                    global_state = lhdq_decode(global_state, previous_recv_state)
+                    # LHDQ: cache the decoded global state for the next round
+                    previous_recv_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()}
+                else:
+                    if args.delta_coding:
+                        previous_recv_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()}
+                        # Pula a dequantização int8 no round 1 do delta_coding
+                    else:
+                        global_state = dequantization(global_state)
                 client_dequant_time = time.time() - client_dequant_start
                 
                 
-                if round_num + 1 >= 2 and prune == 1 and args.model != 'clip':
+                if round_num + 1 >= 2 and prune == 1 and args.model == 'cnn':
                     ammount, _ = recv_data(s)
                 
                 eval_start = time.time()
                 if round_num + 1 >= 2:
-                    if args.model == 'clip':
+                    if args.model in ['clip', 'slm']:
                         old_local_weights = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
 
                     local = resize_model_to_pruned(model, global_state)
                     test_accuracy, test_loss = evaluate_model(local, test_loader)
                     
-                    if args.model == 'clip':
+                    if args.model in ['clip', 'slm']:
                         for n, p in model.named_parameters():
                             if p.requires_grad and n in old_local_weights:
                                 if p.data.shape == old_local_weights[n].shape:
@@ -601,7 +674,7 @@ def main():
                     alaarg=args.ala, 
                     ala=ala,
                     model_type=args.model, 
-                    run_config=run_config if args.model == 'clip' else None
+                    run_config=run_config if args.model in ['clip', 'slm'] else None
                 )
                 client_training_time = time.time() - train_start
                 
@@ -614,19 +687,40 @@ def main():
 
                 logger.info(f"Local training completed in {client_training_time:.2f}s.")
 
-                # Acurácia logo após o treinamento local (avaliado no conjunto de teste para comparação justa)
+                # Avaliações pós-treino (opcionalmente puladas para acelerar SLM/LLM)
                 post_eval_start = time.time()
-                local_test_acc, local_test_loss = evaluate_model(model, test_loader)
-                rs_local_acc.append(local_test_acc)
-                
-                train_accuracy, train_loss = evaluate_model(model, train_loader)
-                rs_train_acc.append(train_accuracy)
+                if not args.skip_post_eval:
+                    local_test_acc, local_test_loss = evaluate_model(model, test_loader)
+                    rs_local_acc.append(local_test_acc)
+                    
+                    if not args.skip_train_eval:
+                        train_accuracy, train_loss = evaluate_model(model, train_loader)
+                        rs_train_acc.append(train_accuracy)
+                    else:
+                        train_accuracy = 0.0
+                        rs_train_acc.append(0.0)
+                        
+                    logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
+                else:
+                    local_test_acc = test_accuracy
+                    train_accuracy = 0.0
+                    rs_local_acc.append(test_accuracy)
+                    rs_train_acc.append(0.0)
+                    logger.info(f"Client {args.client_idx}: Avaliação pós-treino pulada (--skip-post-eval). Usando Global Test Acc={test_accuracy:.2f}%")
                 client_post_eval_time = time.time() - post_eval_start
-
-                logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
                 
                 quant_start = time.time()
-                updated_state = quantization(updated_state)
+                use_lhdq = (args.delta_coding and round_num >= 1 and previous_sent_state)
+                if use_lhdq:
+                    # LHDQ: encode and cache the reconstructed version to maintain reference sync
+                    updated_state = lhdq_encode(updated_state, previous_sent_state)
+                    previous_sent_state = lhdq_decode(updated_state, previous_sent_state)
+                else:
+                    if args.delta_coding:
+                        previous_sent_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
+                        # Pula a quantização int8 no round 1 do delta_coding
+                    else:
+                        updated_state = quantization(updated_state)
                 client_quant_time = time.time() - quant_start
                 
                 # Tempo total de avaliação (pré + pós treinamento) e dequantização no cliente
@@ -637,7 +731,7 @@ def main():
                 
                 try:
                     send_data(s, updated_state)
-                    send_data(s, len(train_loader))
+                    send_data(s, len(train_loader.dataset))
                     send_data(s, args.ala)
                     send_data(s, client_training_time)
                     
@@ -650,7 +744,13 @@ def main():
                     
                     logger.info("Client update sent.")
                     
-                    s.recv(3)
+                    if args.model == 'slm':
+                        round_ack, _ = recv_data(s)
+                        if round_ack is None:
+                            logger.warning("Conexão fechada pelo servidor ou timeout ao aguardar confirmação de round. Finalizando.")
+                            break
+                    else:
+                        s.recv(3)
                     logger.info("Ready for next round...")
                 except (OSError, BrokenPipeError, ConnectionResetError, socket.timeout) as e:
                     logger.warning(f"Conexão fechada pelo servidor ou timeout ({type(e).__name__}). Finalizando.")
@@ -665,23 +765,36 @@ def main():
 
         logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
 
-        # Contador do ultimo encontro processado. Garante que cada encontro
-        # so e processado uma unica vez, mesmo que o JSON persista no disco.
-        last_processed_encounter = 0
-
         # Caminho para a pasta de sinalizacao P2P (volume compartilhado Docker).
         encounters_dir = Path(__file__).resolve().parents[1] / "results" / "encounters"
-        
+
+        # ── Estado compartilhado entre threads ────────────────────────────
+        # Lock para sincronizar acesso ao modelo entre treino e troca P2P.
+        # No local_training da CNN, e adquirido/liberado a cada batch,
+        # permitindo que a thread watcher interrompa o treino quase
+        # instantaneamente (espera no maximo a duracao de 1 batch).
+        model_lock = threading.Lock()
+
+        # Dicionario que armazena pesos recebidos via TCP, indexado por
+        # (encounter_id, sender_client_id). Protegido pelo in_memory_lock.
         in_memory_weights = {}
         in_memory_lock = threading.Lock()
-        
+
+        # Contador thread-safe do ultimo encontro processado.
+        last_processed_encounter = 0
+        encounter_counter_lock = threading.Lock()
+
+        # ── Thread P2P Server (TCP Listener) ──────────────────────────────
+        # Roda em background aceitando conexoes TCP dos vizinhos.
+        # Armazena os pesos recebidos em in_memory_weights para a thread
+        # watcher consumir. NAO toca no modelo diretamente.
         def p2p_server_thread():
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind(('0.0.0.0', 9000))
             server_socket.listen(50)
             logger.info(f"Client {args.client_idx}: P2P Server listening on port 9000")
-            
+
             while True:
                 try:
                     conn, addr = server_socket.accept()
@@ -696,24 +809,204 @@ def main():
                     conn.close()
                 except Exception as e:
                     logger.error(f"Erro no P2P Server: {e}")
-                    
+
         threading.Thread(target=p2p_server_thread, daemon=True).start()
 
+        # ── Thread Encounter Watcher ──────────────────────────────────────
+        # Roda em background fazendo polling da pasta de encontros a cada 1s.
+        # Quando detecta um encontro novo para este cliente:
+        #   1. Adquire model_lock (espera no maximo 1 batch do treino)
+        #   2. Faz snapshot dos pesos atuais do modelo
+        #   3. Libera model_lock (treino retoma)
+        #   4. Envia snapshot para vizinhos via TCP
+        #   5. Aguarda pesos dos vizinhos (poll_timeout = ETC - margem)
+        #   6. Agrega via media D-PSGD
+        #   7. Adquire model_lock e aplica os pesos agregados no modelo
+        #   8. Escreve .done_enc_* para destravar o orquestrador
+        def encounter_watcher_thread():
+            nonlocal last_processed_encounter
+
+            while True:
+                time.sleep(1)  # Polling de 1 segundo
+
+                if not encounters_dir.exists():
+                    continue
+
+                encounter_files = list(encounters_dir.glob("encounter_*.json"))
+                if not encounter_files:
+                    continue
+
+                # Funcao auxiliar para extrair o ID do encontro do JSON
+                def extract_id(filepath):
+                    try:
+                        with open(filepath, "r") as json_f:
+                            return json.load(json_f).get("encounter_id", 0)
+                    except Exception:
+                        return 0
+
+                encounter_files.sort(key=extract_id)
+
+                for ef in encounter_files:
+                    try:
+                        with open(ef, "r") as f:
+                            data = json.load(f)
+
+                        enc_id = data.get("encounter_id", 0)
+                        clients_in_encounter = data.get("clients", [])
+                        etc_seconds = data.get("etc_seconds", 60)
+
+                        with encounter_counter_lock:
+                            if enc_id <= last_processed_encounter:
+                                continue
+                            if args.client_idx not in clients_in_encounter:
+                                continue
+
+                        if isinstance(etc_seconds, str) and etc_seconds == "Carros Parados":
+                            poll_timeout = 115 # MAX_ETC (120) - 5
+                        else:
+                            poll_timeout = max(5, int(etc_seconds - 5))
+
+                        etc_display = f"{etc_seconds}" if isinstance(etc_seconds, str) else f"{etc_seconds:.1f}"
+                        logger.info(
+                            f"Client {args.client_idx}: [WATCHER] Encontro {enc_id} detectado! "
+                            f"ETC={etc_display}s, timeout={poll_timeout}s. "
+                            f"Pausando treino para D-PSGD."
+                        )
+
+                        # ── SNAPSHOT: Adquirir lock e copiar pesos ─────────
+                        # O treino libera o lock a cada batch, entao esta
+                        # aquisicao espera no maximo a duracao de 1 batch.
+                        with model_lock:
+                            if args.model == 'clip':
+                                snapshot = get_trainable_state_dict(model)
+                            else:
+                                snapshot = copy.deepcopy(model.state_dict())
+                        # Lock liberado: treino pode continuar enquanto
+                        # fazemos a troca P2P pela rede.
+
+                        logger.info(f"Client {args.client_idx}: [WATCHER] Snapshot dos pesos capturado. Treino retomado.")
+
+                        # ── ENVIO DE PESOS (TCP) ──────────────────────────
+                        other_clients = [c for c in clients_in_encounter if c != args.client_idx]
+
+                        for c in other_clients:
+                            target_host = f"fl-client-v2v-{c}"
+                            sent = False
+                            for attempt in range(poll_timeout):
+                                try:
+                                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                                        s.settimeout(2.0)
+                                        s.connect((target_host, 9000))
+                                        send_data(s, (args.client_idx, enc_id, snapshot))
+                                        sent = True
+                                        break
+                                except Exception as e:
+                                    if attempt % 10 == 0:
+                                        logger.warning(
+                                            f"Client {args.client_idx}: Tentativa {attempt+1}/{poll_timeout} "
+                                            f"para Cliente {c} falhou: {e}"
+                                        )
+                                    time.sleep(1)
+                            if not sent:
+                                logger.warning(f"Client {args.client_idx}: Falha ao enviar para Cliente {c} no encontro {enc_id}")
+
+                        # ── POLLING dos pesos dos vizinhos na MEMÓRIA ─────
+                        logger.info(f"Client {args.client_idx}: [WATCHER] Aguardando vizinhos {other_clients} (timeout={poll_timeout}s)...")
+
+                        all_received = False
+                        other_states = []
+
+                        for tick in range(poll_timeout):
+                            with in_memory_lock:
+                                enc_weights = in_memory_weights.get(enc_id, {})
+                                if all(c in enc_weights for c in other_clients):
+                                    all_received = True
+                                    other_states = [enc_weights[c] for c in other_clients]
+                                    break
+                            time.sleep(1)
+
+                        # ── AGREGACAO D-PSGD (Media Simples) ──────────────
+                        if all_received:
+                            logger.info(
+                                f"Client {args.client_idx}: [WATCHER] Pesos de {len(other_states)} "
+                                f"vizinhos recebidos! Aplicando consenso (Media)."
+                            )
+
+                            avg_state = {}
+                            for key in snapshot.keys():
+                                avg_state[key] = snapshot[key].clone()
+                                for neighbor_state in other_states:
+                                    avg_state[key] += neighbor_state[key].to(device)
+                                avg_state[key] = avg_state[key] / (1 + len(other_states))
+
+                            # Adquirir lock para aplicar pesos agregados no modelo
+                            with model_lock:
+                                if args.model == 'clip':
+                                    resize_model_to_pruned(model, avg_state)
+                                else:
+                                    model.load_state_dict(avg_state, strict=False)
+
+                            # Avaliar acurácia pós-agregação P2P para plotagem
+                            post_p2p_test_acc, _ = evaluate_model(model, test_loader)
+                            rs_post_p2p_acc.append(post_p2p_test_acc)
+                            rs_post_p2p_encounter_ids.append(enc_id)
+                            logger.info(
+                                f"Client {args.client_idx}: [WATCHER] Agregacao P2P do encontro {enc_id} concluida! "
+                                f"Post-P2P Acc: {post_p2p_test_acc:.2f}%"
+                            )
+
+                            # Limpar memoria
+                            with in_memory_lock:
+                                if enc_id in in_memory_weights:
+                                    del in_memory_weights[enc_id]
+
+                            # Sinalizar ao orquestrador
+                            done_file = encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
+                            done_file.touch()
+                        else:
+                            # ── FALLBACK: timeout expirado ────────────────
+                            logger.warning(
+                                f"Client {args.client_idx}: [WATCHER] Timeout no encontro {enc_id}. "
+                                f"Descartando rodada P2P."
+                            )
+                            # Sinalizar ao orquestrador mesmo no timeout
+                            # para nao travar a simulacao por 300s
+                            done_file = encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
+                            done_file.touch()
+
+                        # Marcar encontro como processado
+                        with encounter_counter_lock:
+                            last_processed_encounter = enc_id
+
+                    except Exception as e:
+                        logger.error(f"Erro processando encontro {ef}: {e}")
+
+        threading.Thread(target=encounter_watcher_thread, daemon=True).start()
+
+        # ── LOOP PRINCIPAL: TREINO CONTÍNUO ───────────────────────────────
+        # O treino roda continuamente. A thread watcher cuida dos encontros
+        # em paralelo, interrompendo o treino por batches conforme necessario.
         epoch = 1
         max_epochs = args.max_epochs if args.max_epochs > 0 else float('inf')
         while epoch <= max_epochs:
             logger.info(f"\n--- Iniciando Epoca {epoch}{f'/{args.max_epochs}' if args.max_epochs > 0 else ''} ---")
 
             # Obter o state_dict atual do modelo para usar como base do treino.
-            # Para CLIP, usa apenas os parametros treinaveis (LoRA/SoRA).
-            if args.model == 'clip':
-                dummy_state = get_trainable_state_dict(model)
+            # Para CLIP/SLM, usa apenas os parametros treinaveis (LoRA/SoRA).
+            if args.model in ['clip', 'slm']:
+                if args.model == 'slm':
+                    from lora_slm.sora import get_trainable_state_dict as get_trainable_state_dict_slm
+                    dummy_state = get_trainable_state_dict_slm(model)
+                else:
+                    from lora_clip.sora import get_trainable_state_dict as get_trainable_state_dict_clip
+                    dummy_state = get_trainable_state_dict_clip(model)
             else:
                 dummy_state = model.state_dict()
 
-            # ── TREINO LOCAL ─────────────────────────────────────────────
+            # ── TREINO LOCAL ──────────────────────────────────────────────
             # Acontece SEMPRE, independente de haver encontro ou nao.
-            # O modelo melhora continuamente com os dados locais.
+            # O model_lock e passado para que a CNN libere a trava a cada
+            # batch, permitindo a thread watcher interromper rapidamente.
             train_start = time.time()
             updated_state, personalized_acc = local_training(
                 model=model,
@@ -726,7 +1019,8 @@ def main():
                 alaarg=args.ala,
                 ala=ala,
                 model_type=args.model,
-                run_config=run_config if args.model == 'clip' else None
+                run_config=run_config if args.model in ['clip', 'slm'] else None,
+                model_lock=model_lock if args.model == 'cnn' else None,
             )
             client_training_time = time.time() - train_start
             logger.info(
@@ -734,133 +1028,7 @@ def main():
                 f"{client_training_time:.2f}s."
             )
 
-            # ── VERIFICAR SINAIS DE ENCONTRO ─────────────────────────────
-            # Apos o treino local, verificar se o orquestrador gerou algum
-            # sinal de encontro novo na pasta compartilhada.
-            if encounters_dir.exists():
-                encounter_files = list(encounters_dir.glob("encounter_*.json"))
-
-                # Funcao auxiliar para extrair o ID do encontro do JSON.
-                # Usada para ordenar os arquivos e processa-los na sequencia.
-                def extract_id(filepath):
-                    try:
-                        with open(filepath, "r") as json_f:
-                            return json.load(json_f).get("encounter_id", 0)
-                    except Exception:
-                        return 0
-
-                # Ordenar por ID para processar na sequencia correta
-                encounter_files.sort(key=extract_id)
-
-                for ef in encounter_files:
-                    try:
-                        with open(ef, "r") as f:
-                            data = json.load(f)
-
-                        enc_id = data.get("encounter_id", 0)
-                        clients_in_encounter = data.get("clients", [])
-
-                        # ── Ler ETC do JSON gerado pelo orquestrador ─────
-                        # O campo etc_seconds contem o Tempo Estimado de
-                        # Contato calculado via TraCI no momento do encontro.
-                        # Usado como timeout para o polling de pesos dos vizinhos.
-                        # Default de 60s caso o campo nao exista (compatibilidade).
-                        etc_seconds = data.get("etc_seconds", 60)
-
-                        # Verificar se:
-                        # 1. Este encontro e NOVO (ID > ultimo processado)
-                        # 2. Este cliente FAZ PARTE do encontro
-                        if enc_id > last_processed_encounter and args.client_idx in clients_in_encounter:
-
-                            # Calcular timeout de polling baseado no ETC.
-                            # Subtrair 5 segundos como margem de seguranca
-                            # para garantir que a agregacao complete antes
-                            # dos veiculos sairem do raio de comunicacao.
-                            # Minimo de 5 segundos para nao abortar instantaneamente.
-                            poll_timeout = max(5, int(etc_seconds - 5))
-
-                            logger.info(
-                                f"Client {args.client_idx}: Encontro {enc_id} detectado! "
-                                f"ETC={etc_seconds:.1f}s, timeout_polling={poll_timeout}s. "
-                                f"Iniciando D-PSGD."
-                            )
-
-                            # ── ENVIO DE PESOS (CLIENTE TCP) ─────────
-                            other_clients = [c for c in clients_in_encounter if c != args.client_idx]
-                            
-                            # Envia para todos os vizinhos
-                            for c in other_clients:
-                                target_host = f"fl-client-v2x-{c}"
-                                sent = False
-                                for attempt in range(poll_timeout):
-                                    try:
-                                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                                            s.settimeout(2.0)
-                                            s.connect((target_host, 9000))
-                                            # Envia (meu_id, id_do_encontro, pesos)
-                                            send_data(s, (args.client_idx, enc_id, updated_state))
-                                            sent = True
-                                            break
-                                    except Exception as e:
-                                        if attempt % 10 == 0:
-                                            logger.warning(f"Client {args.client_idx}: Tentativa {attempt+1}/{poll_timeout} para Cliente {c} falhou: {e}")
-                                        time.sleep(1)
-                                if not sent:
-                                    logger.warning(f"Client {args.client_idx}: Falha ao enviar para Cliente {c} no encontro {enc_id}")
-
-                            # ── POLLING dos pesos dos vizinhos na MEMÓRIA ───────────
-                            logger.info(f"Client {args.client_idx}: Aguardando vizinhos {other_clients} (timeout={poll_timeout}s)...")
-                            
-                            all_received = False
-                            other_states = []
-                            
-                            for tick in range(poll_timeout):
-                                with in_memory_lock:
-                                    enc_weights = in_memory_weights.get(enc_id, {})
-                                    if all(c in enc_weights for c in other_clients):
-                                        all_received = True
-                                        other_states = [enc_weights[c] for c in other_clients]
-                                        break
-                                time.sleep(1)
-
-                            # ── AGREGACAO D-PSGD (Media Simples) ─────────
-                            if all_received:
-                                logger.info(f"Client {args.client_idx}: Pesos de {len(other_states)} vizinhos recebidos via rede! Aplicando consenso (Media).")
-                                
-                                avg_state = {}
-                                for key in updated_state.keys():
-                                    avg_state[key] = updated_state[key].clone()
-                                    for neighbor_state in other_states:
-                                        avg_state[key] += neighbor_state[key].to(device)
-                                    avg_state[key] = avg_state[key] / (1 + len(other_states))
-
-                                if args.model == 'clip':
-                                    resize_model_to_pruned(model, avg_state)
-                                else:
-                                    model.load_state_dict(avg_state, strict=False)
-
-                                logger.info(f"Client {args.client_idx}: Agregacao P2P do encontro {enc_id} concluida com sucesso.")
-                                
-                                # Limpar memória para não vazar RAM
-                                with in_memory_lock:
-                                    if enc_id in in_memory_weights:
-                                        del in_memory_weights[enc_id]
-                                        
-                                # Sinaliza ao orquestrador que terminou criando arquivo vazio
-                                done_file = encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
-                                done_file.touch()
-                            else:
-                                # ── FALLBACK: timeout expirado ───────────
-                                logger.warning(f"Client {args.client_idx}: Timeout (ETC expirado) no encontro {enc_id}. Descartando rodada P2P.")
-
-                            # Marcar este encontro como processado para nao
-                            # tentar novamente na proxima epoca
-                            last_processed_encounter = enc_id
-
-                    except Exception as e:
-                        logger.error(f"Erro processando encontro {ef}: {e}")
-
-            # ── AVALIACAO POS-EPOCA ──────────────────────────────────────
+            # ── AVALIACAO POS-EPOCA ───────────────────────────────────────
             # Avaliar o modelo (com ou sem agregacao P2P) nos dados locais
             local_test_acc, local_test_loss = evaluate_model(model, test_loader)
             train_accuracy, train_loss = evaluate_model(model, train_loader)
@@ -878,6 +1046,8 @@ def main():
                 args, rs_global_acc, rs_global_loss, rs_ala_acc,
                 rs_local_acc, rs_train_acc,
                 idx=args.client_idx, argalgo=args.ala,
+                rs_post_p2p_acc=rs_post_p2p_acc,
+                rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
             )
 
             epoch += 1

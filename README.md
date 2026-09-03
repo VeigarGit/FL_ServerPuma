@@ -255,9 +255,9 @@ tmux kill-server
 
 ---
 
-## 🚀 Method 3: V2X-Docker Execution
+## 🚀 Method 3: V2V-Docker Execution
 
-This method simulates **Vehicular Federated Learning (V2X)** using [SUMO](https://eclipse.dev/sumo/) for urban vehicle mobility and Docker containers as decentralized FL clients. Vehicles train locally and exchange model weights via **D-PSGD (Decentralized Parallel SGD)** when they come within communication range; no central server is required.
+This method simulates **Vehicular Federated Learning (V2V)** using [SUMO](https://eclipse.dev/sumo/) for urban vehicle mobility and Docker containers as decentralized FL clients. Vehicles train locally and exchange model weights via **D-PSGD (Decentralized Parallel SGD)** when they come within communication range; no central server is required.
 
 ### Prerequisites
 
@@ -318,11 +318,11 @@ sg docker -c "uv run python3 sumo_docker_orchestrator.py \
 | `--gui` | Open SUMO graphical interface | headless |
 | `--step-length` | Duration of each SUMO step in seconds | `1.0` |
 
-**V2X Communication:**
+**V2V Communication:**
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--radius` | V2X communication radius in meters | `300` |
+| `--radius` | V2V communication radius in meters | `300` |
 | `--min-clients` | Minimum vehicles to form a cluster | `2` |
 | `--min-contact-time` | Minimum ETC (seconds) to trigger encounter | `6.0` |
 
@@ -358,7 +358,7 @@ The orchestrator prints real-time logs showing encounter formation, ETC values, 
 
 To inspect individual container logs during execution:
 ```bash
-sg docker -c "docker compose -f docker-compose.v2x.yml logs -f fl-client-v2x-0"
+sg docker -c "docker compose -f docker-compose.v2x.yml logs -f fl-client-v2v-0"
 ```
 
 ## 🚀 Method 4: Manual Execution

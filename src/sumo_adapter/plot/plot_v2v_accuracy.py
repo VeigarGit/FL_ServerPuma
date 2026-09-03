@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-plot_v2x_accuracy.py
+plot_v2v_accuracy.py
 =====================
 Gera graficos a partir dos resultados HDF5 salvos pelos clientes:
 
-1. Acuracia individual de cada cliente ao longo das epocas (V2X)
-2. Comparacao da media de acuracia entre cenario V2X e cenario centralizado
+1. Acuracia individual de cada cliente ao longo das epocas (V2V)
+2. Comparacao da media de acuracia entre cenario V2V e cenario centralizado
 
 Uso:
     cd FL_ServerPuma/
-    uv run python3 src/sumo_adapter/plot/plot_v2x_accuracy.py
+    uv run python3 src/sumo_adapter/plot/plot_v2v_accuracy.py
 
     # Especificando pastas:
-    uv run python3 src/sumo_adapter/plot/plot_v2x_accuracy.py \
-        --v2x-dir src/results/default_exp \
+    uv run python3 src/sumo_adapter/plot/plot_v2v_accuracy.py \
+        --v2v-dir src/results/default_exp \
         --centralized-dir src/results/centralized_exp
 
-Os graficos sao salvos como PDF no diretorio de resultados do experimento V2X.
+Os graficos sao salvos como PDF no diretorio de resultados do experimento V2V.
 """
 
 import argparse
@@ -85,7 +85,7 @@ def _save_and_close(fig, output_dir, filename):
     path = os.path.join(str(output_dir), filename)
     fig.savefig(path, dpi=150)
     plt.close(fig)
-    print(f"  📊 {path}")
+    print(f"{path}")
 
 
 # ==============================================================================
@@ -133,14 +133,14 @@ def load_results_from_dir(results_dir: Path) -> dict[int, dict]:
 
 
 # ==============================================================================
-# 01 - Acurácia Individual por Cliente (V2X)
+# 01 - Acurácia Individual por Cliente (V2V)
 # ==============================================================================
 
-def plot_individual_accuracy(v2x_clients: dict[int, dict], output_dir: Path):
-    """Acuracia de teste de cada cliente V2X ao longo das epocas."""
+def plot_individual_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
+    """Acuracia de teste de cada cliente V2V ao longo das epocas."""
     fig, ax = plt.subplots(figsize=(12, 7))
 
-    for i, (client_idx, data) in enumerate(sorted(v2x_clients.items())):
+    for i, (client_idx, data) in enumerate(sorted(v2v_clients.items())):
         s = STYLES[i % len(STYLES)]
         epochs = np.arange(1, len(data["local_acc"]) + 1)
 
@@ -154,7 +154,7 @@ def plot_individual_accuracy(v2x_clients: dict[int, dict], output_dir: Path):
             label=f"Client {client_idx}",
         )
 
-    _set_title(ax, "Per-Client Accuracy — V2X Decentralized Scenario")
+    _set_title(ax, "Per-Client Accuracy — V2V Decentralized Scenario")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Accuracy (%)")
     from matplotlib.ticker import MaxNLocator
@@ -162,7 +162,7 @@ def plot_individual_accuracy(v2x_clients: dict[int, dict], output_dir: Path):
     ax.legend()
     ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    _save_and_close(fig, output_dir, "v2x_accuracy_per_client.pdf")
+    _save_and_close(fig, output_dir, "v2v_accuracy_per_client.pdf")
 
 
 
@@ -170,11 +170,11 @@ def plot_individual_accuracy(v2x_clients: dict[int, dict], output_dir: Path):
 # 02 - Acurácia Pós-Agregação P2P por Cliente
 # ==============================================================================
 
-def plot_post_p2p_accuracy(v2x_clients: dict[int, dict], output_dir: Path):
+def plot_post_p2p_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
     """Acuracia de teste de cada cliente imediatamente apos cada agregacao P2P."""
     # Filtrar clientes que possuem dados de agregacao P2P
     clients_with_p2p = {
-        idx: data for idx, data in v2x_clients.items()
+        idx: data for idx, data in v2v_clients.items()
         if len(data.get("post_p2p_acc", [])) > 0
     }
 
@@ -199,7 +199,7 @@ def plot_post_p2p_accuracy(v2x_clients: dict[int, dict], output_dir: Path):
             label=f"Client {client_idx}",
         )
 
-    _set_title(ax, "Post-P2P Aggregation Accuracy — V2X Decentralized")
+    _set_title(ax, "Post-P2P Aggregation Accuracy — V2V Decentralized")
     ax.set_xlabel("Encounter ID")
     ax.set_ylabel("Accuracy (%)")
     from matplotlib.ticker import MaxNLocator
@@ -207,47 +207,47 @@ def plot_post_p2p_accuracy(v2x_clients: dict[int, dict], output_dir: Path):
     ax.legend()
     ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    _save_and_close(fig, output_dir, "v2x_post_p2p_accuracy.pdf")
+    _save_and_close(fig, output_dir, "v2v_post_p2p_accuracy.pdf")
 
 
 # ==============================================================================
-# 03 - Comparação V2X vs Centralizado (Média de Acurácia)
+# 03 - Comparação V2V vs Centralizado (Média de Acurácia)
 # ==============================================================================
 
 def plot_comparison(
-    v2x_clients: dict[int, dict],
+    v2v_clients: dict[int, dict],
     centralized_clients: dict[int, dict],
     output_dir: Path,
 ):
-    """Comparacao da media de acuracia V2X vs Centralizado."""
+    """Comparacao da media de acuracia V2V vs Centralizado."""
     fig, ax = plt.subplots(figsize=(12, 7))
 
-    # ── Calcular media V2X ────────────────────────────────────────────────
-    if v2x_clients:
-        max_epochs_v2x = max(len(d["local_acc"]) for d in v2x_clients.values())
-        v2x_matrix = np.full((len(v2x_clients), max_epochs_v2x), np.nan)
-        for i, (_, data) in enumerate(sorted(v2x_clients.items())):
+    # ── Calcular media V2V ────────────────────────────────────────────────
+    if v2v_clients:
+        max_epochs_v2v = max(len(d["local_acc"]) for d in v2v_clients.values())
+        v2v_matrix = np.full((len(v2v_clients), max_epochs_v2v), np.nan)
+        for i, (_, data) in enumerate(sorted(v2v_clients.items())):
             n = len(data["local_acc"])
-            v2x_matrix[i, :n] = data["local_acc"]
+            v2v_matrix[i, :n] = data["local_acc"]
 
-        v2x_mean = np.nanmean(v2x_matrix, axis=0)
-        v2x_std = np.nanstd(v2x_matrix, axis=0)
-        epochs_v2x = np.arange(1, max_epochs_v2x + 1)
+        v2v_mean = np.nanmean(v2v_matrix, axis=0)
+        v2v_std = np.nanstd(v2v_matrix, axis=0)
+        epochs_v2v = np.arange(1, max_epochs_v2v + 1)
 
         s = STYLES[0]
         ax.plot(
-            epochs_v2x,
-            v2x_mean,
+            epochs_v2v,
+            v2v_mean,
             color=s['color'],
             marker=s['marker'],
-            markevery=_mark_every(len(v2x_mean)),
+            markevery=_mark_every(len(v2v_mean)),
             linestyle=s['ls'],
-            label="V2X Decentralized",
+            label="V2V Decentralized",
         )
         ax.fill_between(
-            epochs_v2x,
-            v2x_mean - v2x_std,
-            v2x_mean + v2x_std,
+            epochs_v2v,
+            v2v_mean - v2v_std,
+            v2v_mean + v2v_std,
             alpha=0.1,
             color=s['color'],
         )
@@ -290,7 +290,7 @@ def plot_comparison(
             color="#999", ha="center", va="center", style="italic",
         )
 
-    _set_title(ax, "V2X Decentralized vs Centralized")
+    _set_title(ax, "V2V Decentralized vs Centralized")
     ax.set_xlabel("Epoch / Round")
     ax.set_ylabel("Average Test Accuracy (%)")
     ax.set_ylim(0, 100)
@@ -299,7 +299,7 @@ def plot_comparison(
     ax.legend()
     ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
-    _save_and_close(fig, output_dir, "v2x_vs_centralized.pdf")
+    _save_and_close(fig, output_dir, "v2v_vs_centralized.pdf")
 
 
 # ==============================================================================
@@ -308,13 +308,13 @@ def plot_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plotar acuracia dos clientes V2X e comparar com centralizado",
+        description="Plotar acuracia dos clientes V2V e comparar com centralizado",
     )
     parser.add_argument(
-        "--v2x-dir",
+        "--v2v-dir",
         type=str,
-        default="src/results/default_exp_v2x",
-        help="Diretorio com os .h5 dos clientes V2X (default: src/results/default_exp_v2x)",
+        default="src/results/default_exp_v2v",
+        help="Diretorio com os .h5 dos clientes V2V (default: src/results/default_exp_v2v)",
     )
     parser.add_argument(
         "--centralized-dir",
@@ -326,24 +326,24 @@ def main():
 
     # Resolver caminhos relativos a partir da raiz do projeto
     project_root = Path(__file__).resolve().parents[3]
-    v2x_dir = project_root / args.v2x_dir
+    v2v_dir = project_root / args.v2v_dir
     centralized_dir = project_root / args.centralized_dir
 
-    # Salvar graficos na pasta de resultados do experimento V2X
+    # Salvar graficos na pasta de resultados do experimento V2V
     output_dir = Path(__file__).resolve().parent
 
-    print(f"Diretorio V2X:          {v2x_dir}")
+    print(f"Diretorio V2V:          {v2v_dir}")
     print(f"Diretorio Centralizado: {centralized_dir}")
     print(f"Saida:                  {output_dir}")
     print()
 
     # ── Carregar dados ────────────────────────────────────────────────────
-    print("Carregando resultados V2X...")
-    v2x_clients = load_results_from_dir(v2x_dir)
-    if not v2x_clients:
-        print("  [ERRO] Nenhum arquivo .h5 encontrado em:", v2x_dir)
+    print("Carregando resultados V2V...")
+    v2v_clients = load_results_from_dir(v2v_dir)
+    if not v2v_clients:
+        print("  [ERRO] Nenhum arquivo .h5 encontrado em:", v2v_dir)
         sys.exit(1)
-    for idx, data in sorted(v2x_clients.items()):
+    for idx, data in sorted(v2v_clients.items()):
         p2p_info = f", {len(data['post_p2p_acc'])} encontros P2P" if len(data.get('post_p2p_acc', [])) > 0 else ""
         print(f"  Cliente {idx}: {len(data['local_acc'])} epocas{p2p_info}, "
               f"ultima acc={data['local_acc'][-1]:.2f}%")
@@ -353,7 +353,7 @@ def main():
     centralized_clients = load_results_from_dir(centralized_dir)
     if not centralized_clients:
         print("  [INFO] Nenhum arquivo .h5 centralizado encontrado.")
-        print("         O grafico comparativo mostrara apenas V2X.")
+        print("         O grafico comparativo mostrara apenas V2V.")
     else:
         for idx, data in sorted(centralized_clients.items()):
             print(f"  Cliente {idx}: {len(data['local_acc'])} rodadas, "
@@ -362,9 +362,9 @@ def main():
     # ── Gerar graficos ────────────────────────────────────────────────────
     print()
     print("Gerando graficos...")
-    plot_individual_accuracy(v2x_clients, output_dir)
-    plot_post_p2p_accuracy(v2x_clients, output_dir)
-    plot_comparison(v2x_clients, centralized_clients, output_dir)
+    plot_individual_accuracy(v2v_clients, output_dir)
+    plot_post_p2p_accuracy(v2v_clients, output_dir)
+    plot_comparison(v2v_clients, centralized_clients, output_dir)
     print("\nConcluido!")
 
 
