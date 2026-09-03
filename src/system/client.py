@@ -315,7 +315,7 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
 
 
 
-def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0):
+def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0, rs_post_p2p_acc=None, rs_post_p2p_encounter_ids=None):
     b = "FedALA" if argalgo == 0 else "FedAVG"
     
     paca_val = args.paca if (isinstance(args.paca, (int, float)) and not isinstance(args.paca, bool) and args.paca > 0) else 0
@@ -337,6 +337,10 @@ def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, 
             hf.create_dataset('rs_ala_acc', data=rs_ala_acc)
         hf.create_dataset('rs_local_acc', data=rs_local_acc)
         hf.create_dataset('rs_train_acc', data=rs_train_acc)
+        if rs_post_p2p_acc is not None and len(rs_post_p2p_acc) > 0:
+            hf.create_dataset('rs_post_p2p_acc', data=rs_post_p2p_acc)
+        if rs_post_p2p_encounter_ids is not None and len(rs_post_p2p_encounter_ids) > 0:
+            hf.create_dataset('rs_post_p2p_encounter_ids', data=rs_post_p2p_encounter_ids)
         hf.attrs['paca_used'] = paca_val
 
 def local_initialization(ala, received_global_model, model, mask=None):
@@ -525,6 +529,8 @@ def main():
     rs_ala_acc = []
     rs_local_acc = []
     rs_train_acc = []
+    rs_post_p2p_acc = []
+    rs_post_p2p_encounter_ids = []
     
     try:
         is_clip_flag = (args.model == 'clip')
@@ -940,7 +946,14 @@ def main():
                                 else:
                                     model.load_state_dict(avg_state, strict=False)
 
-                            logger.info(f"Client {args.client_idx}: [WATCHER] Agregacao P2P do encontro {enc_id} concluida!")
+                            # Avaliar acurácia pós-agregação P2P para plotagem
+                            post_p2p_test_acc, _ = evaluate_model(model, test_loader)
+                            rs_post_p2p_acc.append(post_p2p_test_acc)
+                            rs_post_p2p_encounter_ids.append(enc_id)
+                            logger.info(
+                                f"Client {args.client_idx}: [WATCHER] Agregacao P2P do encontro {enc_id} concluida! "
+                                f"Post-P2P Acc: {post_p2p_test_acc:.2f}%"
+                            )
 
                             # Limpar memoria
                             with in_memory_lock:
@@ -1033,6 +1046,8 @@ def main():
                 args, rs_global_acc, rs_global_loss, rs_ala_acc,
                 rs_local_acc, rs_train_acc,
                 idx=args.client_idx, argalgo=args.ala,
+                rs_post_p2p_acc=rs_post_p2p_acc,
+                rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
             )
 
             epoch += 1
