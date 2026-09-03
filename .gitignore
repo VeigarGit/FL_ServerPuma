@@ -50,3 +50,10 @@ docker-tc/
 *.pth
 *.pt
 *.log
+
+# =========================
+# Arquivos SUMO
+# =========================
+*.net.xml
+*.rou.xml
+*.sumocfg
