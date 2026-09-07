@@ -11,19 +11,18 @@ from pathlib import Path
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 22
-dir_path = "FGVCAircraft/"
+num_clients = 25
+dir_path = Path(__file__).parent / "FGVCAircraft"
 
 
 # Allocate data to users
-def generate_dataset(dir_path, num_clients, niid, balance, partition):
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+def generate_dataset(dir_path: Path, num_clients, niid, balance, partition):
+    dir_path.mkdir(parents=True, exist_ok=True)
         
     # Setup directory for train/test data
-    config_path = Path(dir_path) / "config.json"
-    train_path = Path(dir_path) / "train/"
-    test_path = Path(dir_path) / "test/"
+    config_path = dir_path / "config.json"
+    train_path = dir_path / "train"
+    test_path = dir_path / "test"
 
     if check(config_path, train_path, test_path, num_clients, niid, balance, partition):
         return
@@ -40,7 +39,7 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
 
     def load_data(split="train"):
         trainset = torchvision.datasets.FGVCAircraft(
-            root=dir_path+"rawdata", split=split, download=True, transform=transform)
+            root=str(dir_path / "rawdata"), split=split, download=True, transform=transform)
         
         total = len(trainset)
         for i in range(total):
@@ -68,8 +67,10 @@ def generate_dataset(dir_path, num_clients, niid, balance, partition):
 
 
 if __name__ == "__main__":
-    niid = True if sys.argv[1] == "noniid" else False
-    balance = True if sys.argv[2] == "balance" else False
-    partition = sys.argv[3] if sys.argv[3] != "-" else None
+    niid = True if len(sys.argv) > 1 and sys.argv[1] == "noniid" else False
+    balance = True if len(sys.argv) > 2 and sys.argv[2] == "balance" else False
+    partition = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] != "-" else None
+    if len(sys.argv) > 4 and sys.argv[4].isdigit():
+        num_clients = int(sys.argv[4])
 
     generate_dataset(dir_path, num_clients, niid, balance, partition)
