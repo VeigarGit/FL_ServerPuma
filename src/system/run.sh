@@ -15,19 +15,20 @@ cd "$SCRIPT_DIR" || exit 1
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
 
-# Previne que o PyTorch tente usar todos os núcleos (100+ threads) para cada um dos 10 clientes, o que causa Thrashing
-export OMP_NUM_THREADS=4
-export MKL_NUM_THREADS=4
-export OPENBLAS_NUM_THREADS=4
-export VECLIB_MAXIMUM_THREADS=4
-export NUMEXPR_NUM_THREADS=4
+# Previne que o PyTorch tente usar todos os núcleos (100+ threads) para cada um dos clientes, o que causa Thrashing
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export TOKENIZERS_PARALLELISM=false
 
 # Compilador C: necessário para o Triton (JIT de kernels CUDA em modelos Transformers)
-if [ -z "$CC" ] && ! command -v cc &>/dev/null && ! command -v gcc &>/dev/null; then
-    echo "[ERRO] Compilador C (gcc/cc) não encontrado. Ele é essencial para o JIT do Triton/PyTorch."
-    echo "Instale-o usando seu gerenciador de pacotes (ex: sudo apt install build-essential)."
-    exit 1
-fi
+# if [ -z "$CC" ] && ! command -v cc &>/dev/null && ! command -v gcc &>/dev/null; then
+#     echo "[ERRO] Compilador C (gcc/cc) não encontrado. Ele é essencial para o JIT do Triton/PyTorch."
+#     echo "Instale-o usando seu gerenciador de pacotes (ex: sudo apt install build-essential)."
+#     exit 1
+# fi
 
 # ---- Valores Padrão ----
 
@@ -43,7 +44,7 @@ CLIENT_COUNT=2
 ROUNDS=5
 DATASET="MNIST"
 BATCH_SIZE=32
-MAX_CLIENTS=22
+MAX_CLIENTS=25
 SIMULATIONS=1
 START_RUN=1
 EXP_NAME_OVERRIDE=""
@@ -383,13 +384,13 @@ if [ -n "$EXP_NAME_OVERRIDE" ]; then
     EXP_NAME="$EXP_NAME_OVERRIDE"
 else
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca"
+        EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca"
     elif [ "$RANDOM_PACA" -eq 1 ]; then
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_randompaca"
+        EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_randompaca"
     elif [ -n "$PACA_LIST" ]; then
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_pacalist"
+        EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_pacalist"
     else
-        EXP_NAME="${SESSION_NAME}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_paca${PACA}"
+        EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_paca${PACA}"
     fi
     # Sufixo de compressão LHDQ
     if [ "$DELTA_CODING" -eq 1 ]; then
@@ -419,7 +420,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
     mkdir -p "$LOG_DIR"
 
     # Comando do servidor
-    SERVER_CMD="CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py \
+    SERVER_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py \
         --host $HOST \
         --port $PORT \
         --clients-per-round $CLIENT_COUNT \
@@ -499,7 +500,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py \
+        CLIENT_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py \
             --client-idx $i \
             --host $HOST \
             --port $PORT \

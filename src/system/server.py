@@ -86,6 +86,11 @@ def get_state_dict_size_mb(state):
         for v in state.values():
             if isinstance(v, torch.Tensor):
                 total_bytes += v.numel() * v.element_size()
+            elif isinstance(v, dict) and v.get('dtype') == 'quantized_int8':
+                if 'weights' in v and isinstance(v['weights'], torch.Tensor):
+                    total_bytes += v['weights'].numel() * v['weights'].element_size()
+                if 'scale' in v and isinstance(v['scale'], torch.Tensor):
+                    total_bytes += v['scale'].numel() * v['scale'].element_size()
             elif isinstance(v, (int, float)):
                 total_bytes += 8
     return total_bytes / (1024 * 1024)
