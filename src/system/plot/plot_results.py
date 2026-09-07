@@ -103,8 +103,13 @@ def _save_and_close(fig, output_dir, filename):
 # Funções de carregamento
 # ==============================================================================
 
-def parse_experiment(exp_name, results_base="../../results"):
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_RESULTS_BASE = os.path.normpath(os.path.join(SCRIPT_DIR, '..', '..', 'results'))
+
+def parse_experiment(exp_name, results_base=None):
     """Analisa um diretório de experimento e retorna seus metadados + dados."""
+    if results_base is None:
+        results_base = DEFAULT_RESULTS_BASE
     results_dir = os.path.join(results_base, exp_name)
     if not os.path.isdir(results_dir):
         print(f"⚠️ Diretório não encontrado: {results_dir}")
@@ -148,7 +153,7 @@ def parse_experiment(exp_name, results_base="../../results"):
         if "adaptpaca" in exp_name.lower():
             label = f"PUMA-GT{rank_str}"
         else:
-            label = f"Static SoRa{rank_str}"
+            label = f"Static SoRA{rank_str}"
     elif "lora" in exp_name.lower():
         label = f"LoRA{rank_str}"
     else:
@@ -190,7 +195,10 @@ def _load_server_h5(files):
     for f in files:
         with h5py.File(f, 'r') as hf:
             acc.append(np.array(hf['rs_test_acc']))
-            loss.append(np.array(hf['rs_train_loss']))
+            loss_arr = np.array(hf['rs_train_loss']) if 'rs_train_loss' in hf else (
+                np.array(hf['rs_test_loss']) if 'rs_test_loss' in hf else np.zeros_like(np.array(hf['rs_test_acc']))
+            )
+            loss.append(loss_arr)
             mb.append(np.array(hf['sended_model_Mb']))
             mb_bruto.append(np.array(hf['Sended_without_quant']))
             time_.append(np.array(hf['Round_time']))
@@ -967,14 +975,33 @@ def plot_15_mb_vs_tempo(experiments, output_dir):
 # ==============================================================================
 
 # ==============================================================================
-# Experimentos para plotar (Adicione ou remova itens desta lista)
+# Experimentos para plotar (Mapeamento dos experimentos recentes por dataset)
 # ==============================================================================
-EXPERIMENTOS_PARA_PLOTAR = [
-    "1_lora_padrao_clip_lora_prune1_ala1_paca12_20260801_180443",
-    "2_sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260802_011456",
-    "3_pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260802_095514",
-    # "pumagt_adap_rank_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260805_183756"
-]
+DATASET_EXPERIMENTS = {
+    "OxfordPets": [
+        "fl_puma_clip_lora_prune1_ala1_paca12",
+        "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_paca12",
+        "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ],
+    "Flowers102": [
+        "fl_puma_Flowers102_clip_lora_prune1_ala1_paca12",
+        "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_paca12",
+        "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ],
+    "DTD": [
+        "fl_puma_DTD_clip_lora_prune1_ala1_paca12",
+        "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_paca12",
+        "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ],
+    "FGVCAircraft": [
+        "fl_puma_FGVCAircraft_clip_lora_prune1_ala1_paca12",
+        "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_paca12",
+        "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ],
+}
+
+# Configuração ativa: execuções do OxfordPets (LoRA, SoRA e PUMA-GT)
+EXPERIMENTOS_PARA_PLOTAR = DATASET_EXPERIMENTS["OxfordPets"]
 
 def main():
     exp_names = EXPERIMENTOS_PARA_PLOTAR
@@ -1007,7 +1034,7 @@ def main():
     if len(experiments) == 1:
         output_dir = os.path.join(experiments[0]['results_dir'], "graficos")
     else:
-        output_dir = os.path.join("..", "..", "results", "graficos_comparativos")
+        output_dir = os.path.join(DEFAULT_RESULTS_BASE, "graficos_comparativos")
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n{'='*60}")
