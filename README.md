@@ -52,6 +52,9 @@ Regardless of the execution method, the environment must be synced and the parti
 
    # Example with Cifar100
    uv run python src/dataset/generate_Cifar100.py noniid - dir
+
+   # Example with Flowers102
+   uv run python src/dataset/generate_Flowers102.py noniid - dir
    ```
 
 > **⚠️ Important:** The number of data partitions is defined by the `num_clients` variable **inside each dataset generator script** (e.g., `generate_MNIST.py`). Make sure this value matches or exceeds the `--clients` count you plan to use in Docker Compose. Otherwise, some clients will have no data and the experiment will fail.
@@ -125,6 +128,9 @@ chmod +x run.sh    # apenas na primeira vez
 
 # Exemplo com SoRA + PaCA adaptativo
 ./run.sh --model clip --strategy sora_with_schedule --adaptive-paca --sora-prune --rounds 50
+
+# Exemplo com CLIP + LoRA em múltiplos rounds e simulações (Flowers102)
+./run.sh --simulations 10 --clients 25 --strategy lora --model clip --rounds 150 --dataset Flowers102 --auto-next --skip-train-eval --num-classes 102 -did 0
 ```
 
 ### 📖 Argumentos do `run.sh`
@@ -140,7 +146,7 @@ chmod +x run.sh    # apenas na primeira vez
 
 | Flag | Descrição | Padrão |
 |------|-----------|--------|
-| `-s`, `--session` | Nome da sessão tmux | `david` |
+| `-s`, `--session` | Nome da sessão tmux | `fl_puma` |
 | `--simulations` | Número de simulações sequenciais | `1` |
 | `--start-run` | Índice da primeira simulação | `1` |
 | `--exp-name` | Nome customizado do experimento | auto-gerado |
@@ -152,9 +158,9 @@ chmod +x run.sh    # apenas na primeira vez
 |------|-----------|--------|
 | `-c`, `--clients` | Número de clientes | `2` |
 | `-r`, `--rounds` | Número de rodadas | `5` |
-| `-d`, `--dataset` | Dataset (`MNIST`, `Cifar10`, `Cifar100`, `OxfordPets`) | `MNIST` |
+| `-d`, `--dataset` | Dataset (`MNIST`, `Cifar10`, `Cifar100`, `OxfordPets`, `Flowers102`, etc. — qualquer um com `generate_<Nome>.py`) | `MNIST` |
 | `--batch-size` | Tamanho do batch | `32` |
-| `--max-clients` | Máximo de clientes permitidos | `22` |
+| `--max-clients` | Máximo de clientes permitidos | `25` |
 | `--ala` | 0=FedALA, 1=FedAvg | `1` |
 
 **Modelo:**
@@ -193,13 +199,21 @@ chmod +x run.sh    # apenas na primeira vez
 | `--paca-max` | PaCA máximo (modo aleatório) | `12` |
 | `--paca-list` | Lista de PaCA por cliente (ex: `"4,8,12"`) | — |
 
-**Arquitetura CNN:**
+**Rank Adaptativo:**
 
 | Flag | Descrição | Padrão |
 |------|-----------|--------|
-| `--in-features` | Canais de entrada | `3` |
-| `--dim` | Dimensão intermediária | `1600` |
-| `--num-classes` | Número de classes | `10` |
+| `--adaptive-rank` | Habilitar rank adaptativo no servidor | desabilitado |
+| `--adaptive-rank-min` | Rank mínimo no rank adaptativo | `2` |
+| `--adaptive-rank-max` | Rank máximo no rank adaptativo | `8` |
+
+**Arquitetura e Classificação:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `--in-features` | Canais de entrada (CNN) | `3` |
+| `--dim` | Dimensão intermediária (CNN) | `1600` |
+| `--num-classes` | Número de classes (ex: `10` p/ MNIST/Cifar10, `37` p/ OxfordPets, `102` p/ Flowers102) | `10` |
 | `-t`, `--test-client-idx` | Índice do cliente de teste | `0` |
 
 **Persistência de Modelo:**
@@ -208,6 +222,19 @@ chmod +x run.sh    # apenas na primeira vez
 |------|-----------|--------|
 | `--save [path]` | Salvar modelo (path opcional) | desabilitado |
 | `--load [path]` | Carregar modelo (path opcional) | desabilitado |
+
+**Otimização de Avaliação:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `--skip-train-eval` | Pular avaliação no conjunto de treino pós-treinamento (acelera o fim da simulação) | desabilitado |
+| `--skip-post-eval` | Pular todas as avaliações pós-treino locais (mantém apenas Global Model Test Acc) | desabilitado |
+
+**Compressão:**
+
+| Flag | Descrição | Padrão |
+|------|-----------|--------|
+| `--delta-coding` | Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8 | desabilitado |
 
 ### 🖥️ Guia Rápido do Tmux
 
