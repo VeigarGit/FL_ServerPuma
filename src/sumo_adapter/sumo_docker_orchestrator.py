@@ -571,6 +571,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     rejected_count = 0                             # Encontros rejeitados por ETC insuficiente
     event_log: list[V2VEvent] = []                 # Log de todos os eventos V2V
     prev_cluster_key: frozenset[str] | None = None # Chave do cluster anterior (para detectar mudanca)
+    pair_encounter_counts: dict[frozenset[str], int] = {} # Contador de encontros por cluster
     veh_to_client_idx: dict[str, int] = {}         # Mapa veiculo SUMO -> indice do conteiner
     next_client_idx = 0                            # Proximo indice de conteiner disponivel
     last_encounter_time = -float('inf')            # Timestamp SUMO do ultimo encontro (para cooldown)
@@ -638,6 +639,14 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     veh_names = [v.veh_id for v in best_cluster]
                     c_indices = [veh_to_client_idx[v] for v in veh_names]
 
+                    # ── Verificar Limite de Encontros por Par ─────────────
+                    if args.max_encounters_per_pair > 0:
+                        count = pair_encounter_counts.get(cluster_key, 0)
+                        if count >= args.max_encounters_per_pair:
+                            # Ignorar este cluster, pois ja se encontraram o maximo permitido
+                            prev_cluster_key = cluster_key
+                            continue
+
                     # ── Calcular ETC do cluster ───────────────────────────
                     etc = cluster_etc(best_cluster, args.radius)
 
@@ -670,12 +679,14 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
                     # ── ETC suficiente: gerar sinal de encontro ───────────
                     encounter_count += 1
+                    pair_encounter_counts[cluster_key] = pair_encounter_counts.get(cluster_key, 0) + 1
 
                     etc_display = f"{etc}" if isinstance(etc, str) else f"{etc:.1f}s"
                     log.info(
-                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%s",
+                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%s | (Vezes: %d)",
                         encounter_count, args.encounters,
                         veh_names, c_indices, etc_display,
+                        pair_encounter_counts[cluster_key],
                     )
 
                     # Montar dados do encontro com ETC para os clientes usarem
@@ -845,6 +856,10 @@ def main():
     parser.add_argument(
         "--encounters", type=int, default=4,
         help="Numero maximo de encontros VIAVEIS para terminar a simulacao (default: 4)",
+    )
+    parser.add_argument(
+        "--max-encounters-per-pair", type=int, default=0,
+        help="Numero maximo de encontros permitidos entre o mesmo par/cluster de veiculos. 0 = sem limite (default: 0)",
     )
     parser.add_argument(
         "--radius", type=float, default=DEFAULT_COMM_RADIUS,
