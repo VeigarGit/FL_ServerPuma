@@ -98,6 +98,9 @@ def get_state_dict_size_mb(state):
 class FederatedLearningServer:
     def __init__(self, args):
         self.args = args
+        self.config = None
+        self.slm_collator = None
+        self.test_loaders_cache = {}
         
         # Uso do Structural Pattern Matching (Substituindo a cadeia de IFs)
         match args.model:
@@ -120,6 +123,7 @@ class FederatedLearningServer:
                     config = load_config(args.config)
                 else:
                     config = load_config_slm(args.config)
+                self.config = config
                 
                 # --- INÍCIO DA SOBRESCRITA DA ESTRATÉGIA ---
                 # Pega a flag do terminal (--strategy) e força o modo no dicionário do YAML
@@ -172,6 +176,17 @@ class FederatedLearningServer:
                         device=args.device
                     )
                     self.input_size = None # SLM usa o processor
+                    
+                    try:
+                        from lora_slm.slm_setup import CustomCollator
+                        from transformers import AutoProcessor
+                        model_name = self.config.get("model", {}).get("name", "Qwen/Qwen3-VL-2B-Instruct") if self.config else "Qwen/Qwen3-VL-2B-Instruct"
+                        processor = AutoProcessor.from_pretrained(model_name)
+                        label_to_idx = {i: i for i in range(1000)}
+                        label_to_idx.update({str(i): i for i in range(1000)})
+                        self.slm_collator = CustomCollator(processor, label_to_idx)
+                    except Exception as e:
+                        logger.warning(f"Não foi possível pré-carregar CustomCollator para SLM na inicialização: {e}")
                         
                         
         if args.load_model:
@@ -253,7 +268,9 @@ class FederatedLearningServer:
         self.client_masks = {}
         
         self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
-        if self.test_loader is None:
+        if self.test_loader is not None:
+            self.test_loaders_cache[args.test_client_idx if args.test_client_idx is not None else 0] = self.test_loader
+        else:
             logger.warning("Could not load test data. Evaluation will be skipped.")
 
     def aggregate_models(self, model_list, global_model, client_weights=None):
@@ -1134,12 +1151,66 @@ class FederatedLearningServer:
         finally:
             self.clients_info[client_id]['socket_lock'].release()
 
+    def _prepare_slm_test_loader(self, X, y, batch_size=32):
+        from PIL import Image
+        import numpy as np
+        
+        if not hasattr(self, 'slm_collator') or self.slm_collator is None:
+            from lora_slm.slm_setup import CustomCollator
+            from transformers import AutoProcessor
+            model_name = getattr(self, 'config', {}).get("model", {}).get("name", "Qwen/Qwen3-VL-2B-Instruct") if getattr(self, 'config', None) else "Qwen/Qwen3-VL-2B-Instruct"
+            processor = AutoProcessor.from_pretrained(model_name)
+            label_to_idx = {i: i for i in range(1000)}
+            label_to_idx.update({str(i): i for i in range(1000)})
+            self.slm_collator = CustomCollator(processor, label_to_idx)
+            
+        slm_data = []
+        for x_tensor, y_tensor in zip(X, y):
+            x_tensor = x_tensor.cpu().float()
+            
+            # Se o tensor vier com normalização do CLIP (valores negativos < -0.1)
+            if x_tensor.min() < -0.1:
+                clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
+                clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
+                if x_tensor.shape[0] == 3:
+                    x_tensor = x_tensor * clip_std + clip_mean
+                else:
+                    x_tensor = x_tensor * 0.5 + 0.5
+            elif x_tensor.min() < 0:
+                # Normalização padrão [-1, 1]
+                x_tensor = x_tensor * 0.5 + 0.5
+                
+            if x_tensor.max() <= 1.0:
+                x_tensor = x_tensor * 255.0
+                
+            # Clamp to [0, 255] range
+            x_tensor = torch.clamp(x_tensor, 0, 255)
+            x_numpy = x_tensor.byte().numpy()
+            
+            if x_numpy.shape[0] in [1, 3]: # (C, H, W) -> (H, W, C)
+                x_numpy = np.transpose(x_numpy, (1, 2, 0))
+            if x_numpy.shape[-1] == 1:
+                x_numpy = np.squeeze(x_numpy, axis=-1)
+                
+            pil_img = Image.fromarray(x_numpy)
+            if pil_img.mode != "RGB":
+                pil_img = pil_img.convert("RGB")
+            
+            slm_data.append({"image": pil_img, "label": y_tensor.item()})
+            
+        pin_mem = True if hasattr(self.args, 'device') and torch.device(self.args.device).type == 'cuda' else False
+        return DataLoader(slm_data, batch_size=batch_size, shuffle=False, collate_fn=self.slm_collator, pin_memory=pin_mem)
+
     def load_test_data(self, dataset, client_idx=0, batch_size=32):
         try:
             test_data = read_client_data(dataset, client_idx if client_idx is not None else 0, is_train=False)
             X, y = zip(*test_data)
             X = torch.stack(X)
             y = torch.tensor(y)
+            
+            if getattr(self.args, 'model', 'cnn') == 'slm':
+                return self._prepare_slm_test_loader(X, y, batch_size)
+                
             if getattr(self.args, 'model', 'cnn') == 'clip':
                 import torchvision.transforms as T
                 if X.shape[-2:] != (224, 224):
@@ -1152,7 +1223,7 @@ class FederatedLearningServer:
                     normalize = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
                     X = normalize(X)
             dataset = torch.utils.data.TensorDataset(X, y)
-            return DataLoader(dataset, batch_size=batch_size)
+            return DataLoader(dataset, batch_size=batch_size, shuffle=False)
         except Exception as e:
             logger.exception("Error loading test data")
             return None
@@ -1353,24 +1424,39 @@ class FederatedLearningServer:
                         self.global_state = aggregated_state
                         self.global_model.load_state_dict(self.global_state, strict=False)
                     
-                    if self.test_loader is not None:
-                        total_correct_weight = 0.0
-                        total_loss_weight = 0.0
-                        total_samples = 0
-                        for i in self.client_idx:
-                            self.test_loader = self.load_test_data(self.args.dataset, i, self.args.batch_size)
-                            if self.test_loader is not None:
-                                accuracy, avg_loss = evaluate_model(self.global_model, self.test_loader)
-                                n_samples = len(self.test_loader.dataset)
-                                total_correct_weight += accuracy * n_samples
-                                total_loss_weight += avg_loss * n_samples
-                                total_samples += n_samples
-                        
-                        final_accuracy = total_correct_weight / total_samples if total_samples > 0 else 0.0
-                        final_loss = total_loss_weight / total_samples if total_samples > 0 else 0.0
-                        self.rs_test_acc.append(final_accuracy)
-                        self.rs_test_loss.append(final_loss)
-                        logger.info(f"Round {round_num + 1}: Test Acc: {final_accuracy:.2f}% | Loss: {final_loss:.4f}")
+                    if self.test_loader is not None or self.client_idx:
+                        try:
+                            total_correct_weight = 0.0
+                            total_loss_weight = 0.0
+                            total_samples = 0
+                            eval_clients = self.client_idx if self.client_idx else ([self.args.test_client_idx] if self.args.test_client_idx is not None else [0])
+                            for i in eval_clients:
+                                if i not in self.test_loaders_cache:
+                                    self.test_loaders_cache[i] = self.load_test_data(self.args.dataset, i, self.args.batch_size)
+                                client_loader = self.test_loaders_cache[i]
+                                if client_loader is not None:
+                                    accuracy, avg_loss = evaluate_model(self.global_model, client_loader)
+                                    n_samples = len(client_loader.dataset)
+                                    total_correct_weight += accuracy * n_samples
+                                    total_loss_weight += avg_loss * n_samples
+                                    total_samples += n_samples
+                            
+                            final_accuracy = total_correct_weight / total_samples if total_samples > 0 else 0.0
+                            final_loss = total_loss_weight / total_samples if total_samples > 0 else 0.0
+                            self.rs_test_acc.append(final_accuracy)
+                            self.rs_test_loss.append(final_loss)
+                            logger.info(f"Round {round_num + 1}: Test Acc: {final_accuracy:.2f}% | Loss: {final_loss:.4f}")
+                        except Exception as e:
+                            logger.exception(f"Round {round_num + 1}: Erro durante avaliação global no servidor: {e}")
+                            if client_accuracies:
+                                fallback_acc = sum(client_accuracies) / len(client_accuracies)
+                                fallback_loss = sum(client_losses) / len(client_losses) if client_losses else 0.0
+                                self.rs_test_acc.append(fallback_acc)
+                                self.rs_test_loss.append(fallback_loss)
+                                logger.warning(f"Round {round_num + 1}: Usando fallback de acurácia reportada pelos clientes: {fallback_acc:.2f}%")
+                            else:
+                                self.rs_test_acc.append(0.0)
+                                self.rs_test_loss.append(0.0)
                     else:
                         logger.info(f"Round {round_num + 1}: Model aggregated (no test data)")
                     
