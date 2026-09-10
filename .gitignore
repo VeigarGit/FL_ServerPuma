@@ -16,6 +16,10 @@ src/dataset/OxfordPets/
 src/dataset/Flowers102/
 src/dataset/DTD/
 src/dataset/FGVCAircraft/
+src/system/DTD/
+src/system/Flowers102/
+src/system/OxfordPets/
+src/system/FGVCAircraft/
 Cifar100/
 *.npz
 
@@ -46,3 +50,10 @@ docker-tc/
 *.pth
 *.pt
 *.log
+
+# =========================
+# Arquivos SUMO
+# =========================
+*.net.xml
+*.rou.xml
+*.sumocfg

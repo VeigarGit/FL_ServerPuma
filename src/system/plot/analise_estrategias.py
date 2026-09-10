@@ -40,70 +40,54 @@ import h5py
 EXPERIMENTS = [
     # --- OxfordPets ---
     ("OxfordPets", "LoRA Padrão",
-     "1_lora_padrao_clip_lora_prune1_ala1_paca12_20260801_180443",
+     "fl_puma_clip_lora_prune1_ala1_paca12",
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "SoRA Estático",
-     "2_sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260802_011456",
+     "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_paca12",
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "PUMA-GT",
-     "3_pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260802_095514",
-     "server_OxfordPets_*_run*.h5"),
-
-    ("OxfordPets", "PUMA-GT Rank Adap",
-     "4_pumagt_adap_rank_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260805_183756",
+     "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
      "server_OxfordPets_*_run*.h5"),
 
     # --- DTD ---
     ("DTD", "LoRA Padrão",
-     "DTD_run_lora_padrao_clip_lora_prune1_ala1_paca12_20260811_174358",
+     "fl_puma_DTD_clip_lora_prune1_ala1_paca12",
      "server_DTD_*_run*.h5"),
 
     ("DTD", "SoRA Estático",
-     "DTD_run_sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260811_074803",
+     "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_paca12",
      "server_DTD_*_run*.h5"),
 
     ("DTD", "PUMA-GT",
-     "DTD_run_sora_adapt_paca_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260810_191511",
-     "server_DTD_*_run*.h5"),
-
-    ("DTD", "PUMA-GT Rank Adap",
-     "DTD_run_puma_gt_rank_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260812_185342",
+     "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
      "server_DTD_*_run*.h5"),
 
     # --- FGVCAircraft ---
     ("FGVCAircraft", "LoRA Padrão",
-     "FGVCAircraft_run_lora_padrao_clip_lora_prune1_ala1_paca12_20260812_073136",
+     "fl_puma_FGVCAircraft_clip_lora_prune1_ala1_paca12",
      "server_FGVCAircraft_*_run*.h5"),
 
     ("FGVCAircraft", "SoRA Estático",
-     "FGVCAircraft_run_sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260809_123022",
+     "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_paca12",
      "server_FGVCAircraft_*_run*.h5"),
 
     ("FGVCAircraft", "PUMA-GT",
-     "FGVCAircraft_run_sora_adapt_paca_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260810_091733",
-     "server_FGVCAircraft_*_run*.h5"),
-
-    ("FGVCAircraft", "PUMA-GT Rank Adap",
-     "FGVCAircraft_run_puma_gt_rank_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260813_121451",
+     "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
      "server_FGVCAircraft_*_run*.h5"),
 
     # --- Flowers102 ---
     ("Flowers102", "LoRA Padrão",
-     "Flowers102_run_lora_padrao_clip_lora_prune1_ala1_paca12_20260808_080534",
+     "fl_puma_Flowers102_clip_lora_prune1_ala1_paca12",
      "server_Flowers102_*_run*.h5"),
 
     ("Flowers102", "SoRA Estático",
-     "Flowers102_run_sora_estatico_clip_sora_with_schedule_prune1_ala1_paca12_20260807_160845",
+     "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_paca12",
      "server_Flowers102_*_run*.h5"),
 
     ("Flowers102", "PUMA-GT",
-     "Flowers102_run_pumagt_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260806_192626",
-     "server_Flowers102_*_run*.h5"),
-
-    ("Flowers102", "PUMA-GT Rank Adap",
-     "Flowers102_run_puma_gt_rank_adap_clip_sora_with_schedule_prune1_ala1_adaptpaca_20260813_220649",
+     "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
      "server_Flowers102_*_run*.h5"),
 ]
 
@@ -308,8 +292,11 @@ def main():
 
     # Caminho base dos resultados
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    results_dir = os.path.join(base_dir, '..', 'results')
-    results_dir = os.path.normpath(results_dir)
+    candidates = [
+        os.path.normpath(os.path.join(base_dir, '..', '..', 'results')),
+        os.path.normpath(os.path.join(base_dir, '..', 'results')),
+    ]
+    results_dir = next((c for c in candidates if os.path.exists(c)), candidates[0])
 
     if not os.path.exists(results_dir):
         print(f"[ERRO] Diretório de resultados não encontrado: {results_dir}")
@@ -394,6 +381,8 @@ def main():
         datasets_list = ["OxfordPets", "DTD", "FGVCAircraft", "Flowers102"]
         for ds in datasets_list:
             puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT Rank Adap' and r['status'] == 'OK'), None)
+            if puma is None:
+                puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT' and r['status'] == 'OK'), None)
             lora = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'LoRA Padrão' and r['status'] == 'OK'), None)
 
             if puma is None or lora is None:
@@ -405,7 +394,7 @@ def main():
                 continue
 
             imp = compute_improvement(puma, lora)
-            improvement_data[ds] = imp
+            improvement_data[ds] = (imp, puma['strategy'])
 
             acc_imp = format_improvement(imp['accuracy'])
             conv_imp = format_improvement(imp['convergence'])
@@ -533,10 +522,10 @@ def main():
 
         # Linhas de improvement no CSV
         if args.improvement:
-            for ds, imp in improvement_data.items():
+            for ds, (imp, strat_name) in improvement_data.items():
                 writer.writerow({
                     'Dataset': ds,
-                    'Estrategia': 'IMPROVEMENT (PUMA-GT Rank Adap vs LoRA)',
+                    'Estrategia': f'IMPROVEMENT ({strat_name} vs LoRA)',
                     'N_Runs': '',
                     'Improvement_Acuracia_%': f"{imp['accuracy']:.4f}",
                     'Improvement_Convergencia_%': f"{imp['convergence']:.4f}",

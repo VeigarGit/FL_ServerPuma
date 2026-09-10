@@ -86,6 +86,11 @@ def get_state_dict_size_mb(state):
         for v in state.values():
             if isinstance(v, torch.Tensor):
                 total_bytes += v.numel() * v.element_size()
+            elif isinstance(v, dict) and v.get('dtype') == 'quantized_int8':
+                if 'weights' in v and isinstance(v['weights'], torch.Tensor):
+                    total_bytes += v['weights'].numel() * v['weights'].element_size()
+                if 'scale' in v and isinstance(v['scale'], torch.Tensor):
+                    total_bytes += v['scale'].numel() * v['scale'].element_size()
             elif isinstance(v, (int, float)):
                 total_bytes += 8
     return total_bytes / (1024 * 1024)
@@ -562,9 +567,26 @@ class FederatedLearningServer:
         accuracy_signal = self._check_accuracy_signal(
             client_id, current_paca, paca_min, max_paca, in_cooldown
         )
-        if accuracy_signal is not None:
-            if accuracy_signal < current_paca:
-                client_info['last_paca_any_reduction_round'] = current_round
+        if accuracy_signal is not None and accuracy_signal > current_paca:
+            return accuracy_signal
+
+        # --- SINAL DE LOSS LOCAL (Dificuldade do cliente) ---
+        global_loss = self.rs_test_loss[-1] if self.rs_test_loss else 1.0
+        client_loss = client_info.get('last_loss', 0.0)
+        is_difficult_client = (client_loss > 0.0 and global_loss > 0.0 and client_loss > global_loss * 1.2)
+
+        if is_difficult_client:
+            if current_paca < max_paca:
+                if getattr(self.args, 'allow_paca_upscale', False) or total_time <= target_latency:
+                    new_paca = current_paca + 1
+                    logger.info(f"PaCA adaptativo {client_id}: cliente difícil (loss={client_loss:.4f} > global={global_loss:.4f}*1.2) com margem de tempo ({total_time:.1f}s <= {target_latency:.1f}s). Subindo PaCA {current_paca} -> {new_paca}")
+                    return new_paca
+                else:
+                    logger.info(f"PaCA adaptativo {client_id}: cliente difícil (loss={client_loss:.4f}), mas sem margem de tempo ({total_time:.1f}s > {target_latency:.1f}s). Mantendo {current_paca}")
+            return current_paca
+
+        if accuracy_signal is not None and accuracy_signal < current_paca:
+            client_info['last_paca_any_reduction_round'] = current_round
             return accuracy_signal
 
         # --- CRITÉRIO 1: LATÊNCIA (per-client em relação à média do cluster) ---
@@ -644,15 +666,15 @@ class FederatedLearningServer:
         global_loss = self.rs_test_loss[-1] if self.rs_test_loss else 1.0
         client_loss = client_info.get('last_loss', 0.0)
         
-        is_difficult_client = (client_loss > global_loss * 1.2)
+        is_difficult_client = (client_loss > 0.0 and global_loss > 0.0 and client_loss > global_loss * 1.2)
         
         if is_difficult_client:
             if current_rank < max_rank:
-                if getattr(self.args, 'allow_rank_upscale', False):
+                if getattr(self.args, 'allow_rank_upscale', False) or total_time <= target_latency:
                     logger.info(f"Rank adaptativo {client_id}: cliente difícil (loss={client_loss:.4f} > global={global_loss:.4f}*1.2). Forçando subida {current_rank} -> {current_rank + 1}")
                     return current_rank + 1
                 else:
-                    logger.info(f"Rank adaptativo {client_id}: cliente difícil, mas subida bloqueada por padrão (use --allow-rank-upscale)")
+                    logger.info(f"Rank adaptativo {client_id}: cliente difícil, mas sem margem de tempo ({total_time:.1f}s > {target_latency:.1f}s) e upscale bloqueado")
             return current_rank
 
         # --- 3. Acurácia Estável (Platô) ---
@@ -956,7 +978,7 @@ class FederatedLearningServer:
                         and client_id in self.previous_sent_state)
             
             if round_num >= 2 and self.prune == 1 and self.args.model == 'cnn':
-                size_before = get_state_dict_size_mb(g_model_pruned)
+                size_before = (len(pickle.dumps(g_model_pruned)) + 4) / (1024 * 1024)
                 if use_lhdq:
                     prev_state = self.previous_sent_state.get(client_id, {})
                     g_model_pruned = lhdq_encode(g_model_pruned, prev_state)
@@ -968,17 +990,17 @@ class FederatedLearningServer:
                         self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in g_model_pruned.items()}
                     if not getattr(self.args, 'delta_coding', False):
                         g_model_pruned = quantization(g_model_pruned)
-                size_after = get_state_dict_size_mb(g_model_pruned)
+                server_quant_time = time.time() - server_quant_start
+                
+                bytes_sent = send_data(conn, g_model_pruned)
+                send_data(conn, self.prune)
+                send_data(conn, max_amount)
+                size_after = bytes_sent / (1024 * 1024)
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
-                server_quant_time = time.time() - server_quant_start
-                
-                send_data(conn, g_model_pruned)
-                send_data(conn, self.prune)
-                send_data(conn, max_amount)
             else:
-                size_before = get_state_dict_size_mb(current_global_state)
+                size_before = (len(pickle.dumps(current_global_state)) + 4) / (1024 * 1024)
                 if use_lhdq:
                     prev_state = self.previous_sent_state.get(client_id, {})
                     current_global_state = lhdq_encode(current_global_state, prev_state)
@@ -990,23 +1012,23 @@ class FederatedLearningServer:
                         self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in current_global_state.items()}
                     if not getattr(self.args, 'delta_coding', False):
                         current_global_state = quantization(current_global_state)
-                size_after = get_state_dict_size_mb(current_global_state)
+                server_quant_time = time.time() - server_quant_start
+                
+                bytes_sent = send_data(conn, current_global_state)
+                send_data(conn, self.prune)
+                size_after = bytes_sent / (1024 * 1024)
                 with self.lock:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
-                server_quant_time = time.time() - server_quant_start
-                
-                send_data(conn, current_global_state)
-                send_data(conn, self.prune)
 
             size_saved = size_before - size_after
             logger.debug(f"Tamanho antes: {size_before:.2f} MB | Tamanho depois: {size_after:.2f} MB | Economia: {size_saved:.2f} MB")
             logger.info(f"Round {round_num}: Sent global model to client {client_id}")
             
-            updated_state, rate = recv_data(conn)
+            updated_state, rate, recv_bytes = recv_data(conn, return_bytes=True)
             bit_rate.append(rate)
             if updated_state is not None:
-                recv_size_mb = get_state_dict_size_mb(updated_state)
+                recv_size_mb = recv_bytes / (1024 * 1024)
                 with self.lock:
                     self.received_ammount.append(self.received_ammount[-1] + recv_size_mb)
             
@@ -1112,12 +1134,23 @@ class FederatedLearningServer:
         finally:
             self.clients_info[client_id]['socket_lock'].release()
 
-    def load_test_data(self, dataset, client_idx, batch_size=32):
+    def load_test_data(self, dataset, client_idx=0, batch_size=32):
         try:
-            test_data = read_client_data(dataset, client_idx, is_train=False)
+            test_data = read_client_data(dataset, client_idx if client_idx is not None else 0, is_train=False)
             X, y = zip(*test_data)
             X = torch.stack(X)
             y = torch.tensor(y)
+            if getattr(self.args, 'model', 'cnn') == 'clip':
+                import torchvision.transforms as T
+                if X.shape[-2:] != (224, 224):
+                    X = T.Resize((224, 224), antialias=True)(X)
+                if not X.is_floating_point():
+                    X = X.float() / 255.0
+                elif X.max() > 1.0:
+                    X = X / 255.0
+                if X.min() >= 0.0:
+                    normalize = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+                    X = normalize(X)
             dataset = torch.utils.data.TensorDataset(X, y)
             return DataLoader(dataset, batch_size=batch_size)
         except Exception as e:
@@ -1320,15 +1353,26 @@ class FederatedLearningServer:
                         self.global_state = aggregated_state
                         self.global_model.load_state_dict(self.global_state, strict=False)
                     
-                    if client_accuracies:
-                        final_accuracy = sum(client_accuracies) / len(client_accuracies)
-                        final_loss = sum(client_losses) / len(client_losses)
+                    if self.test_loader is not None:
+                        total_correct_weight = 0.0
+                        total_loss_weight = 0.0
+                        total_samples = 0
+                        for i in self.client_idx:
+                            self.test_loader = self.load_test_data(self.args.dataset, i, self.args.batch_size)
+                            if self.test_loader is not None:
+                                accuracy, avg_loss = evaluate_model(self.global_model, self.test_loader)
+                                n_samples = len(self.test_loader.dataset)
+                                total_correct_weight += accuracy * n_samples
+                                total_loss_weight += avg_loss * n_samples
+                                total_samples += n_samples
                         
+                        final_accuracy = total_correct_weight / total_samples if total_samples > 0 else 0.0
+                        final_loss = total_loss_weight / total_samples if total_samples > 0 else 0.0
                         self.rs_test_acc.append(final_accuracy)
                         self.rs_test_loss.append(final_loss)
-                        logger.info(f"Round {round_num + 1}: Global Acc (from clients): {final_accuracy:.2f}% | Loss: {final_loss:.4f}")
+                        logger.info(f"Round {round_num + 1}: Test Acc: {final_accuracy:.2f}% | Loss: {final_loss:.4f}")
                     else:
-                        logger.info(f"Round {round_num + 1}: Model aggregated (no client accuracies received)")
+                        logger.info(f"Round {round_num + 1}: Model aggregated (no test data)")
                     
                     size_trainable_mb, num_trainable_params = get_trainable_size_and_params(self.global_model)
                     logger.info(f'Size Trainable Adapters: {size_trainable_mb:.2f} MB | Trainable Params: {num_trainable_params:,}')

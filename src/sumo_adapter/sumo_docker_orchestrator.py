@@ -376,7 +376,38 @@ def write_encounter_signal(
 
 # ── Controle Docker ──────────────────────────────────────────────────────────
 
-def docker_compose_up(compose_file: str, project_root: Path, build: bool = False) -> bool:
+def wait_all_clients_epoch_done(encounters_dir: Path, client_indices: list[int], round_num: int, timeout: int = 300, log=None):
+    """Espera todos os clientes sinalizarem que completaram a época da rodada atual."""
+    expected = [encounters_dir / f".epoch_done_client_{c}" for c in client_indices]
+    
+    # Garantir que o sinal de start_round exista para que os clientes comecem
+    start_round_file = encounters_dir / f".start_round_{round_num}"
+    if not start_round_file.exists():
+        start_round_file.touch()
+
+    if log:
+        log.info("Aguardando todos os %d clientes completarem a época da rodada %d...", len(client_indices), round_num)
+        
+    for tick in range(timeout):
+        if all(f.exists() for f in expected):
+            # Limpar sinais de conclusão para a próxima rodada
+            for f in expected:
+                f.unlink(missing_ok=True)
+            if log:
+                log.info("Todos os clientes completaram a época!")
+            return True
+            
+        if log and tick > 0 and tick % 15 == 0:
+            count = sum(f.exists() for f in expected)
+            log.info("  ... %d/%d clientes concluídos (%ds)", count, len(expected), tick)
+            
+        time.sleep(1)
+        
+    if log:
+        log.warning("Timeout (%ds) aguardando clientes completarem a época!", timeout)
+    return False
+
+def docker_compose_up(compose_file: Path, project_root: Path, build: bool = False) -> bool:
     """Inicia todos os conteineres (veiculos) de uma vez no inicio da simulacao.
     
     Args:
@@ -387,7 +418,7 @@ def docker_compose_up(compose_file: str, project_root: Path, build: bool = False
     Returns:
         True se o comando foi bem sucedido, False caso contrario
     """
-    cmd = ["docker", "compose", "--project-directory", ".", "-f", compose_file, "up", "-d"]
+    cmd = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file), "up", "-d"]
     if build:
         cmd.insert(-1, "--build")
         log.info("Iniciando conteineres Docker...")
@@ -511,17 +542,25 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # ── PASSO 3: Warmup ──────────────────────────────────────────────────
-    # Esperar os conteineres Docker inicializarem completamente antes de
-    # iniciar o SUMO. Isso garante que os clientes ja estejam treinando
-    # (com pesos prontos para exportar) quando o primeiro encontro chegar.
+    # Esperar os conteineres Docker inicializarem completamente.
     if args.warmup > 0:
         log.info(
-            "Aguardando %ds de warmup (conteineres inicializando, "
-            "clientes treinando primeira epoca)...",
+            "Aguardando %ds de warmup (conteineres inicializando)...",
             args.warmup,
         )
         time.sleep(args.warmup)
         log.info("Warmup concluido!")
+
+    # ── PASSO 3.5: Iniciar Rodada 0 (Treino Inicial) ─────────────────────
+    # Limpar qualquer arquivo antigo
+    for f in encounters_dir.glob(".start_round_*"): f.unlink()
+    for f in encounters_dir.glob(".epoch_done_*"): f.unlink()
+    for f in encounters_dir.glob(".simulation_done"): f.unlink()
+    
+    all_client_indices = list(range(args.total_clients))
+    log.info("--- Iniciando Treino (Rodada 0) ---")
+    
+    wait_all_clients_epoch_done(encounters_dir, all_client_indices, round_num=0, timeout=300, log=log)
 
     # ── PASSO 4: Iniciar simulacao SUMO ──────────────────────────────────
     log.info("Iniciando SUMO...")
@@ -532,6 +571,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     rejected_count = 0                             # Encontros rejeitados por ETC insuficiente
     event_log: list[V2VEvent] = []                 # Log de todos os eventos V2V
     prev_cluster_key: frozenset[str] | None = None # Chave do cluster anterior (para detectar mudanca)
+    pair_encounter_counts: dict[frozenset[str], int] = {} # Contador de encontros por cluster
     veh_to_client_idx: dict[str, int] = {}         # Mapa veiculo SUMO -> indice do conteiner
     next_client_idx = 0                            # Proximo indice de conteiner disponivel
     last_encounter_time = -float('inf')            # Timestamp SUMO do ultimo encontro (para cooldown)
@@ -599,6 +639,14 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     veh_names = [v.veh_id for v in best_cluster]
                     c_indices = [veh_to_client_idx[v] for v in veh_names]
 
+                    # ── Verificar Limite de Encontros por Par ─────────────
+                    if args.max_encounters_per_pair > 0:
+                        count = pair_encounter_counts.get(cluster_key, 0)
+                        if count >= args.max_encounters_per_pair:
+                            # Ignorar este cluster, pois ja se encontraram o maximo permitido
+                            prev_cluster_key = cluster_key
+                            continue
+
                     # ── Calcular ETC do cluster ───────────────────────────
                     etc = cluster_etc(best_cluster, args.radius)
 
@@ -631,12 +679,14 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
                     # ── ETC suficiente: gerar sinal de encontro ───────────
                     encounter_count += 1
+                    pair_encounter_counts[cluster_key] = pair_encounter_counts.get(cluster_key, 0) + 1
 
                     etc_display = f"{etc}" if isinstance(etc, str) else f"{etc:.1f}s"
                     log.info(
-                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%s",
+                        "Encontro %d/%d! Veiculos %s (Clientes %s) | ETC=%s | (Vezes: %d)",
                         encounter_count, args.encounters,
                         veh_names, c_indices, etc_display,
+                        pair_encounter_counts[cluster_key],
                     )
 
                     # Montar dados do encontro com ETC para os clientes usarem
@@ -658,6 +708,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         event_type="encounter_formed",
                         vehicles=veh_names,
                         details={
+                            "encounter_id": encounter_count,
                             "clients": c_indices,
                             "etc_seconds": etc if isinstance(etc, str) else round(etc, 1),
                         },
@@ -726,6 +777,17 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         event_log[-1].details["exchange_time"] = round(exchange_time, 1)
 
                     log.info("SUMO RETOMADO.")
+                    
+                    # ── PASSO 3: Iniciar Nova Rodada ──────────────────────
+                    # Agora que o encontro terminou e o SUMO retomou, sinalizamos
+                    # para TODOS os clientes treinarem mais 1 época
+                    log.info(f"--- Iniciando Treino (Rodada {encounter_count}) ---")
+                    all_client_indices = list(range(args.total_clients))
+                    wait_all_clients_epoch_done(encounters_dir, all_client_indices, round_num=encounter_count, timeout=300, log=log)
+                    
+                    # Atualizar tempo do ultimo encontro (para cooldown)
+                    last_encounter_time = sim_time
+                    prev_cluster_key = cluster_key
 
                     # Verificar se atingimos o limite de encontros
                     if encounter_count >= args.encounters:
@@ -745,6 +807,10 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         log.info("\nSimulacao interrompida pelo usuario.")
     finally:
         # ── PASSO 4: Limpeza geral ───────────────────────────────────────
+        log.info("Encerrando simulacao V2V...")
+        done_file = encounters_dir / ".simulation_done"
+        done_file.touch()
+        time.sleep(5)  # Dar tempo para os clientes lerem o sinal
         docker_compose_down(compose_file, PROJECT_ROOT)
         traci.close()
         log.info("SUMO encerrado.")
@@ -790,6 +856,10 @@ def main():
     parser.add_argument(
         "--encounters", type=int, default=4,
         help="Numero maximo de encontros VIAVEIS para terminar a simulacao (default: 4)",
+    )
+    parser.add_argument(
+        "--max-encounters-per-pair", type=int, default=0,
+        help="Numero maximo de encontros permitidos entre o mesmo par/cluster de veiculos. 0 = sem limite (default: 0)",
     )
     parser.add_argument(
         "--radius", type=float, default=DEFAULT_COMM_RADIUS,

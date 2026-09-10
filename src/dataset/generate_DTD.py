@@ -11,7 +11,7 @@ from pathlib import Path
 
 random.seed(1)
 np.random.seed(1)
-num_clients = 20
+num_clients = 25
 dir_path = "DTD/"
 
 

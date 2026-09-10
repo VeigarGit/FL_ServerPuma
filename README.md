@@ -52,6 +52,9 @@ Regardless of the execution method, the environment must be synced and the parti
 
    # Example with Cifar100
    uv run python src/dataset/generate_Cifar100.py noniid - dir
+
+   # Example with Flowers102
+   uv run python src/dataset/generate_Flowers102.py noniid - dir
    ```
 
 > **⚠️ Important:** The number of data partitions is defined by the `num_clients` variable **inside each dataset generator script** (e.g., `generate_MNIST.py`). Make sure this value matches or exceeds the `--clients` count you plan to use in Docker Compose. Otherwise, some clients will have no data and the experiment will fail.
@@ -112,146 +115,170 @@ This script automates the setup on the host machine using `tmux` to manage multi
 
 ```bash
 cd src/system/
-chmod +x run.sh    # apenas na primeira vez
+chmod +x run.sh    # first time only
 
-# Ver todos os argumentos disponíveis
+# View all available arguments
 ./run.sh --help
 
-# Rodar com valores padrão (2 clientes, MNIST, 5 rodadas)
+# Run with default values (2 clients, MNIST, 5 rounds)
 ./run.sh
 
-# Exemplo com CLIP + LoRA
+# Example with CLIP + LoRA
 ./run.sh --model clip --strategy lora --dataset OxfordPets --clients 5 --rounds 50 --num-classes 37
 
-# Exemplo com SoRA + PaCA adaptativo
+# Example with SoRA + adaptive PaCA
 ./run.sh --model clip --strategy sora_with_schedule --adaptive-paca --sora-prune --rounds 50
+
+# Example with CLIP + LoRA across multiple rounds and simulations (Flowers102)
+./run.sh --simulations 10 --clients 25 --strategy lora --model clip --rounds 150 --dataset Flowers102 --auto-next --skip-train-eval --num-classes 102 -did 0
 ```
 
-### 📖 Argumentos do `run.sh`
+### 📖 `run.sh` Arguments
 
-**Rede:**
+**Network:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `-h`, `--host` | Host do servidor | `localhost` |
-| `-p`, `--port` | Porta do servidor | `9500` |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-h`, `--host` | Server host | `localhost` |
+| `-p`, `--port` | Server port | `9500` |
 
-**Sessão / Execução:**
+**Session / Execution:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `-s`, `--session` | Nome da sessão tmux | `david` |
-| `--simulations` | Número de simulações sequenciais | `1` |
-| `--start-run` | Índice da primeira simulação | `1` |
-| `--exp-name` | Nome customizado do experimento | auto-gerado |
-| `--auto-next` | Não pausar entre simulações | desabilitado |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-s`, `--session` | Tmux session name | `fl_puma` |
+| `--simulations` | Number of sequential simulations | `1` |
+| `--start-run` | Index of the first simulation run | `1` |
+| `--exp-name` | Custom experiment name | auto-generated |
+| `--auto-next` | Do not pause between simulations | disabled |
 
-**Treinamento:**
+**Training:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `-c`, `--clients` | Número de clientes | `2` |
-| `-r`, `--rounds` | Número de rodadas | `5` |
-| `-d`, `--dataset` | Dataset (`MNIST`, `Cifar10`, `Cifar100`, `OxfordPets`) | `MNIST` |
-| `--batch-size` | Tamanho do batch | `32` |
-| `--max-clients` | Máximo de clientes permitidos | `22` |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-c`, `--clients` | Number of clients | `2` |
+| `-r`, `--rounds` | Number of rounds | `5` |
+| `-d`, `--dataset` | Dataset (`MNIST`, `Cifar10`, `Cifar100`, `OxfordPets`, `Flowers102`, etc. — any dataset with `generate_<Name>.py`) | `MNIST` |
+| `--batch-size` | Batch size | `32` |
+| `--max-clients` | Maximum allowed clients | `25` |
 | `--ala` | 0=FedALA, 1=FedAvg | `1` |
 
-**Modelo:**
+**Model:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `-m`, `--model` | Tipo de modelo (`cnn` ou `clip`) | `cnn` |
-| `--strategy` | Estratégia (`lora`, `sora_with_schedule`, etc.) | `lora` |
-| `--rank` | Rank do LoRA/SoRA | `8` |
-| `--config` | Caminho do YAML de config (obrigatório para CLIP) | `lora_clip/train_config.yml` |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-m`, `--model` | Model type (`cnn` or `clip`) | `cnn` |
+| `--strategy` | Strategy (`lora`, `sora_with_schedule`, etc.) | `lora` |
+| `--rank` | LoRA/SoRA rank | `8` |
+| `--config` | Path to YAML config file (required for CLIP) | `lora_clip/train_config.yml` |
 
-**Dispositivo:**
+**Device:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `--device` | Dispositivo (`cuda`, `cpu`, `mps`) | auto-detectado |
-| `-did`, `--device-id` | ID da GPU | `0` |
-| `--cpu` | Forçar uso de CPU | desabilitado |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--device` | Device (`cuda`, `cpu`, `mps`) | auto-detected |
+| `-did`, `--device-id` | GPU ID | `0` |
+| `--cpu` | Force CPU usage | disabled |
 
 **Pruning:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `--prune` | Habilitar pruning (`0` ou `1`) | `1` |
-| `--prune-freq` | Frequência de pruning | `1` |
-| `--sora-prune` | Habilitar pruning SoRA | desabilitado |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--prune` | Enable pruning (`0` or `1`) | `1` |
+| `--prune-freq` | Pruning frequency | `1` |
+| `--sora-prune` | Enable SoRA pruning | disabled |
 
 **PaCA:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `--paca` | Valor fixo de PaCA | `12` |
-| `--adaptive-paca` | PaCA adaptativo no servidor | desabilitado |
-| `--random-paca` | PaCA aleatório por cliente | desabilitado |
-| `--paca-min` | PaCA mínimo (modo aleatório) | `1` |
-| `--paca-max` | PaCA máximo (modo aleatório) | `12` |
-| `--paca-list` | Lista de PaCA por cliente (ex: `"4,8,12"`) | — |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--paca` | Fixed PaCA value | `12` |
+| `--adaptive-paca` | Adaptive PaCA on server | disabled |
+| `--random-paca` | Random PaCA per client | disabled |
+| `--paca-min` | Minimum PaCA (random mode) | `1` |
+| `--paca-max` | Maximum PaCA (random mode) | `12` |
+| `--paca-list` | List of PaCA per client (e.g. `"4,8,12"`) | — |
 
-**Arquitetura CNN:**
+**Adaptive Rank:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `--in-features` | Canais de entrada | `3` |
-| `--dim` | Dimensão intermediária | `1600` |
-| `--num-classes` | Número de classes | `10` |
-| `-t`, `--test-client-idx` | Índice do cliente de teste | `0` |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--adaptive-rank` | Enable adaptive rank on server | disabled |
+| `--adaptive-rank-min` | Minimum rank in adaptive mode | `2` |
+| `--adaptive-rank-max` | Maximum rank in adaptive mode | `8` |
 
-**Persistência de Modelo:**
+**Architecture and Classification:**
 
-| Flag | Descrição | Padrão |
-|------|-----------|--------|
-| `--save [path]` | Salvar modelo (path opcional) | desabilitado |
-| `--load [path]` | Carregar modelo (path opcional) | desabilitado |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--in-features` | Input channels (CNN) | `3` |
+| `--dim` | Intermediate dimension (CNN) | `1600` |
+| `--num-classes` | Number of dataset classes (e.g. `10` for MNIST/Cifar10, `37` for OxfordPets, `102` for Flowers102) | `10` |
+| `-t`, `--test-client-idx` | Test client index | `0` |
 
-### 🖥️ Guia Rápido do Tmux
+**Model Persistence:**
 
-O script roda a sessão em background (detached). Cada processo (servidor + clientes) fica em sua própria **janela** (aba) dentro da sessão tmux.
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--save [path]` | Save model (optional custom path) | disabled |
+| `--load [path]` | Load model (optional custom path) | disabled |
 
-**Conectar e desconectar:**
+**Evaluation Optimization:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--skip-train-eval` | Skip evaluation on the training set post-training (speeds up round completion) | disabled |
+| `--skip-post-eval` | Skip all local post-training evaluations (retains only Global Model Test Acc) | disabled |
+
+**Compression:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--delta-coding` | Enable LHDQ (Low Huffman-coded Delta Quantization) instead of int8 | disabled |
+
+### 🖥️ Quick Tmux Guide
+
+The script runs the session in the background (detached). Each process (server + clients) is assigned its own **window** (tab) inside the tmux session.
+
+**Attach and detach:**
 ```bash
-# Conectar à sessão (nome padrão: david)
-tmux attach -t david
+# Attach to the session (default name: fl_puma)
+tmux attach -t fl_puma
 
-# Desconectar sem matar os processos (de dentro do tmux)
-# Pressione: Ctrl+b, depois d
+# Detach without terminating processes (from inside tmux)
+# Press: Ctrl+b, then d
 ```
 
-**Navegação entre janelas (abas):**
+**Window navigation (tabs):**
 
-| Atalho | Ação |
-|--------|------|
-| `Ctrl+b n` | Próxima janela |
-| `Ctrl+b p` | Janela anterior |
-| `Ctrl+b w` | Lista de janelas (selecione com setas + Enter) |
-| `Ctrl+b 0..9` | Ir direto para janela pelo número |
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+b n` | Next window |
+| `Ctrl+b p` | Previous window |
+| `Ctrl+b w` | List windows (select with arrow keys + Enter) |
+| `Ctrl+b 0..9` | Jump directly to window by number |
 
-**Scroll e busca no log:**
+**Scroll and search in logs:**
 
-| Atalho | Ação |
-|--------|------|
-| `Ctrl+b [` | Entrar no modo scroll (use setas/PgUp/PgDn) |
-| `q` | Sair do modo scroll |
-| `Ctrl+b [` → `/` | Buscar texto no log (dentro do modo scroll) |
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+b [` | Enter scroll mode (use arrow keys / PgUp / PgDn) |
+| `q` | Exit scroll mode |
+| `Ctrl+b [` → `/` | Search text in log (inside scroll mode) |
 
-**Gerenciamento de sessão (fora do tmux):**
+**Session management (from outside tmux):**
 ```bash
-# Listar sessões ativas
+# List active sessions
 tmux ls
 
-# Matar uma sessão específica
-tmux kill-session -t david
+# Terminate a specific session
+tmux kill-session -t fl_puma
 
-# Matar todas as sessões
+# Terminate all tmux sessions
 tmux kill-server
 ```
 
-> **Dica:** Se o treinamento travou e você quer forçar o encerramento, use `tmux kill-session -t david` de outro terminal. Isso mata o servidor e todos os clientes de uma vez.
+> **Tip:** If training hangs and you want to force shutdown, run `tmux kill-session -t fl_puma` from another terminal. This terminates the server and all clients at once.
 
 ---
 
