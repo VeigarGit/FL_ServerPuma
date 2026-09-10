@@ -92,11 +92,13 @@ if __name__ == "__main__":
     parser.add_argument("niid", type=str)
     parser.add_argument("balance", type=str)
     parser.add_argument("partition", type=str)
+    parser.add_argument("pos_clients", nargs="?", type=int, default=None, help="Optional positional client count")
     parser.add_argument("--num-clients", type=int, default=10, help="Number of clients to partition the data for")
     args = parser.parse_args()
 
+    num_clients = args.pos_clients if args.pos_clients is not None else args.num_clients
     niid = True if args.niid == "noniid" else False
     balance = True if args.balance == "balance" else False
     partition = args.partition if args.partition != "-" else None
 
-    generate_dataset(dir_path, args.num_clients, niid, balance, partition)
+    generate_dataset(dir_path, num_clients, niid, balance, partition)
