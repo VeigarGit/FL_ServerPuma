@@ -305,24 +305,24 @@ sumo --version
 uv run python src/dataset/generate_MNIST.py noniid - dir
 ```
 
-### Step 2: Run the V2X Simulation
+### Step 2: Run the V2V Simulation
 
-Navigate to the `sumo_adapter` directory and execute the orchestrator:
+Navigate to the `v2v_fl` directory and execute the orchestrator:
 
 ```bash
-cd src/sumo_adapter/
+cd src/v2v_fl/
 
 # First run or after code changes
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+sg docker -c "uv run python3 v2v_docker_orchestrator.py \
     --sumo-cfg maps/grid.sumocfg \
     --build --gui"
 
 # Default run (headless, 5 vehicles, MNIST, max 4 encounters)
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+sg docker -c "uv run python3 v2v_docker_orchestrator.py \
     --sumo-cfg maps/grid.sumocfg"
 
 # With SUMO GUI + custom parameters
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+sg docker -c "uv run python3 v2v_docker_orchestrator.py \
     --sumo-cfg maps/grid.sumocfg \
     --gui \
     --total-clients 5 \

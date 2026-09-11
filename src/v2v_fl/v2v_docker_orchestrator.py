@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sumo_docker_orchestrator.py
+v2v_docker_orchestrator.py
 ============================
 Orquestrador V2V para Treinamento Federado.
 
@@ -27,7 +27,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from sumo_adapter.generate_v2v_compose import generate as compose_generate
+from v2v_fl.generate_v2v_compose import generate as compose_generate
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -509,12 +509,18 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     encounters_dir = PROJECT_ROOT / "src" / "results" / "encounters"
     encounters_dir.mkdir(parents=True, exist_ok=True)
 
-    # Limpar encontros e pesos de execucoes anteriores
+    # Limpar encontros, pesos e sinalizacoes de execucoes anteriores
     for f in encounters_dir.glob("*.json"):
         f.unlink()
     for f in encounters_dir.glob("*.pt"):
         f.unlink()
     for f in encounters_dir.glob(".done_enc_*"):
+        f.unlink()
+    for f in encounters_dir.glob(".start_round_*"):
+        f.unlink()
+    for f in encounters_dir.glob(".epoch_done_*"):
+        f.unlink()
+    for f in encounters_dir.glob(".simulation_done"):
         f.unlink()
     # Limpar arquivos temporarios orfaos de escritas atomicas interrompidas
     for f in encounters_dir.glob(".encounter_*.tmp"):
@@ -552,10 +558,6 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         log.info("Warmup concluido!")
 
     # ── PASSO 3.5: Iniciar Rodada 0 (Treino Inicial) ─────────────────────
-    # Limpar qualquer arquivo antigo
-    for f in encounters_dir.glob(".start_round_*"): f.unlink()
-    for f in encounters_dir.glob(".epoch_done_*"): f.unlink()
-    for f in encounters_dir.glob(".simulation_done"): f.unlink()
     
     all_client_indices = list(range(args.total_clients))
     log.info("--- Iniciando Treino (Rodada 0) ---")

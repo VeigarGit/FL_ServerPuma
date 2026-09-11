@@ -29,6 +29,7 @@ Cifar100/
 src/results/
 src/system/dados_compartilhados/
 *.h5
+plot/
 
 # =========================
 # Gráficos e Visualizações
