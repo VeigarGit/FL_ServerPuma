@@ -149,11 +149,16 @@ def parse_experiment(exp_name, results_base=None):
 
     if "adalora" in exp_name.lower():
         label = f"AdaLoRA{rank_str}"
+    elif "pumagt_naive" in exp_name.lower() or "naive" in exp_name.lower():
+        label = f"PUMA-GT (Naive){rank_str}"
+    elif "puma_plus" in exp_name.lower() or "pumagt_plus" in exp_name.lower():
+        label = f"PUMA-GT Plus{rank_str}"
+    elif "puma_v2" in exp_name.lower() or "_v2" in exp_name.lower():
+        label = f"PUMA-GT (v2){rank_str}"
+    elif "puma" in exp_name.lower() or "adaptpaca" in exp_name.lower():
+        label = f"PUMA-GT (v1){rank_str}"
     elif "sora" in exp_name.lower():
-        if "adaptpaca" in exp_name.lower():
-            label = f"PUMA-GT{rank_str}"
-        else:
-            label = f"Static SoRA{rank_str}"
+        label = f"Static SoRA{rank_str}"
     elif "lora" in exp_name.lower():
         label = f"LoRA{rank_str}"
     else:
@@ -274,6 +279,21 @@ def _load_server_h5(files):
         valid_server_processing_time = [t[:min_len] for t in valid_server_processing_time]
         server_processing_time_mean = np.mean(valid_server_processing_time, axis=0)
 
+    tpr_list = []
+    for f in files:
+        with h5py.File(f, 'r') as hf:
+            if 'total_transmitted_per_round_Mb' in hf:
+                tpr_list.append(np.array(hf['total_transmitted_per_round_Mb']))
+            else:
+                tpr_list.append(None)
+    valid_tpr = [t for t in tpr_list if t is not None]
+    tpr_mean, tpr_std = None, None
+    if valid_tpr:
+        min_len = min(len(t) for t in valid_tpr)
+        valid_tpr = [t[:min_len] for t in valid_tpr]
+        tpr_mean = np.mean(valid_tpr, axis=0)
+        tpr_std = np.std(valid_tpr, axis=0)
+
     return {
         'acc_mean': np.mean(acc, axis=0), 'acc_std': np.std(acc, axis=0),
         'loss_mean': np.mean(loss, axis=0), 'loss_std': np.std(loss, axis=0),
@@ -288,6 +308,8 @@ def _load_server_h5(files):
         'server_pruning_time_mean': server_pruning_time_mean,
         'client_eval_time_mean': client_eval_time_mean,
         'server_processing_time_mean': server_processing_time_mean,
+        'tpr_mean': tpr_mean,
+        'tpr_std': tpr_std,
         'num_runs': len(files),
     }
 
@@ -317,7 +339,10 @@ def _load_client_h5(files):
 # ==============================================================================
 
 def _compute_mb_per_round(d):
-    """Calcula MB trafegados por rodada individual (ida + volta) a partir do acumulado."""
+    """Calcula MB trafegados por rodada individual (ida + volta) a partir do total_transmitted_per_round_Mb ou do acumulado."""
+    if d.get('tpr_mean') is not None:
+        tpr = d['tpr_mean']
+        return tpr, np.cumsum(tpr), None
     num_rounds = len(d['time_mean'])
     total_envios = len(d['mb_mean'])
     if num_rounds == 0 or total_envios == 0:
@@ -457,8 +482,12 @@ def plot_04_banda_acumulada(experiments, output_dir):
 # 05 - Banda de Rede por Rodada Individual (Upload + Download)
 # ==============================================================================
 
-def plot_05_banda_por_rodada(experiments, output_dir):
-    """Mostra quanto de dados (MB) foi trafegado (ida + volta) em cada rodada individual."""
+def plot_05_banda_por_rodada(experiments, output_dir, window=5):
+    """Mostra quanto de dados (MB) foi trafegado (ida + volta) em cada rodada individual.
+    Aplica média móvel de 5 rodadas (correspondente a 1 ciclo canário de 5 grupos de clientes)
+    para suavizar artefatos de amostragem por rodada, exibindo os dados brutos em transparência suave."""
+    import pandas as pd
+
     fig, ax = plt.subplots(figsize=(12, 7))
     has_valid_data = False
 
@@ -469,19 +498,36 @@ def plot_05_banda_por_rodada(experiments, output_dir):
         if result is None:
             continue
         mb_discrete, _, _ = result
-        x = range(1, len(mb_discrete) + 1)
-        ax.plot(x, mb_discrete, color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(mb_discrete)), linestyle=s['ls'],
+        mb_arr = np.array(mb_discrete)
+        x = np.arange(1, len(mb_arr) + 1)
+
+        # Média móvel com janela de 5 rodadas (1 ciclo canário completo do cluster)
+        mb_smooth = pd.Series(mb_arr).rolling(window=window, min_periods=1).mean().values
+
+        # Plota linha bruta suave no fundo (alpha=0.20) para total transparência científica
+        ax.plot(x, mb_arr, color=s['color'], linestyle='-', linewidth=0.8, alpha=0.20)
+
+        # Plota linha suavizada sólida em destaque com marcadores
+        ax.plot(x, mb_smooth, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(mb_smooth)), linestyle=s['ls'], linewidth=2.2,
                 label=exp['label'])
+
+        # Se houver desvio padrão real entre runs, plota fill_between
+        tpr_std = d.get('tpr_std')
+        if tpr_std is not None and np.any(tpr_std > 0):
+            std_smooth = pd.Series(tpr_std[:len(mb_smooth)]).rolling(window=window, min_periods=1).mean().values
+            ax.fill_between(x, np.maximum(0, mb_smooth - std_smooth), mb_smooth + std_smooth,
+                            color=s['color'], alpha=0.10)
+
         has_valid_data = True
 
     if not has_valid_data:
         plt.close(fig)
         return
 
-    _set_title(ax, "Bandwidth Consumption per Round (Upload + Download)")
+    _set_title(ax, f"Bandwidth Consumption per Round (Moving Average={window})")
     ax.set_xlabel("Rounds"); ax.set_ylabel("Transferred MB per Round")
-    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    ax.legend(fontsize=12, loc='upper right'); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "05_banda_por_rodada.pdf")
 
@@ -979,32 +1025,50 @@ def plot_15_mb_vs_tempo(experiments, output_dir):
 # ==============================================================================
 DATASET_EXPERIMENTS = {
     "OxfordPets": [
-        "fl_puma_clip_lora_prune1_ala1_paca12",
-        "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_paca12",
-        "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+        "OxfordPets__LoRA_Padrao_paca12",
+        "OxfordPets__SoRA_Estatico_paca12",
+        "OxfordPets__PUMA-GT_AdaptPaCA",
+        "fl_puma_v2_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+        "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
     ],
     "Flowers102": [
-        "fl_puma_Flowers102_clip_lora_prune1_ala1_paca12",
-        "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_paca12",
-        "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+        "Flowers102__LoRA_Padrao_paca12",
+        "Flowers102__SoRA_Estatico_paca12",
+        "Flowers102__PUMA-GT_AdaptPaCA",
+        "fl_puma_v2_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+        "fl_pumagt_plus_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
     ],
     "DTD": [
-        "fl_puma_DTD_clip_lora_prune1_ala1_paca12",
-        "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_paca12",
-        "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+        "DTD__LoRA_Padrao_paca12",
+        "DTD__SoRA_Estatico_paca12",
+        "DTD__PUMA-GT_AdaptPaCA",
+        "fl_puma_v2_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+        "fl_pumagt_plus_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
     ],
     "FGVCAircraft": [
-        "fl_puma_FGVCAircraft_clip_lora_prune1_ala1_paca12",
-        "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_paca12",
-        "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+        "FGVCAircraft__LoRA_Padrao_paca12",
+        "FGVCAircraft__SoRA_Estatico_paca12",
+        "FGVCAircraft__PUMA-GT_AdaptPaCA",
+        "fl_puma_v2_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+        "fl_pumagt_plus_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
     ],
 }
 
-# Configuração ativa: execuções do OxfordPets (LoRA, SoRA e PUMA-GT)
+# Configuração ativa: execuções do OxfordPets (LoRA, SoRA, PUMA-GT v1 e v2)
 EXPERIMENTOS_PARA_PLOTAR = DATASET_EXPERIMENTS["OxfordPets"]
 
 def main():
-    exp_names = EXPERIMENTOS_PARA_PLOTAR
+    dataset_name = None
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg in DATASET_EXPERIMENTS:
+            dataset_name = arg
+            exp_names = DATASET_EXPERIMENTS[arg]
+        else:
+            exp_names = sys.argv[1:]
+    else:
+        exp_names = EXPERIMENTOS_PARA_PLOTAR
+        dataset_name = "OxfordPets"
 
     if not exp_names:
         print("❌ Nenhum experimento definido na lista EXPERIMENTOS_PARA_PLOTAR.")
@@ -1030,50 +1094,58 @@ def main():
         print("\n❌ Nenhum experimento válido encontrado.")
         sys.exit(1)
 
-    # Diretório de saída
+    # Diretórios de saída
     if len(experiments) == 1:
-        output_dir = os.path.join(experiments[0]['results_dir'], "graficos")
+        output_dirs = [os.path.join(experiments[0]['results_dir'], "graficos")]
+    elif dataset_name == "OxfordPets":
+        output_dirs = [
+            os.path.join(DEFAULT_RESULTS_BASE, "graficos_comparativos_OxfordPets"),
+            os.path.join(DEFAULT_RESULTS_BASE, "graficos_comparativos"),
+        ]
+    elif dataset_name:
+        output_dirs = [os.path.join(DEFAULT_RESULTS_BASE, f"graficos_comparativos_{dataset_name}")]
     else:
-        output_dir = os.path.join(DEFAULT_RESULTS_BASE, "graficos_comparativos")
-    os.makedirs(output_dir, exist_ok=True)
+        output_dirs = [os.path.join(DEFAULT_RESULTS_BASE, "graficos_comparativos")]
 
-    print(f"\n{'='*60}")
-    print(f"📂 Salvando gráficos em: {output_dir}")
-    print(f"{'='*60}")
-    print(f"📝 Títulos nos gráficos: {'ATIVADOS' if SHOW_TITLES else 'DESATIVADOS'}")
-    print(f"🏷️ Legenda com Rank: {'ATIVADA' if SHOW_RANK_IN_LEGEND else 'DESATIVADA'}\n")
+    for output_dir in output_dirs:
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"\n{'='*60}")
+        print(f"📂 Salvando gráficos em: {output_dir}")
+        print(f"{'='*60}")
+        print(f"📝 Títulos nos gráficos: {'ATIVADOS' if SHOW_TITLES else 'DESATIVADOS'}")
+        print(f"🏷️ Legenda com Rank: {'ATIVADA' if SHOW_RANK_IN_LEGEND else 'DESATIVADA'}\n")
 
-    # Gerar todos os gráficos (em ordem sequencial 01-15)
-    # --- Desempenho do Modelo ---
-    plot_01_acuracia_global(experiments, output_dir)
-    plot_02_train_loss(experiments, output_dir)
-    plot_03_local_vs_treino(experiments, output_dir)
+        # Gerar todos os gráficos (em ordem sequencial 01-15)
+        # --- Desempenho do Modelo ---
+        plot_01_acuracia_global(experiments, output_dir)
+        plot_02_train_loss(experiments, output_dir)
+        plot_03_local_vs_treino(experiments, output_dir)
 
-    # --- Custos de Comunicação ---
-    plot_04_banda_acumulada(experiments, output_dir)
-    plot_05_banda_por_rodada(experiments, output_dir)
+        # --- Custos de Comunicação ---
+        plot_04_banda_acumulada(experiments, output_dir)
+        plot_05_banda_por_rodada(experiments, output_dir)
 
-    # --- Estrutura do Modelo ---
-    plot_06_tamanho_modelo(experiments, output_dir)
-    plot_07_parametros_treinaveis(experiments, output_dir)
-    plot_08_paca_evolucao(experiments, output_dir)
+        # --- Estrutura do Modelo ---
+        plot_06_tamanho_modelo(experiments, output_dir)
+        plot_07_parametros_treinaveis(experiments, output_dir)
+        plot_08_paca_evolucao(experiments, output_dir)
 
-    # --- Análise Temporal ---
-    plot_09_tempo_por_rodada(experiments, output_dir)
-    plot_10_tempo_treinamento_clientes(experiments, output_dir)
-    plot_11_tempo_comunicacao_clientes(experiments, output_dir)
-    plot_12_decomposicao_temporal(experiments, output_dir)
+        # --- Análise Temporal ---
+        plot_09_tempo_por_rodada(experiments, output_dir)
+        plot_10_tempo_treinamento_clientes(experiments, output_dir)
+        plot_11_tempo_comunicacao_clientes(experiments, output_dir)
+        plot_12_decomposicao_temporal(experiments, output_dir)
 
-    # --- Eficiência (Acurácia vs Tempo) ---
-    plot_13_acuracia_vs_tempo(experiments, output_dir)
+        # --- Eficiência (Acurácia vs Tempo) ---
+        plot_13_acuracia_vs_tempo(experiments, output_dir)
 
-    # --- Resumo ---
-    plot_14_resumo_comparativo(experiments, output_dir)
+        # --- Resumo ---
+        plot_14_resumo_comparativo(experiments, output_dir)
 
-    # --- MB vs Tempo ---
-    plot_15_mb_vs_tempo(experiments, output_dir)
+        # --- MB vs Tempo ---
+        plot_15_mb_vs_tempo(experiments, output_dir)
 
-    print(f"\n✅ {len(experiments)} experimento(s) plotados com sucesso em: {output_dir}")
+        print(f"\n✅ {len(experiments)} experimento(s) plotados com sucesso em: {output_dir}")
 
 
 if __name__ == "__main__":

@@ -40,54 +40,94 @@ import h5py
 EXPERIMENTS = [
     # --- OxfordPets ---
     ("OxfordPets", "LoRA Padrão",
-     "fl_puma_clip_lora_prune1_ala1_paca12",
+     "OxfordPets__LoRA_Padrao_paca12",
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "SoRA Estático",
-     "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_paca12",
+     "OxfordPets__SoRA_Estatico_paca12",
      "server_OxfordPets_*_run*.h5"),
 
-    ("OxfordPets", "PUMA-GT",
-     "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ("OxfordPets", "PUMA-GT v1",
+     "OxfordPets__PUMA-GT_AdaptPaCA",
+     "server_OxfordPets_*_run*.h5"),
+
+    ("OxfordPets", "PUMA-GT v2",
+     "fl_puma_v2_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "server_OxfordPets_*_run*.h5"),
+
+    ("OxfordPets", "PUMA-GT Naive",
+     "fl_pumagt_naive_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+     "server_OxfordPets_*_run*.h5"),
+
+    ("OxfordPets", "PUMA-GT Plus",
+     "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
      "server_OxfordPets_*_run*.h5"),
 
     # --- DTD ---
     ("DTD", "LoRA Padrão",
-     "fl_puma_DTD_clip_lora_prune1_ala1_paca12",
+     "DTD__LoRA_Padrao_paca12",
      "server_DTD_*_run*.h5"),
 
     ("DTD", "SoRA Estático",
-     "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_paca12",
+     "DTD__SoRA_Estatico_paca12",
      "server_DTD_*_run*.h5"),
 
-    ("DTD", "PUMA-GT",
-     "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ("DTD", "PUMA-GT v1",
+     "DTD__PUMA-GT_AdaptPaCA",
+     "server_DTD_*_run*.h5"),
+
+    ("DTD", "PUMA-GT v2",
+     "fl_puma_v2_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "server_DTD_*_run*.h5"),
+
+    ("DTD", "PUMA-GT Naive",
+     "fl_pumagt_naive_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+     "server_DTD_*_run*.h5"),
+
+    ("DTD", "PUMA-GT Plus",
+     "fl_pumagt_plus_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
      "server_DTD_*_run*.h5"),
 
     # --- FGVCAircraft ---
     ("FGVCAircraft", "LoRA Padrão",
-     "fl_puma_FGVCAircraft_clip_lora_prune1_ala1_paca12",
+     "FGVCAircraft__LoRA_Padrao_paca12",
      "server_FGVCAircraft_*_run*.h5"),
 
     ("FGVCAircraft", "SoRA Estático",
-     "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_paca12",
+     "FGVCAircraft__SoRA_Estatico_paca12",
      "server_FGVCAircraft_*_run*.h5"),
 
-    ("FGVCAircraft", "PUMA-GT",
-     "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ("FGVCAircraft", "PUMA-GT v1",
+     "FGVCAircraft__PUMA-GT_AdaptPaCA",
+     "server_FGVCAircraft_*_run*.h5"),
+
+    ("FGVCAircraft", "PUMA-GT v2",
+     "fl_puma_v2_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "server_FGVCAircraft_*_run*.h5"),
+
+    ("FGVCAircraft", "PUMA-GT Plus",
+     "fl_pumagt_plus_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
      "server_FGVCAircraft_*_run*.h5"),
 
     # --- Flowers102 ---
     ("Flowers102", "LoRA Padrão",
-     "fl_puma_Flowers102_clip_lora_prune1_ala1_paca12",
+     "Flowers102__LoRA_Padrao_paca12",
      "server_Flowers102_*_run*.h5"),
 
     ("Flowers102", "SoRA Estático",
-     "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_paca12",
+     "Flowers102__SoRA_Estatico_paca12",
      "server_Flowers102_*_run*.h5"),
 
-    ("Flowers102", "PUMA-GT",
-     "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ("Flowers102", "PUMA-GT v1",
+     "Flowers102__PUMA-GT_AdaptPaCA",
+     "server_Flowers102_*_run*.h5"),
+
+    ("Flowers102", "PUMA-GT v2",
+     "fl_puma_v2_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "server_Flowers102_*_run*.h5"),
+
+    ("Flowers102", "PUMA-GT Plus",
+     "fl_pumagt_plus_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
      "server_Flowers102_*_run*.h5"),
 ]
 
@@ -380,9 +420,9 @@ def main():
         print("-" * 168)
         datasets_list = ["OxfordPets", "DTD", "FGVCAircraft", "Flowers102"]
         for ds in datasets_list:
-            puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT Rank Adap' and r['status'] == 'OK'), None)
+            puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT v2' and r['status'] == 'OK'), None)
             if puma is None:
-                puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT' and r['status'] == 'OK'), None)
+                puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] in ('PUMA-GT', 'PUMA-GT v1', 'PUMA-GT Rank Adap') and r['status'] == 'OK'), None)
             lora = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'LoRA Padrão' and r['status'] == 'OK'), None)
 
             if puma is None or lora is None:
