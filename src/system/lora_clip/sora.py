@@ -15,6 +15,7 @@ class SoRALinear(nn.Module):
     def __init__(self, in_features, out_features, r=8, lora_alpha=16, lora_dropout=0.0):
         super().__init__()
         self.r = r
+        self.base_r = r
         self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / r
 

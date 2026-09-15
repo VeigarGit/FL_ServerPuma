@@ -697,8 +697,8 @@ class FederatedLearningServer:
             client_info['last_rank_reduction_round'] = current_round
             return acc_signal
 
-        # --- 2. Mitigação de Straggler por Latência (Hardware lento) ---
-        if total_time > target_latency and not in_cooldown:
+        # --- 2. Mitigação de Straggler por Latência (Hardware lento, a partir do round 25) ---
+        if total_time > target_latency and not in_cooldown and current_round >= 25:
             if current_rank > min_rank:
                 new_rank = current_rank - 1
                 logger.info(f"Rank adaptativo {client_id}: reduzindo {current_rank} -> {new_rank} "
@@ -828,8 +828,8 @@ class FederatedLearningServer:
         if current_round < cooldown_until:
             return None
 
-        # --- B. SONDAGEM CAUTELOSA DE EFICIÊNCIA ---
-        if current_round < 20:
+        # --- B. SONDAGEM CAUTELOSA DE EFICIÊNCIA (a partir do round 25) ---
+        if current_round < 25:
             return None  # Fase inicial de aprendizado: não reduzir
             
         if mean_acc < best_acc * 0.90:
