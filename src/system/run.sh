@@ -359,6 +359,10 @@ else
     fi
 fi
 
+if [ "$ADAPTIVE_RANK" -eq 1 ]; then
+    echo "  Rank Adaptativo:    ATIVADO (min: $ADAPTIVE_RANK_MIN, max: $ADAPTIVE_RANK_MAX)"
+fi
+
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
 if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; else echo "  Compressão: INT8 padrão (8 bits/param)"; fi
@@ -383,8 +387,12 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 if [ -n "$EXP_NAME_OVERRIDE" ]; then
     EXP_NAME="$EXP_NAME_OVERRIDE"
 else
-    if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+    if [ "$ADAPTIVE_PACA" -eq 1 ] && [ "$ADAPTIVE_RANK" -eq 1 ]; then
+        EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca_adaptrank"
+    elif [ "$ADAPTIVE_PACA" -eq 1 ]; then
         EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca"
+    elif [ "$ADAPTIVE_RANK" -eq 1 ]; then
+        EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptrank"
     elif [ "$RANDOM_PACA" -eq 1 ]; then
         EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_randompaca"
     elif [ -n "$PACA_LIST" ]; then

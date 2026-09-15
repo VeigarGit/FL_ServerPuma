@@ -1,12 +1,13 @@
 #!/bin/bash
 
 # =============================================================================
-# run_all_sora.sh — Executa a sequência de simulações PUMA-GT nos 4 datasets
+# run_all_pumagt_plus.sh — Executa simulações completas do PUMA-GT Plus (CLIP)
 #
-# Configuração PUMA-GT:
+# Configuração PUMA-GT Plus:
 #   - Estratégia: sora_with_schedule
 #   - Frequência de Pruning: 3 (--prune-freq 3)
-#   - PaCA Adaptativo / APL: Ativado (--adaptive-paca)
+#   - PaCA Adaptativo (APL): Ativado (--adaptive-paca + --allow-paca-upscale)
+#   - Rank Adaptativo (ARR): Ativado (--adaptive-rank + --allow-rank-upscale, min=2, max=8)
 #   - Modelo: CLIP
 #   - Rodadas: 150
 #   - Clientes: 25
@@ -19,9 +20,9 @@
 #   4. Flowers102   (102 classes)
 #
 # Uso recomendado dentro de uma sessão tmux:
-#   tmux new -s orquestrador
+#   tmux new -s orquestrador_pumagt_plus
 #   cd /home/rafael.teixeira.silva/David/FL_ServerPuma/src/system
-#   ./run_all_sora.sh [opções adicionais como -did 1, --simulations 5, etc.]
+#   ./run_all_pumagt_plus.sh [opções adicionais como -did 0, --simulations 10, etc.]
 # =============================================================================
 
 set -e
@@ -29,8 +30,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 cd "$SCRIPT_DIR"
 
-# Parâmetros padrão do PUMA-GT
-SESSION_NAME="fl_puma_v2"
+# Parâmetros padrão do PUMA-GT Plus
+SESSION_NAME="fl_pumagt_plus"
 SIMULATIONS=10
 START_RUN=1
 CLIENTS=25
@@ -45,10 +46,10 @@ EXTRA_ARGS=()
 # Evita conflito se a sessão tmux externa tiver o mesmo nome da interna usada pelo run.sh
 if [ -n "$TMUX" ]; then
     CURRENT_TMUX_SESSION=$(tmux display-message -p '#S' 2>/dev/null || true)
-    if [ "$CURRENT_TMUX_SESSION" = "$SESSION_NAME" ] || [ "$CURRENT_TMUX_SESSION" = "fl_puma" ]; then
+    if [ "$CURRENT_TMUX_SESSION" = "$SESSION_NAME" ] || [ "$CURRENT_TMUX_SESSION" = "fl_puma" ] || [ "$CURRENT_TMUX_SESSION" = "fl_puma_v2" ]; then
         echo "❌ [ERRO] Sua sessão tmux atual se chama '$CURRENT_TMUX_SESSION'!"
         echo "O script cria internamente uma sessão com esse nome para o servidor e clientes."
-        echo "Por favor, execute dentro de uma sessão com nome diferente (ex: tmux new -s orquestrador_v2)."
+        echo "Por favor, execute dentro de uma sessão com nome diferente (ex: tmux new -s orquestrador_pumagt_plus)."
         exit 1
     fi
 fi
@@ -56,44 +57,81 @@ fi
 # Função de ajuda
 show_help() {
     cat << 'EOF'
-Uso: ./run_all_sora.sh [opções]
+Uso: ./run_all_pumagt_plus.sh [opções]
 
-Executa automaticamente as 10 simulações de PUMA-GT
-(SoRA com schedule, prune-freq 3 e adaptive-paca ativo)
+Executa automaticamente as 10 simulações de PUMA-GT Plus
+(SoRA com schedule, prune-freq 3, adaptive-paca e adaptive-rank ativos)
 para os 4 datasets na ordem:
   1. OxfordPets   (37 classes)
   2. DTD          (47 classes)
   3. FGVCAircraft (100 classes)
   4. Flowers102   (102 classes)
 
-Opções:
-  --simulations <n>           Número de simulações por dataset (padrão: 10)
-  --start-run <n>             Índice da simulação inicial (padrão: 1, ex: 4 para runs 4, 5, 6)
-  -c, --clients <n>           Número de clientes (padrão: 25)
-  -r, --rounds <n>            Número de rodadas (padrão: 150)
-  --prune-freq <n>            Frequência de pruning (padrão: 3)
-  -did, --device-id <id>      ID da GPU (padrão: 0)
-  -h, --help                  Exibir esta ajuda
+Opções disponíveis:
+  -s, --session <nome>       Nome da sessão tmux interna (padrão: fl_pumagt_plus)
+  --simulations <n>          Número de simulações por dataset (padrão: 10)
+  --start-run <n>            Número da primeira simulação (padrão: 1)
+  --clients <n>              Número de clientes (padrão: 25)
+  --rounds <n>               Número de rodadas por simulação (padrão: 150)
+  --prune-freq <n>           Frequência da poda iterativa SoRA (padrão: 3)
+  -did, --device-id <id>     ID da GPU a utilizar (padrão: 0)
+  -d, --dataset <nome>       Executa apenas um dataset específico
+  -h, --help                 Exibe esta mensagem de ajuda
+
+Exemplos:
+  ./run_all_pumagt_plus.sh
+  ./run_all_pumagt_plus.sh -did 0 --simulations 10
+  ./run_all_pumagt_plus.sh -d OxfordPets --simulations 3
 EOF
     exit 0
 }
 
-# Processa argumentos passados na linha de comando
-while [ $# -gt 0 ]; do
-    case $1 in
-        -h|--help) show_help ;;
-        --simulations) SIMULATIONS="$2"; shift 2 ;;
-        --start-run) START_RUN="$2"; shift 2 ;;
-        -s|--session) SESSION_NAME="$2"; shift 2 ;;
-        -d|--dataset) TARGET_DATASET="$2"; shift 2 ;;
-        --clients|-c) CLIENTS="$2"; shift 2 ;;
-        --rounds|-r) ROUNDS="$2"; shift 2 ;;
-        --prune-freq) PRUNE_FREQ="$2"; shift 2 ;;
-        -did|--device-id) DEVICE_ID="$2"; shift 2 ;;
-        *) EXTRA_ARGS+=("$1"); shift 1 ;;
+# Processamento de argumentos
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s|--session)
+            SESSION_NAME="$2"
+            shift 2
+            ;;
+        --simulations)
+            SIMULATIONS="$2"
+            shift 2
+            ;;
+        --start-run)
+            START_RUN="$2"
+            shift 2
+            ;;
+        --clients)
+            CLIENTS="$2"
+            shift 2
+            ;;
+        --rounds)
+            ROUNDS="$2"
+            shift 2
+            ;;
+        --prune-freq)
+            PRUNE_FREQ="$2"
+            shift 2
+            ;;
+        -did|--device-id)
+            DEVICE_ID="$2"
+            shift 2
+            ;;
+        -d|--dataset)
+            TARGET_DATASET="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift 1
+            ;;
     esac
 done
 
+# Definição dos datasets: "nome:num_classes"
 DATASETS=(
     "OxfordPets:37"
     "DTD:47"
@@ -114,11 +152,12 @@ fi
 TOTAL_DATASETS=${#DATASETS[@]}
 
 echo "================================================================="
-echo "        ORQUESTRADOR DE EXPERIMENTOS PUMA-GT (CLIP)"
+echo "        ORQUESTRADOR DE EXPERIMENTOS PUMA-GT PLUS (CLIP)"
 echo "================================================================="
-echo "  Estratégia:         $STRATEGY (prune_freq=$PRUNE_FREQ)
-  PaCA Adaptativo:    ATIVADO (--adaptive-paca + --allow-paca-upscale)
-  Modelo:             $MODEL"
+echo "  Estratégia:         $STRATEGY (prune_freq=$PRUNE_FREQ)"
+echo "  PaCA Adaptativo:    ATIVADO (--adaptive-paca + --allow-paca-upscale)"
+echo "  Rank Adaptativo:    ATIVADO (--adaptive-rank + --allow-rank-upscale, min=2, max=8)"
+echo "  Modelo:             $MODEL"
 echo "  Simulações/dataset: $SIMULATIONS"
 echo "  Clientes:           $CLIENTS"
 echo "  Rodadas:            $ROUNDS"
@@ -136,7 +175,7 @@ for ENTRY in "${DATASETS[@]}"; do
 
     DATASET_START_TIME=$(date +%s)
     echo "================================================================="
-    echo "[$IDX/$TOTAL_DATASETS] Iniciando PUMA-GT: $DATASET_NAME ($NUM_CLASSES classes)"
+    echo "[$IDX/$TOTAL_DATASETS] Iniciando PUMA-GT Plus: $DATASET_NAME ($NUM_CLASSES classes)"
     echo "Horário de início: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "================================================================="
 
@@ -150,6 +189,10 @@ for ENTRY in "${DATASETS[@]}"; do
         --prune-freq "$PRUNE_FREQ"
         --adaptive-paca
         --allow-paca-upscale
+        --adaptive-rank
+        --allow-rank-upscale
+        --adaptive-rank-min 2
+        --adaptive-rank-max 8
         --model "$MODEL"
         --rounds "$ROUNDS"
         --dataset "$DATASET_NAME"
@@ -187,7 +230,7 @@ TOTAL_H=$((TOTAL_DURATION / 3600))
 TOTAL_M=$(((TOTAL_DURATION % 3600) / 60))
 TOTAL_S=$((TOTAL_DURATION % 60))
 
-echo "🎉 TODOS OS EXPERIMENTOS PUMA-GT FORAM CONCLUÍDOS COM SUCESSO!"
+echo "🎉 TODOS OS EXPERIMENTOS PUMA-GT PLUS FORAM CONCLUÍDOS COM SUCESSO!"
 echo "Horário final: $(date '+%Y-%m-%d %H:%M:%S')"
 printf "Tempo total de execução: %02dh:%02dm:%02ds\n" "$TOTAL_H" "$TOTAL_M" "$TOTAL_S"
 echo "================================================================="
