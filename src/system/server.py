@@ -682,7 +682,7 @@ class FederatedLearningServer:
         # --- 1. Sinal da Acurácia Global (Rollback e Platô) ---
         last_reduction_round = client_info.get('last_rank_reduction_round', None)
         current_round = len(self.rs_test_acc)
-        cooldown_rounds = 8
+        cooldown_rounds = 4
         in_cooldown = (last_reduction_round is not None and (current_round - last_reduction_round) < cooldown_rounds)
 
         acc_signal = self._check_accuracy_signal_rank(client_id, current_rank, min_rank, max_rank, in_cooldown)
@@ -697,8 +697,8 @@ class FederatedLearningServer:
             client_info['last_rank_reduction_round'] = current_round
             return acc_signal
 
-        # --- 2. Mitigação de Straggler por Latência (Hardware lento, a partir do round 25) ---
-        if total_time > target_latency and not in_cooldown and current_round >= 25:
+        # --- 2. Mitigação de Straggler por Latência (Hardware lento, a partir do round 10) ---
+        if total_time > target_latency and not in_cooldown and current_round >= 10:
             if current_rank > min_rank:
                 new_rank = current_rank - 1
                 logger.info(f"Rank adaptativo {client_id}: reduzindo {current_rank} -> {new_rank} "
@@ -741,7 +741,7 @@ class FederatedLearningServer:
             return None
 
         current_round = len(acc_history)
-        if current_round < 25:
+        if current_round < 10:
             return None  # Fase inicial de aprendizado do subespaço
             
         # Escalonamento Canário: divide os clientes em 4 grupos (25% dos clientes por rodada)
@@ -828,8 +828,8 @@ class FederatedLearningServer:
         if current_round < cooldown_until:
             return None
 
-        # --- B. SONDAGEM CAUTELOSA DE EFICIÊNCIA (a partir do round 25) ---
-        if current_round < 25:
+        # --- B. SONDAGEM CAUTELOSA DE EFICIÊNCIA (a partir do round 10) ---
+        if current_round < 10:
             return None  # Fase inicial de aprendizado: não reduzir
             
         if mean_acc < best_acc * 0.90:
