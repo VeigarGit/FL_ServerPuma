@@ -48,19 +48,19 @@ EXPERIMENTS = [
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "PUMA-GT v1",
-     "OxfordPets__PUMA-GT_AdaptPaCA",
+     "OxfordPets__PUMA-GT_v1_PruneFreq3",
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "PUMA-GT v2",
-     "fl_puma_v2_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "OxfordPets__PUMA-GT_v2_PruneFreq1",
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "PUMA-GT Naive",
-     "fl_pumagt_naive_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+     "OxfordPets__PUMA-GT_Ablacao_NaiveRank",
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "PUMA-GT Plus",
-     "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+     "OxfordPets__PUMA-GT_Plus_Desacoplado",
      "server_OxfordPets_*_run*.h5"),
 
     # --- DTD ---
@@ -73,19 +73,19 @@ EXPERIMENTS = [
      "server_DTD_*_run*.h5"),
 
     ("DTD", "PUMA-GT v1",
-     "DTD__PUMA-GT_AdaptPaCA",
+     "DTD__PUMA-GT_v1_PruneFreq3",
      "server_DTD_*_run*.h5"),
 
     ("DTD", "PUMA-GT v2",
-     "fl_puma_v2_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "DTD__PUMA-GT_v2_PruneFreq1",
      "server_DTD_*_run*.h5"),
 
     ("DTD", "PUMA-GT Naive",
-     "fl_pumagt_naive_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+     "DTD__PUMA-GT_Ablacao_NaiveRank",
      "server_DTD_*_run*.h5"),
 
     ("DTD", "PUMA-GT Plus",
-     "fl_pumagt_plus_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+     "DTD__PUMA-GT_Plus_Desacoplado",
      "server_DTD_*_run*.h5"),
 
     # --- FGVCAircraft ---
@@ -98,15 +98,15 @@ EXPERIMENTS = [
      "server_FGVCAircraft_*_run*.h5"),
 
     ("FGVCAircraft", "PUMA-GT v1",
-     "FGVCAircraft__PUMA-GT_AdaptPaCA",
+     "FGVCAircraft__PUMA-GT_v1_PruneFreq3",
      "server_FGVCAircraft_*_run*.h5"),
 
     ("FGVCAircraft", "PUMA-GT v2",
-     "fl_puma_v2_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "FGVCAircraft__PUMA-GT_v2_PruneFreq1",
      "server_FGVCAircraft_*_run*.h5"),
 
     ("FGVCAircraft", "PUMA-GT Plus",
-     "fl_pumagt_plus_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+     "FGVCAircraft__PUMA-GT_Plus_Desacoplado",
      "server_FGVCAircraft_*_run*.h5"),
 
     # --- Flowers102 ---
@@ -119,15 +119,15 @@ EXPERIMENTS = [
      "server_Flowers102_*_run*.h5"),
 
     ("Flowers102", "PUMA-GT v1",
-     "Flowers102__PUMA-GT_AdaptPaCA",
+     "Flowers102__PUMA-GT_v1_PruneFreq3",
      "server_Flowers102_*_run*.h5"),
 
     ("Flowers102", "PUMA-GT v2",
-     "fl_puma_v2_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "Flowers102__PUMA-GT_v2_PruneFreq1",
      "server_Flowers102_*_run*.h5"),
 
     ("Flowers102", "PUMA-GT Plus",
-     "fl_pumagt_plus_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+     "Flowers102__PUMA-GT_Plus_Desacoplado",
      "server_Flowers102_*_run*.h5"),
 ]
 

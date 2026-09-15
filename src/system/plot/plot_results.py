@@ -149,13 +149,13 @@ def parse_experiment(exp_name, results_base=None):
 
     if "adalora" in exp_name.lower():
         label = f"AdaLoRA{rank_str}"
-    elif "pumagt_naive" in exp_name.lower() or "naive" in exp_name.lower():
+    elif "naive" in exp_name.lower() or "ablacao" in exp_name.lower():
         label = f"PUMA-GT (Naive){rank_str}"
-    elif "puma_plus" in exp_name.lower() or "pumagt_plus" in exp_name.lower():
+    elif "plus" in exp_name.lower():
         label = f"PUMA-GT Plus{rank_str}"
-    elif "puma_v2" in exp_name.lower() or "_v2" in exp_name.lower():
+    elif "v2" in exp_name.lower():
         label = f"PUMA-GT (v2){rank_str}"
-    elif "puma" in exp_name.lower() or "adaptpaca" in exp_name.lower():
+    elif "v1" in exp_name.lower() or "prunefreq3" in exp_name.lower() or "adaptpaca" in exp_name.lower():
         label = f"PUMA-GT (v1){rank_str}"
     elif "sora" in exp_name.lower():
         label = f"Static SoRA{rank_str}"
@@ -1027,30 +1027,32 @@ DATASET_EXPERIMENTS = {
     "OxfordPets": [
         "OxfordPets__LoRA_Padrao_paca12",
         "OxfordPets__SoRA_Estatico_paca12",
-        "OxfordPets__PUMA-GT_AdaptPaCA",
-        "fl_puma_v2_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
-        "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+        "OxfordPets__PUMA-GT_v1_PruneFreq3",
+        "OxfordPets__PUMA-GT_v2_PruneFreq1",
+        "OxfordPets__PUMA-GT_Ablacao_NaiveRank",
+        "OxfordPets__PUMA-GT_Plus_Desacoplado",
     ],
     "Flowers102": [
         "Flowers102__LoRA_Padrao_paca12",
         "Flowers102__SoRA_Estatico_paca12",
-        "Flowers102__PUMA-GT_AdaptPaCA",
-        "fl_puma_v2_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
-        "fl_pumagt_plus_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+        "Flowers102__PUMA-GT_v1_PruneFreq3",
+        "Flowers102__PUMA-GT_v2_PruneFreq1",
+        "Flowers102__PUMA-GT_Plus_Desacoplado",
     ],
     "DTD": [
         "DTD__LoRA_Padrao_paca12",
         "DTD__SoRA_Estatico_paca12",
-        "DTD__PUMA-GT_AdaptPaCA",
-        "fl_puma_v2_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
-        "fl_pumagt_plus_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+        "DTD__PUMA-GT_v1_PruneFreq3",
+        "DTD__PUMA-GT_v2_PruneFreq1",
+        "DTD__PUMA-GT_Ablacao_NaiveRank",
+        "DTD__PUMA-GT_Plus_Desacoplado",
     ],
     "FGVCAircraft": [
         "FGVCAircraft__LoRA_Padrao_paca12",
         "FGVCAircraft__SoRA_Estatico_paca12",
-        "FGVCAircraft__PUMA-GT_AdaptPaCA",
-        "fl_puma_v2_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
-        "fl_pumagt_plus_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank",
+        "FGVCAircraft__PUMA-GT_v1_PruneFreq3",
+        "FGVCAircraft__PUMA-GT_v2_PruneFreq1",
+        "FGVCAircraft__PUMA-GT_Plus_Desacoplado",
     ],
 }
 
