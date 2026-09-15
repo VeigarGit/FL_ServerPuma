@@ -60,7 +60,7 @@ EXPERIMENTS = [
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "PUMA-GT Plus",
-     "OxfordPets__PUMA-GT_Plus_Desacoplado",
+     ("OxfordPets__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
      "server_OxfordPets_*_run*.h5"),
 
     # --- DTD ---
@@ -85,7 +85,7 @@ EXPERIMENTS = [
      "server_DTD_*_run*.h5"),
 
     ("DTD", "PUMA-GT Plus",
-     "DTD__PUMA-GT_Plus_Desacoplado",
+     ("DTD__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
      "server_DTD_*_run*.h5"),
 
     # --- FGVCAircraft ---
@@ -106,7 +106,7 @@ EXPERIMENTS = [
      "server_FGVCAircraft_*_run*.h5"),
 
     ("FGVCAircraft", "PUMA-GT Plus",
-     "FGVCAircraft__PUMA-GT_Plus_Desacoplado",
+     ("FGVCAircraft__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
      "server_FGVCAircraft_*_run*.h5"),
 
     # --- Flowers102 ---
@@ -127,7 +127,7 @@ EXPERIMENTS = [
      "server_Flowers102_*_run*.h5"),
 
     ("Flowers102", "PUMA-GT Plus",
-     "Flowers102__PUMA-GT_Plus_Desacoplado",
+     ("Flowers102__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
      "server_Flowers102_*_run*.h5"),
 ]
 
@@ -227,8 +227,19 @@ def analyze_experiment(results_dir: str, folder: str, h5_glob: str) -> dict:
     Retorna dict com média ± desvio padrão de cada métrica,
     e o número de runs encontrados.
     """
-    exp_path = os.path.join(results_dir, folder)
-    if not os.path.isdir(exp_path):
+    if isinstance(folder, (list, tuple)):
+        candidates = folder
+    else:
+        candidates = [folder]
+
+    exp_path = None
+    for cand in candidates:
+        p = os.path.join(results_dir, cand)
+        if os.path.isdir(p):
+            exp_path = p
+            break
+
+    if exp_path is None:
         return None
 
     h5_files = sorted(glob.glob(os.path.join(exp_path, h5_glob)))

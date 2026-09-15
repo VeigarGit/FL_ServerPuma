@@ -110,10 +110,25 @@ def parse_experiment(exp_name, results_base=None):
     """Analisa um diretório de experimento e retorna seus metadados + dados."""
     if results_base is None:
         results_base = DEFAULT_RESULTS_BASE
-    results_dir = os.path.join(results_base, exp_name)
-    if not os.path.isdir(results_dir):
-        print(f"⚠️ Diretório não encontrado: {results_dir}")
+
+    if isinstance(exp_name, (list, tuple)):
+        candidates = exp_name
+    else:
+        candidates = [exp_name]
+
+    results_dir = None
+    actual_name = candidates[0]
+    for cand in candidates:
+        p = os.path.join(results_base, cand)
+        if os.path.isdir(p):
+            results_dir = p
+            actual_name = cand
+            break
+
+    if results_dir is None:
+        print(f"⚠️ Diretório não encontrado: {candidates[0]}")
         return None
+    exp_name = actual_name
 
     server_files = sorted(glob.glob(os.path.join(results_dir, "server_*.h5")))
     if not server_files:
