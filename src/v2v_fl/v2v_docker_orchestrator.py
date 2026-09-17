@@ -691,7 +691,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         pair_encounter_counts[cluster_key],
                     )
 
-                    # Montar dados do encontro com ETC para os clientes usarem
+                    # Montar dados do encontro com ETC e Posições para os clientes usarem
                     encounter_data = {
                         "encounter_id": encounter_count,
                         "clients": c_indices,
@@ -699,6 +699,12 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         # O ETC permite que os clientes ajustem seu timeout
                         # de polling pela janela de contato real
                         "etc_seconds": etc,
+                        # As posicoes sao necessarias na Fase 3 para o cliente eleger
+                        # o Aggregator (medoid) e simular o canal (path loss) OTA.
+                        "positions": {
+                            veh_to_client_idx[v.veh_id]: (v.x, v.y)
+                            for v in best_cluster
+                        }
                     }
 
                     # Escrita ATOMICA do JSON (write-to-temp + rename)

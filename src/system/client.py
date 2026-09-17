@@ -820,14 +820,23 @@ def main():
             clients_in_encounter = encounter_data.get("clients", [])
             etc_seconds = encounter_data.get("etc_seconds", 60)
             
+            # Converter chaves do JSON de volta para int
+            positions = {int(k): tuple(v) for k, v in encounter_data.get("positions", {}).items()}
+            
             if isinstance(etc_seconds, str) and etc_seconds == "Carros Parados":
                 poll_timeout = 115 
             else:
                 poll_timeout = max(5, int(etc_seconds - 5))
                 
-            logger.info(f"Client {args.client_idx}: [D-PSGD] Encontro {enc_id} detectado! ETC={etc_seconds}s. Iniciando troca P2P.")
+            # Eleição do Aggregator via Medoid
+            from v2v_fl.over_the_air.ota_channel import find_medoid
+            aggregator_id = find_medoid(positions)
+            is_aggregator = (args.client_idx == aggregator_id)
             
-            # ── FASE 6: Troca P2P e Agregação (D-PSGD) ──────────────────────
+            logger.info(f"Client {args.client_idx}: [D-PSGD] Encontro {enc_id} detectado! ETC={etc_seconds}s.")
+            logger.info(f"Client {args.client_idx}: Aggregator eleito: {aggregator_id}. Sou aggregator? {is_aggregator}")
+            
+            # ── FASE 6: Troca P2P e Agregação (D-PSGD Assimétrico) ──────────────
             if args.model == 'clip':
                 from lora_clip.sora import get_trainable_state_dict
                 snapshot = get_trainable_state_dict(model)
@@ -837,8 +846,9 @@ def main():
                 
             other_clients = [c for c in clients_in_encounter if c != args.client_idx]
             
-            for c in other_clients:
-                target_host = f"fl-client-v2v-{c}"
+            # 1. Transmissores enviam seus pesos para o Aggregator
+            if not is_aggregator:
+                target_host = f"fl-client-v2v-{aggregator_id}"
                 sent = False
                 for attempt in range(poll_timeout):
                     try:
@@ -850,29 +860,45 @@ def main():
                             rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
                             rs_p2p_data_sent_enc_ids.append(enc_id)
                             send_data(s, (args.client_idx, enc_id, snapshot))
-                        logger.info(f"Client {args.client_idx}: Enviou pesos para {target_host} ({snapshot_bytes / (1024*1024):.2f} MB)")
+                        logger.info(f"Client {args.client_idx}: Enviou pesos para o Aggregator {target_host} ({snapshot_bytes / (1024*1024):.2f} MB)")
                         sent = True
                         break
                     except (ConnectionRefusedError, socket.timeout):
                         time.sleep(1)
                 if not sent:
-                    logger.warning(f"Client {args.client_idx}: Falhou ao enviar pesos para {target_host} apos {poll_timeout}s")
+                    logger.warning(f"Client {args.client_idx}: Falhou ao enviar pesos para o Aggregator após {poll_timeout}s")
 
-            # Aguardar pesos dos vizinhos
-            logger.info(f"Client {args.client_idx}: Aguardando receber pesos dos vizinhos {other_clients}...")
-            received_states = []
-            for attempt in range(poll_timeout):
-                with in_memory_lock:
-                    if enc_id in in_memory_weights:
-                        missing = [c for c in other_clients if c not in in_memory_weights[enc_id]]
-                        if not missing:
-                            for c in other_clients:
-                                received_states.append(in_memory_weights[enc_id][c])
+                # Aguardar resposta do Aggregator (pesos consolidados)
+                logger.info(f"Client {args.client_idx}: Aguardando resposta do Aggregator {aggregator_id}...")
+                received_states = []
+                for attempt in range(poll_timeout):
+                    with in_memory_lock:
+                        if enc_id in in_memory_weights and aggregator_id in in_memory_weights[enc_id]:
+                            received_states.append(in_memory_weights[enc_id][aggregator_id])
                             break
-                time.sleep(1)
+                    time.sleep(1)
 
-            if len(received_states) == len(other_clients):
-                logger.info(f"Client {args.client_idx}: Todos os pesos recebidos! Agregando D-PSGD...")
+            # 2. Aggregator recebe de todos os transmissores e consolida
+            if is_aggregator:
+                logger.info(f"Client {args.client_idx}: Aguardando receber pesos dos transmissores {other_clients}...")
+                received_states = []
+                for attempt in range(poll_timeout):
+                    with in_memory_lock:
+                        if enc_id in in_memory_weights:
+                            missing = [c for c in other_clients if c not in in_memory_weights[enc_id]]
+                            if not missing:
+                                for c in other_clients:
+                                    received_states.append(in_memory_weights[enc_id][c])
+                                break
+                    time.sleep(1)
+
+            # 3. Consolidação (No Aggregator) ou Atualização (Nos Transmissores)
+            if (is_aggregator and len(received_states) == len(other_clients)) or (not is_aggregator and len(received_states) == 1):
+                if is_aggregator:
+                    logger.info(f"Client {args.client_idx}: Todos os pesos recebidos! Agregando D-PSGD (Media simples temporaria)...")
+                else:
+                    logger.info(f"Client {args.client_idx}: Pesos consolidados recebidos do Aggregator!")
+
                 if args.model in ['clip', 'slm']:
                     for k in snapshot.keys():
                         tensors = [snapshot[k].float()] + [s[k].float() for s in received_states]
@@ -891,9 +917,33 @@ def main():
                         snapshot[k] = torch.mean(torch.stack(tensors), dim=0).to(snapshot[k].dtype)
                     model.load_state_dict(snapshot)
 
+                # 4. Aggregator envia o resultado de volta para os transmissores
+                if is_aggregator:
+                    for c in other_clients:
+                        target_host = f"fl-client-v2v-{c}"
+                        sent = False
+                        for attempt in range(5): # Tentativas rápidas, eles já estão esperando
+                            try:
+                                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                                    s.settimeout(2.0)
+                                    s.connect((target_host, 9000))
+                                    import pickle
+                                    snapshot_bytes = len(pickle.dumps((args.client_idx, enc_id, snapshot)))
+                                    rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
+                                    rs_p2p_data_sent_enc_ids.append(enc_id)
+                                    send_data(s, (args.client_idx, enc_id, snapshot))
+                                logger.info(f"Client {args.client_idx}: Retornou pesos consolidados para {target_host}")
+                                sent = True
+                                break
+                            except (ConnectionRefusedError, socket.timeout):
+                                time.sleep(1)
+                        if not sent:
+                            logger.warning(f"Client {args.client_idx}: Falhou ao retornar pesos consolidados para {target_host}")
+
                 # Limpar RAM
                 with in_memory_lock:
-                    del in_memory_weights[enc_id]
+                    if enc_id in in_memory_weights:
+                        del in_memory_weights[enc_id]
 
                 # ── FASE 7: Avaliação Pós-Agregação ──────────────────────
                 if not args.skip_post_eval:
