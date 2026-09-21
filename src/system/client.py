@@ -894,28 +894,112 @@ def main():
 
             # 3. Consolidação (No Aggregator) ou Atualização (Nos Transmissores)
             if (is_aggregator and len(received_states) == len(other_clients)) or (not is_aggregator and len(received_states) == 1):
+
+                # ── AGGREGATOR: Pipeline OTA (Over-the-Air) ──────────────────
                 if is_aggregator:
-                    logger.info(f"Client {args.client_idx}: Todos os pesos recebidos! Agregando D-PSGD (Media simples temporaria)...")
+                    logger.info(f"Client {args.client_idx}: Todos os pesos recebidos! Iniciando agregação OTA...")
+
+                    import numpy as np
+                    from v2v_fl.over_the_air.ota_channel import (
+                        distances_from_positions,
+                        build_channel_matrices,
+                        compute_noise_variance,
+                    )
+                    from v2v_fl.over_the_air.ota_aggregation import (
+                        compute_weight_variance,
+                        mmse_beamforming,
+                        apply_ota_channel,
+                    )
+
+                    # Passo 3a: Montar o dicionário {client_id: state_dict} dos transmissores
+                    tx_state_dicts = {}
+                    for i, c in enumerate(other_clients):
+                        tx_state_dicts[c] = received_states[i]
+
+                    # Passo 3b: Calcular distâncias geográficas (SUMO) entre cada
+                    # transmissor e o aggregator (eu)
+                    transmitter_ids, distances = distances_from_positions(positions, aggregator_id)
+                    logger.info(f"Client {args.client_idx}: Distâncias aos transmissores: "
+                                f"{dict(zip(transmitter_ids, distances.tolist()))}")
+
+                    # Passo 3c: n_samples uniforme (FedAvg sem ponderação por dataset)
+                    n_tx = len(transmitter_ids)
+                    n_samples = np.ones(n_tx, dtype=np.float64)
+
+                    # Passo 3d: Construir as matrizes de canal (Path Loss + Rayleigh Fading)
+                    # n_antennas = 8 é o padrão do paper de referência
+                    N_ANTENNAS = 8
+                    EPSILON = 0.1  # Erro de estimação do canal (10%)
+                    H_est, H_true, H_scaled, path_loss = build_channel_matrices(
+                        distances, N_ANTENNAS, n_samples, epsilon=EPSILON,
+                    )
+
+                    # Passo 3e: Calcular a variância dos pesos de cada transmissor
+                    # (usado para normalizar os pesos antes da transmissão)
+                    variances, model_size = compute_weight_variance(tx_state_dicts)
+                    weight_vars = np.array([variances[tid] for tid in transmitter_ids])
+
+                    # Passo 3f: Calcular o beamforming MMSE (vetor de recepção f' e
+                    # escalares de transmissão b_k)
+                    f_prime, transmit_scalars = mmse_beamforming(H_est, weight_vars, n_samples)
+
+                    # Passo 3g: Calcular a variância do ruído térmico do receptor
+                    noise_var = compute_noise_variance(bandwidth_hz=100e3)
+
+                    # Passo 3h: Simular a transmissão Over-the-Air!
+                    # Esta função aplica: normalização → pré-codificação → canal → ruído
+                    # O resultado é a média ponderada degradada pelo canal de rádio
+                    ota_aggregated = apply_ota_channel(
+                        state_dicts=tx_state_dicts,
+                        transmitter_ids=transmitter_ids,
+                        n_samples=n_samples,
+                        H_true=H_true,
+                        transmit_scalars=transmit_scalars,
+                        f_prime=f_prime,
+                        noise_variance=noise_var,
+                        weight_variances=weight_vars,
+                    )
+                    logger.info(f"Client {args.client_idx}: Agregação OTA concluída com sucesso!")
+
+                    # Passo 3i: FedAvg final — média entre o resultado OTA (transmissores)
+                    # e o modelo local do aggregator (que não viajou pelo ar)
+                    for k in snapshot.keys():
+                        ota_val = ota_aggregated[k].float()
+                        local_val = snapshot[k].float()
+                        # Média simples: (meu_modelo + modelo_OTA) / 2
+                        snapshot[k] = ((local_val + ota_val) / 2.0).to(snapshot[k].dtype)
+
+                    # Carregar o modelo agregado no PyTorch
+                    if args.model in ['clip', 'slm']:
+                        if args.model == 'clip':
+                            from lora_clip.sora import set_trainable_state_dict
+                            set_trainable_state_dict(model, snapshot)
+                        else:
+                            from lora_slm.sora import set_trainable_state_dict as set_trainable_state_dict_slm
+                            set_trainable_state_dict_slm(model, snapshot)
+                    else:
+                        model.load_state_dict(snapshot)
+
+                # ── TRANSMISSOR: Apenas carrega o modelo recebido do Aggregator ──
                 else:
                     logger.info(f"Client {args.client_idx}: Pesos consolidados recebidos do Aggregator!")
+                    # O Transmissor recebe o modelo já agregado (OTA + local do Aggregator)
+                    # e simplesmente o carrega como seu novo modelo local
+                    aggregated_state = received_states[0]
 
-                if args.model in ['clip', 'slm']:
-                    for k in snapshot.keys():
-                        tensors = [snapshot[k].float()] + [s[k].float() for s in received_states]
-                        avg_tensor = torch.mean(torch.stack(tensors), dim=0).to(snapshot[k].dtype)
-                        snapshot[k].copy_(avg_tensor)
-                    
-                    if args.model == 'clip':
-                        from lora_clip.sora import set_trainable_state_dict
-                        set_trainable_state_dict(model, snapshot)
+                    if args.model in ['clip', 'slm']:
+                        for k in snapshot.keys():
+                            snapshot[k].copy_(aggregated_state[k].to(snapshot[k].dtype))
+                        if args.model == 'clip':
+                            from lora_clip.sora import set_trainable_state_dict
+                            set_trainable_state_dict(model, snapshot)
+                        else:
+                            from lora_slm.sora import set_trainable_state_dict as set_trainable_state_dict_slm
+                            set_trainable_state_dict_slm(model, snapshot)
                     else:
-                        from lora_slm.sora import set_trainable_state_dict as set_trainable_state_dict_slm
-                        set_trainable_state_dict_slm(model, snapshot)
-                else:
-                    for k in snapshot.keys():
-                        tensors = [snapshot[k].float()] + [s[k].float() for s in received_states]
-                        snapshot[k] = torch.mean(torch.stack(tensors), dim=0).to(snapshot[k].dtype)
-                    model.load_state_dict(snapshot)
+                        for k in snapshot.keys():
+                            snapshot[k] = aggregated_state[k].to(snapshot[k].dtype)
+                        model.load_state_dict(snapshot)
 
                 # 4. Aggregator envia o resultado de volta para os transmissores
                 if is_aggregator:
