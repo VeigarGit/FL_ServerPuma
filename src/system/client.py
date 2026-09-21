@@ -306,7 +306,7 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
 
 
 
-def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0, rs_post_p2p_acc=None, rs_post_p2p_encounter_ids=None, rs_p2p_data_sent_mb=None, rs_p2p_data_sent_enc_ids=None):
+def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0, rs_post_p2p_acc=None, rs_post_p2p_encounter_ids=None, rs_p2p_data_sent_mb=None, rs_p2p_data_sent_enc_ids=None, rs_ota_encounter_epochs=None, rs_ota_mean_distances=None, rs_ota_is_aggregator=None):
     b = "FedALA" if argalgo == 0 else "FedAVG"
     
     paca_val = args.paca if (isinstance(args.paca, (int, float)) and not isinstance(args.paca, bool) and args.paca > 0) else 0
@@ -336,6 +336,13 @@ def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, 
             hf.create_dataset('rs_p2p_data_sent_mb', data=rs_p2p_data_sent_mb)
         if rs_p2p_data_sent_enc_ids is not None and len(rs_p2p_data_sent_enc_ids) > 0:
             hf.create_dataset('rs_p2p_data_sent_enc_ids', data=rs_p2p_data_sent_enc_ids)
+        # Métricas OTA (Fase 3): distância, época do encontro, papel do cliente
+        if rs_ota_encounter_epochs is not None and len(rs_ota_encounter_epochs) > 0:
+            hf.create_dataset('rs_ota_encounter_epochs', data=rs_ota_encounter_epochs)
+        if rs_ota_mean_distances is not None and len(rs_ota_mean_distances) > 0:
+            hf.create_dataset('rs_ota_mean_distances', data=rs_ota_mean_distances)
+        if rs_ota_is_aggregator is not None and len(rs_ota_is_aggregator) > 0:
+            hf.create_dataset('rs_ota_is_aggregator', data=rs_ota_is_aggregator)
         hf.attrs['paca_used'] = paca_val
 
 def local_initialization(ala, received_global_model, model, mask=None):
@@ -528,6 +535,10 @@ def main():
     rs_post_p2p_encounter_ids = []
     rs_p2p_data_sent_mb = []
     rs_p2p_data_sent_enc_ids = []
+    # Métricas OTA (Fase 3): registram informações de cada encontro
+    rs_ota_encounter_epochs = []   # Em qual época cada encontro ocorreu
+    rs_ota_mean_distances = []     # Distância média (metros) dos TX ao Aggregator
+    rs_ota_is_aggregator = []      # 1 se este cliente foi o Aggregator, 0 se TX
     
     try:
         is_clip_flag = (args.model == 'clip')
@@ -836,6 +847,13 @@ def main():
             logger.info(f"Client {args.client_idx}: [D-PSGD] Encontro {enc_id} detectado! ETC={etc_seconds}s.")
             logger.info(f"Client {args.client_idx}: Aggregator eleito: {aggregator_id}. Sou aggregator? {is_aggregator}")
             
+            # Calcular distância média TX→Aggregator para métricas OTA
+            # (disponível para todos os clientes, pois todos lêem o JSON)
+            import numpy as np
+            from v2v_fl.over_the_air.ota_channel import distances_from_positions
+            _, enc_distances = distances_from_positions(positions, aggregator_id)
+            enc_mean_distance = float(np.mean(enc_distances)) if len(enc_distances) > 0 else 0.0
+            
             # ── FASE 6: Troca P2P e Agregação (D-PSGD Assimétrico) ──────────────
             if args.model == 'clip':
                 from lora_clip.sora import get_trainable_state_dict
@@ -1035,12 +1053,22 @@ def main():
                     logger.info(f"Client {args.client_idx}: Post-D-PSGD Test Accuracy: {post_p2p_acc:.2f}%")
                     rs_post_p2p_acc.append(post_p2p_acc)
                     rs_post_p2p_encounter_ids.append(enc_id)
+                
+                # Registrar métricas OTA deste encontro (dentro ou fora do skip_post_eval)
+                rs_ota_encounter_epochs.append(epoch)
+                rs_ota_mean_distances.append(enc_mean_distance)
+                rs_ota_is_aggregator.append(1 if is_aggregator else 0)
+                
+                if not args.skip_post_eval:
                     save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, 
                                  idx=args.client_idx, argalgo=args.ala, 
                                  rs_post_p2p_acc=rs_post_p2p_acc, 
                                  rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
                                  rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                                 rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids)
+                                 rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
+                                 rs_ota_encounter_epochs=rs_ota_encounter_epochs,
+                                 rs_ota_mean_distances=rs_ota_mean_distances,
+                                 rs_ota_is_aggregator=rs_ota_is_aggregator)
 
                 # Sinalizar ao SUMO que a troca terminou
                 (encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}").touch()
@@ -1059,7 +1087,10 @@ def main():
                      rs_post_p2p_acc=rs_post_p2p_acc, 
                      rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
                      rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                     rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids)
+                     rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
+                     rs_ota_encounter_epochs=rs_ota_encounter_epochs,
+                     rs_ota_mean_distances=rs_ota_mean_distances,
+                     rs_ota_is_aggregator=rs_ota_is_aggregator)
         logger.info("\nTraining completed!")
 
 if __name__ == '__main__':
