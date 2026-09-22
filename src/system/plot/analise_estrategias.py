@@ -20,6 +20,7 @@ import sys
 import argparse
 import csv
 import glob
+import re
 from pathlib import Path
 
 import numpy as np
@@ -60,7 +61,7 @@ EXPERIMENTS = [
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "PUMA-GT Plus",
-     ("OxfordPets__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
+     ("fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "OxfordPets__PUMA-GT_Plus_Cientifico_083", "OxfordPets__PUMA-GT_Plus_Cientifico", "OxfordPets__PUMA-GT_Plus_Desacoplado"),
      "server_OxfordPets_*_run*.h5"),
 
     # --- DTD ---
@@ -245,6 +246,19 @@ def analyze_experiment(results_dir: str, folder: str, h5_glob: str) -> dict:
     h5_files = sorted(glob.glob(os.path.join(exp_path, h5_glob)))
     if not h5_files:
         return None
+
+    # Deduplicar execuções mantendo o arquivo mais recente para cada run
+    run_dict = {}
+    for f in h5_files:
+        m = re.search(r"_run(\d+)(?:_(\d{8}_\d{6}))?\.h5$", os.path.basename(f))
+        if m:
+            rid = int(m.group(1))
+            ts = m.group(2) or ""
+            if rid not in run_dict or ts > run_dict[rid][0]:
+                run_dict[rid] = (ts, f)
+        else:
+            run_dict[f] = ("", f)
+    h5_files = [v[1] for v in sorted(run_dict.values(), key=lambda x: x[1])]
 
     # Acumular métricas de cada run
     metrics_keys = [
@@ -431,7 +445,9 @@ def main():
         print("-" * 168)
         datasets_list = ["OxfordPets", "DTD", "FGVCAircraft", "Flowers102"]
         for ds in datasets_list:
-            puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT v2' and r['status'] == 'OK'), None)
+            puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT Plus' and r['status'] == 'OK'), None)
+            if puma is None:
+                puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT v2' and r['status'] == 'OK'), None)
             if puma is None:
                 puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] in ('PUMA-GT', 'PUMA-GT v1', 'PUMA-GT Rank Adap') and r['status'] == 'OK'), None)
             lora = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'LoRA Padrão' and r['status'] == 'OK'), None)

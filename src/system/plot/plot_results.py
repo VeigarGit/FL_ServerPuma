@@ -92,11 +92,13 @@ def _set_title(ax, title):
 
 
 def _save_and_close(fig, output_dir, filename):
-    """Salva a figura como PDF e fecha."""
+    """Salva a figura como PDF e PNG e fecha."""
     path = os.path.join(output_dir, filename)
     fig.savefig(path, dpi=150)
+    png_path = os.path.splitext(path)[0] + ".png"
+    fig.savefig(png_path, dpi=150)
     plt.close(fig)
-    print(f"  📊 {path}")
+    print(f"  📊 {path} | {png_path}")
 
 
 # ==============================================================================
@@ -135,6 +137,19 @@ def parse_experiment(exp_name, results_base=None):
         print(f"⚠️ Nenhum arquivo de servidor em: {results_dir}")
         return None
 
+    # Deduplicar execuções mantendo o arquivo mais recente para cada run
+    run_dict = {}
+    for f in server_files:
+        m = re.search(r"_run(\d+)(?:_(\d{8}_\d{6}))?\.h5$", os.path.basename(f))
+        if m:
+            rid = int(m.group(1))
+            ts = m.group(2) or ""
+            if rid not in run_dict or ts > run_dict[rid][0]:
+                run_dict[rid] = (ts, f)
+        else:
+            run_dict[f] = ("", f)
+    server_files = [v[1] for v in sorted(run_dict.values(), key=lambda x: x[1])]
+
     # Extrair metadados do nome do arquivo
     sample = os.path.basename(server_files[0])
     
@@ -162,7 +177,9 @@ def parse_experiment(exp_name, results_base=None):
     else:
         rank_str = ""
 
-    if "adalora" in exp_name.lower():
+    if "localacc" in exp_name.lower():
+        label = f"PUMA-GT (LocalAcc){rank_str}"
+    elif "adalora" in exp_name.lower():
         label = f"AdaLoRA{rank_str}"
     elif "naive" in exp_name.lower() or "ablacao" in exp_name.lower():
         label = f"PUMA-GT (Naive){rank_str}"
@@ -173,7 +190,7 @@ def parse_experiment(exp_name, results_base=None):
     elif "v1" in exp_name.lower() or "prunefreq3" in exp_name.lower() or "adaptpaca" in exp_name.lower():
         label = f"PUMA-GT (v1){rank_str}"
     elif "sora" in exp_name.lower():
-        label = f"Static SoRA{rank_str}"
+        label = f"SoRA{rank_str}"
     elif "lora" in exp_name.lower():
         label = f"LoRA{rank_str}"
     else:
@@ -185,9 +202,22 @@ def parse_experiment(exp_name, results_base=None):
     server_data = _load_server_h5(server_files)
 
     # Carregar dados dos clientes
-    client_pattern = os.path.join(results_dir, f"client_*_{dataset}_{strategy}_rank{rank}_paca*_{algo}_run*.h5")
+    client_pattern = os.path.join(results_dir, f"client_*_{dataset}_{strategy}_rank*_paca*_{algo}_run*.h5")
     client_files = sorted(glob.glob(client_pattern))
-    client_data = _load_client_h5(client_files) if client_files else None
+    if client_files:
+        c_dict = {}
+        for f in client_files:
+            m = re.search(r"client_(\d+)_.*_run(\d+)(?:_(\d{8}_\d{6}))?\.h5$", os.path.basename(f))
+            if m:
+                cid, rid = int(m.group(1)), int(m.group(2))
+                ts = m.group(3) or ""
+                key = (cid, rid)
+                if key not in c_dict or ts > c_dict[key][0]:
+                    c_dict[key] = (ts, f)
+            else:
+                c_dict[f] = ("", f)
+        client_files = [v[1] for v in sorted(c_dict.values(), key=lambda x: x[1])]
+    client_data = _load_client_h5(client_files, dataset=dataset) if client_files else None
 
     return {
         'exp_name':    exp_name,
@@ -206,7 +236,7 @@ def parse_experiment(exp_name, results_base=None):
 
 
 def _load_server_h5(files):
-    acc, loss, mb, mb_bruto, time_, params, size_, paca = [], [], [], [], [], [], [], []
+    acc, loss, mb, mb_bruto, time_, params, size_, paca, rank = [], [], [], [], [], [], [], [], []
     client_training_time = []
     client_comm_time = []
     server_pruning_time = []
@@ -229,6 +259,15 @@ def _load_server_h5(files):
                 paca.append(np.array(hf['rs_client_paca']))
             else:
                 paca.append(None)
+                
+            if 'rs_client_rank' in hf:
+                rank.append(np.array(hf['rs_client_rank']))
+            elif 'rs_test_acc' in hf:
+                num_rounds = len(hf['rs_test_acc'])
+                num_clients = len(hf['rs_client_paca'][0]) if ('rs_client_paca' in hf and len(hf['rs_client_paca']) > 0) else 25
+                rank.append(np.full((num_rounds, num_clients), 8.0))
+            else:
+                rank.append(None)
                 
             if 'rs_client_training_time' in hf:
                 client_training_time.append(np.array(hf['rs_client_training_time']))
@@ -258,6 +297,13 @@ def _load_server_h5(files):
     paca_mean = None
     if all(p is not None for p in paca):
         paca_mean = np.mean(paca, axis=0)
+
+    rank_mean = None
+    valid_rank = [r for r in rank if r is not None]
+    if valid_rank:
+        min_len = min(len(r) for r in valid_rank)
+        valid_rank = [r[:min_len] for r in valid_rank]
+        rank_mean = np.mean(valid_rank, axis=0)
 
     valid_client_training_time = [t for t in client_training_time if t is not None]
     client_training_time_mean = None
@@ -318,6 +364,7 @@ def _load_server_h5(files):
         'params_mean': np.mean(params, axis=0),
         'size_mb_mean': np.mean(size_, axis=0), 'size_mb_std': np.std(size_, axis=0),
         'paca_mean': paca_mean,
+        'rank_mean': rank_mean,
         'client_training_time_mean': client_training_time_mean,
         'client_comm_time_mean': client_comm_time_mean,
         'server_pruning_time_mean': server_pruning_time_mean,
@@ -329,23 +376,50 @@ def _load_server_h5(files):
     }
 
 
-def _load_client_h5(files):
+def _load_client_h5(files, dataset=None):
     g_acc, g_loss, l_acc, t_acc = [], [], [], []
-    clients_set = set()
+    clients_order = []
     for f in files:
-        clients_set.add(os.path.basename(f).split('_')[1])
+        m = re.search(r"client_(\d+)_", os.path.basename(f))
+        cid = int(m.group(1)) if m else len(clients_order)
+        clients_order.append(cid)
         with h5py.File(f, 'r') as hf:
             g_acc.append(np.array(hf['rs_global_acc']))
             g_loss.append(np.array(hf['rs_global_loss']))
             l_acc.append(np.array(hf['rs_local_acc']))
             t_acc.append(np.array(hf['rs_train_acc']))
 
+    weighted_acc = None
+    weighted_local_acc = None
+    if dataset and g_acc:
+        test_dir = os.path.normpath(os.path.join(SCRIPT_DIR, '..', '..', 'dataset', dataset, 'test'))
+        if os.path.isdir(test_dir):
+            counts = []
+            for cid in clients_order:
+                npz_path = os.path.join(test_dir, f"{cid}.npz")
+                if os.path.isfile(npz_path):
+                    try:
+                        d = np.load(npz_path, allow_pickle=True)
+                        item = d['data'].item()
+                        counts.append(len(item['y']))
+                    except Exception:
+                        counts.append(1)
+                else:
+                    counts.append(1)
+            total_samples = sum(counts)
+            if total_samples > 0:
+                weights = np.array(counts, dtype=float) / total_samples
+                weighted_acc = np.sum(np.array(g_acc) * weights[:, None], axis=0)
+                weighted_local_acc = np.sum(np.array(l_acc) * weights[:, None], axis=0)
+
     return {
         'global_acc_mean': np.mean(g_acc, axis=0), 'global_acc_std': np.std(g_acc, axis=0),
         'global_loss_mean': np.mean(g_loss, axis=0), 'global_loss_std': np.std(g_loss, axis=0),
         'local_acc_mean': np.mean(l_acc, axis=0), 'local_acc_std': np.std(l_acc, axis=0),
         'train_acc_mean': np.mean(t_acc, axis=0), 'train_acc_std': np.std(t_acc, axis=0),
-        'num_clients': len(clients_set),
+        'weighted_acc_mean': weighted_acc,
+        'weighted_local_acc_mean': weighted_local_acc,
+        'num_clients': len(set(clients_order)),
     }
 
 
@@ -441,30 +515,81 @@ def plot_02_train_loss(experiments, output_dir):
 # ==============================================================================
 
 def plot_03_local_vs_treino(experiments, output_dir):
-    """Compara acurácia de teste local e de treino nos clientes para detectar overfitting."""
+    """Compara acurácia de teste local e de treino nos clientes (ou foca no teste local se treino não for avaliado)."""
     has_data = any(e['client'] is not None for e in experiments)
     if not has_data:
         return
 
+    has_any_train = any(
+        any(v > 0 for v in exp['client']['train_acc_mean']) 
+        for exp in experiments if exp['client'] is not None
+    )
+
     fig, ax = plt.subplots(figsize=(12, 7))
+    all_local_vals = []
     for i, exp in enumerate(experiments):
         if exp['client'] is None:
             continue
         s = STYLES[i % len(STYLES)]
         d = exp['client']
         x = range(1, len(d['local_acc_mean']) + 1)
+        all_local_vals.extend(d['local_acc_mean'])
+        
+        lbl = f"{exp['label']} (local test)" if has_any_train else exp['label']
         ax.plot(x, d['local_acc_mean'], color=s['color'], marker=s['marker'],
                 markevery=_mark_every(len(d['local_acc_mean'])), linestyle=s['ls'],
-                label=f"{exp['label']} (local test)")
-        ax.plot(x, d['train_acc_mean'], color=s['color'], marker=s['marker'],
-                markevery=_mark_every(len(d['train_acc_mean'])), linestyle=':',
-                alpha=0.6, label=f"{exp['label']} (train)")
+                label=lbl)
+        
+        if has_any_train and any(v > 0 for v in d['train_acc_mean']):
+            ax.plot(x, d['train_acc_mean'], color=s['color'], marker=s['marker'],
+                    markevery=_mark_every(len(d['train_acc_mean'])), linestyle=':',
+                    alpha=0.6, label=f"{exp['label']} (train)")
 
-    _set_title(ax, "Overfitting Analysis: Train vs. Local Test Accuracy")
-    ax.set_xlabel("Rounds"); ax.set_ylabel("Accuracy (%)")
-    ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
+    _set_title(ax, "Local Test Accuracy per Round" if not has_any_train else "Overfitting Analysis: Train vs. Local Test Accuracy")
+    ax.set_xlabel("Rounds")
+    ax.set_ylabel("Local Accuracy (%)")
+    
+    if not has_any_train and all_local_vals:
+        ymin = max(0, min(all_local_vals) - 5)
+        ax.set_ylim(ymin, 102)
+        
+    ax.legend(loc='lower right')
+    ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "03_acuracia_local_vs_treino.pdf")
+
+
+# ==============================================================================
+# 03b - Acurácia Auxiliar Ponderada dos Clientes vs Rodadas
+# ==============================================================================
+
+def plot_03b_acuracia_auxiliar_ponderada(experiments, output_dir):
+    """Compara a acurácia auxiliar ponderada pelo número de amostras de teste dos clientes."""
+    has_data = any(e['client'] is not None and e['client'].get('weighted_acc_mean') is not None for e in experiments)
+    if not has_data:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for i, exp in enumerate(experiments):
+        if exp['client'] is None or exp['client'].get('weighted_acc_mean') is None:
+            continue
+        s = STYLES[i % len(STYLES)]
+        w_acc = exp['client']['weighted_acc_mean']
+        x = range(1, len(w_acc) + 1)
+        
+        lbl = f"{exp['label']} (Final: {w_acc[-1]:.2f}%)"
+        ax.plot(x, w_acc, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(w_acc)), linestyle=s['ls'],
+                linewidth=2.5, label=lbl)
+
+    _set_title(ax, "Weighted Client Auxiliary Accuracy per Round")
+    ax.set_xlabel("Rounds")
+    ax.set_ylabel("Weighted Client Accuracy (%)")
+    ax.set_ylim(bottom=0, top=100)
+    ax.legend(loc='lower right')
+    ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    _save_and_close(fig, output_dir, "03b_acuracia_auxiliar_ponderada.pdf")
 
 
 # ==============================================================================
@@ -640,6 +765,41 @@ def plot_08_paca_evolucao(experiments, output_dir):
     ax.legend(); ax.grid(True, ls='--', alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "08_paca_evolucao.pdf")
+
+
+# ==============================================================================
+# 08b - Evolução do Rank Adaptativo
+# ==============================================================================
+
+def plot_08b_rank_evolucao(experiments, output_dir):
+    """Mostra como o valor médio do Rank (LoRA/SoRA) evolui nos clientes ao longo das rodadas."""
+    has_data = any(e['server'].get('rank_mean') is not None for e in experiments)
+    if not has_data:
+        print("  ⚠️ Sem dados de evolução do Rank, pulando.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for i, exp in enumerate(experiments):
+        d = exp['server']
+        if d.get('rank_mean') is None:
+            continue
+        s = STYLES[i % len(STYLES)]
+        # d['rank_mean'] tem shape (Rodadas, Clientes)
+        rank_per_round = np.mean(d['rank_mean'], axis=1)
+        rank_std_per_round = np.std(d['rank_mean'], axis=1)
+        x = range(1, len(rank_per_round) + 1)
+        ax.plot(x, rank_per_round, color=s['color'], marker=s['marker'],
+                markevery=_mark_every(len(rank_per_round)), linestyle=s['ls'],
+                label=exp['label'])
+        ax.fill_between(x, rank_per_round - rank_std_per_round, rank_per_round + rank_std_per_round,
+                         color=s['color'], alpha=0.1)
+
+    _set_title(ax, "Average Adaptive Rank Dynamics across Clients")
+    ax.set_xlabel("Round"); ax.set_ylabel("Rank Value")
+    ax.set_ylim(bottom=1.5, top=8.5)
+    ax.legend(); ax.grid(True, ls='--', alpha=0.4)
+    fig.tight_layout()
+    _save_and_close(fig, output_dir, "08b_rank_evolucao.pdf")
 
 
 # ==============================================================================
@@ -1042,32 +1202,22 @@ DATASET_EXPERIMENTS = {
     "OxfordPets": [
         "OxfordPets__LoRA_Padrao_paca12",
         "OxfordPets__SoRA_Estatico_paca12",
-        "OxfordPets__PUMA-GT_v1_PruneFreq3",
-        "OxfordPets__PUMA-GT_v2_PruneFreq1",
-        "OxfordPets__PUMA-GT_Ablacao_NaiveRank",
-        "OxfordPets__PUMA-GT_Plus_Desacoplado",
+        ("fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "OxfordPets__PUMA-GT_Plus_Cientifico_083", "OxfordPets__PUMA-GT_Plus_Cientifico"),
     ],
     "Flowers102": [
         "Flowers102__LoRA_Padrao_paca12",
         "Flowers102__SoRA_Estatico_paca12",
-        "Flowers102__PUMA-GT_v1_PruneFreq3",
-        "Flowers102__PUMA-GT_v2_PruneFreq1",
-        "Flowers102__PUMA-GT_Plus_Desacoplado",
+        ("Flowers102__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
     ],
     "DTD": [
         "DTD__LoRA_Padrao_paca12",
         "DTD__SoRA_Estatico_paca12",
-        "DTD__PUMA-GT_v1_PruneFreq3",
-        "DTD__PUMA-GT_v2_PruneFreq1",
-        "DTD__PUMA-GT_Ablacao_NaiveRank",
-        "DTD__PUMA-GT_Plus_Desacoplado",
+        ("DTD__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
     ],
     "FGVCAircraft": [
         "FGVCAircraft__LoRA_Padrao_paca12",
         "FGVCAircraft__SoRA_Estatico_paca12",
-        "FGVCAircraft__PUMA-GT_v1_PruneFreq3",
-        "FGVCAircraft__PUMA-GT_v2_PruneFreq1",
-        "FGVCAircraft__PUMA-GT_Plus_Desacoplado",
+        ("FGVCAircraft__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
     ],
 }
 
@@ -1137,6 +1287,7 @@ def main():
         plot_01_acuracia_global(experiments, output_dir)
         plot_02_train_loss(experiments, output_dir)
         plot_03_local_vs_treino(experiments, output_dir)
+        plot_03b_acuracia_auxiliar_ponderada(experiments, output_dir)
 
         # --- Custos de Comunicação ---
         plot_04_banda_acumulada(experiments, output_dir)
@@ -1146,6 +1297,7 @@ def main():
         plot_06_tamanho_modelo(experiments, output_dir)
         plot_07_parametros_treinaveis(experiments, output_dir)
         plot_08_paca_evolucao(experiments, output_dir)
+        plot_08b_rank_evolucao(experiments, output_dir)
 
         # --- Análise Temporal ---
         plot_09_tempo_por_rodada(experiments, output_dir)
