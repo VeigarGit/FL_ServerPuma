@@ -37,7 +37,7 @@ START_RUN=1
 CLIENTS=25
 ROUNDS=150
 STRATEGY="sora_with_schedule"
-PRUNE_FREQ=1
+PRUNE_FREQ=3
 MODEL="clip"
 DEVICE_ID="0"
 TARGET_DATASET=""
@@ -155,8 +155,8 @@ echo "================================================================="
 echo "        ORQUESTRADOR DE EXPERIMENTOS PUMA-GT PLUS (CLIP)"
 echo "================================================================="
 echo "  Estratégia:         $STRATEGY (prune_freq=$PRUNE_FREQ)"
-echo "  PaCA Adaptativo:    ATIVADO (--adaptive-paca + --allow-paca-upscale)"
-echo "  Rank Adaptativo:    ATIVADO (--adaptive-rank + --allow-rank-upscale, min=2, max=8)"
+echo "  PaCA Adaptativo:    ATIVADO (--adaptive-paca)"
+echo "  Rank Adaptativo:    ATIVADO (--adaptive-rank)"
 echo "  Modelo:             $MODEL"
 echo "  Simulações/dataset: $SIMULATIONS"
 echo "  Clientes:           $CLIENTS"
@@ -188,20 +188,18 @@ for ENTRY in "${DATASETS[@]}"; do
         --strategy "$STRATEGY"
         --prune-freq "$PRUNE_FREQ"
         --adaptive-paca
-        --allow-paca-upscale
         --adaptive-rank
-        --allow-rank-upscale
-        --adaptive-rank-min 2
-        --adaptive-rank-max 8
         --model "$MODEL"
         --rounds "$ROUNDS"
         --dataset "$DATASET_NAME"
         --num-classes "$NUM_CLASSES"
         --auto-next
         --skip-train-eval
+        --skip-post-eval
         -did "$DEVICE_ID"
         "${EXTRA_ARGS[@]}"
     )
+
 
     echo "Comando a executar: ${CMD[*]}"
     echo ""

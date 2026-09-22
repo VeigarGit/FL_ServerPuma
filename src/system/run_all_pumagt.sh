@@ -149,7 +149,6 @@ for ENTRY in "${DATASETS[@]}"; do
         --strategy "$STRATEGY"
         --prune-freq "$PRUNE_FREQ"
         --adaptive-paca
-        --allow-paca-upscale
         --model "$MODEL"
         --rounds "$ROUNDS"
         --dataset "$DATASET_NAME"
