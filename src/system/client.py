@@ -290,7 +290,7 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
             X = resize(X)
         if not X.is_floating_point():
             X = X.float() / 255.0
-        elif X.max() > 1.0:
+        elif X.min() >= 0.0 and X.max() > 1.0:
             X = X / 255.0
         # Se os dados não tiverem normalização do CLIP, aplica a normalização oficial do CLIP
         if X.min() >= 0.0:
@@ -687,7 +687,7 @@ def main():
                 logger.info(f"Client {args.client_idx}: Tempos - treino={client_training_time:.2f}s, eval={client_eval_time:.2f}s, quant={client_quant_time:.2f}s, dequant={client_dequant_time:.2f}s")
                 try:
                     send_data(s, updated_state)
-                    send_data(s, len(train_loader.dataset))
+                    send_data(s, len(train_loader))
                     send_data(s, args.ala)
                     send_data(s, client_training_time)
                     send_data(s, test_accuracy)

@@ -8,6 +8,7 @@ import argparse
 import sys
 import os
 import logging
+import math
 from pathlib import Path
 
 # Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
@@ -204,6 +205,7 @@ class FederatedLearningServer:
         self.global_model = self.global_model.to(args.device)
         self.rs_test_acc = []
         self.rs_test_loss = []
+        self.rs_aux_simple_avg_acc = []  # Média simples das acurácias reportadas pelos clientes (usada pelo PaCA/Rank adaptativo)
         self.global_state = self.global_model.state_dict()
         self.lock = threading.Lock()
         self.client_data = {}
@@ -285,7 +287,7 @@ class FederatedLearningServer:
         
         for key in global_model.keys():
             weighted_sum = None
-            weight_mask = None
+            total_weight_for_key = 0.0
             global_val = global_model[key]
             
             for idx, model_state in enumerate(model_list):
@@ -305,20 +307,16 @@ class FederatedLearningServer:
                             local_val, global_val, key, model_state, idx
                         )
                         
-                        mask = self._get_mask(local_val, global_val)
                         weight = normalized_weights[idx]
                         
                         if weighted_sum is None:
-                            weighted_sum = torch.zeros_like(global_val)
-                            weight_mask = torch.zeros_like(global_val)
+                            weighted_sum = torch.zeros_like(aligned_val)
                         
                         weighted_sum += aligned_val * weight
-                        weight_mask += mask * weight
+                        total_weight_for_key += weight
             
-            if weighted_sum is not None:
-                valid_mask = weight_mask > 0
-                agg_state[key] = global_val.clone()
-                agg_state[key][valid_mask] = weighted_sum[valid_mask] / weight_mask[valid_mask]
+            if weighted_sum is not None and total_weight_for_key > 0:
+                agg_state[key] = weighted_sum / total_weight_for_key
         
         return agg_state
     
@@ -537,29 +535,19 @@ class FederatedLearningServer:
 
     def calculate_adaptive_paca(self, client_id):
         """
-        Calcula o PaCA ideal para um cliente de forma estritamente individualizada:
+        Calcula o PaCA ideal para um cliente baseado em dois critérios:
         
-        1. REVERSÃO DE SEGURANÇA GLOBAL / ROLLBACK (Prioridade Máxima):
-           Se a acurácia global recente cair abaixo de:
-           - best_acc - 1.5% (rede de segurança geral), OU
-           - probe_baseline_acc - 1.0% (se em sondagem ativa),
-           reverte imediatamente (+2 camadas até max_paca) e entra em cooldown de 15 rodadas.
+        1. LATÊNCIA: Se o cliente é gargalo (training_time > threshold), reduz PaCA.
+        2. ACURÁCIA: Se a acurácia estabilizou (plateau), reduz PaCA porque as camadas
+           extras não estão contribuindo — menos camadas = menos comunicação de graça.
         
-        2. SINAL DE LOSS LOCAL (Dificuldade do cliente - Individual):
-           Se client_loss > 1.2 * global_loss e total_time <= target_latency:
-           Sobe PaCA (+1) se allow_paca_upscale estiver ativo.
+        Proteções:
+        - Se a acurácia caiu após redução de PaCA, reverte (sobe de volta).
+        - Mínimo configurável via --adaptive-paca-min (padrão: 2).
+        - Máximo ±2 camadas de mudança por round.
         
-        3. MITIGAÇÃO DE STRAGGLER POR LATÊNCIA (Individual por hardware):
-           Se total_time > target_latency, reduz no máximo 1 camada por round
-           para caber no budget, respeitando o piso paca_min (padrão: 2).
-        
-        4. SONDAGEM CAUTELOSA DE EFICIÊNCIA (Canary / Escalonada):
-           Para testar se este cliente específico consegue operar com menos camadas:
-           - Apenas após rodada 20 e com modelo em alta acurácia (>= 92% de best_acc).
-           - Apenas se a perda local do cliente for baixa (client_loss <= global_loss * 0.95).
-           - Escalonamento Canário: (client_id % 5 == current_round % 5), garantindo que
-             a grande maioria dos clientes (80%) mantenha todas as camadas ativas.
-           - Janela probatória de 5 rounds com rollback instantâneo se a acurácia cair.
+        NOTA: Usa rs_aux_simple_avg_acc (média simples dos clientes) como sinal de acurácia,
+        não a avaliação centralizada do servidor (rs_test_acc).
         """
         try:
             client_info = self.clients_info[client_id]
@@ -567,93 +555,83 @@ class FederatedLearningServer:
             return self.args.paca
 
         bandwidth = client_info.get('bandwidth')
-        t_train = client_info.get('training_time', 0.0) or 0.0
-        t_eval = client_info.get('client_eval_time', 0.0) or 0.0
-        t_proc = client_info.get('server_processing_time', 0.0) or 0.0
-        t_comm = client_info.get('comm_time', 0.0) or 0.0
-        total_time = t_train + t_eval + t_proc + t_comm
-        
+        training_time = client_info.get('training_time')
         current_paca = client_info.get('current_paca', self.args.paca)
         max_paca = self.args.paca  # O máximo possível (definido na CLI)
-        paca_min = getattr(self.args, 'adaptive_paca_min', 2)  # Mínimo configurável (mantido em 2)
+        paca_min = getattr(self.args, 'adaptive_paca_min', 2)  # Mínimo configurável (padrão: 2)
 
         # Sem dados suficientes, mantém o atual
-        if bandwidth is None or t_train == 0.0:
+        if bandwidth is None or training_time is None:
             return current_paca
 
-        target_latency = getattr(self, 'target_latency', getattr(self, 'time_threshold', 60.0))
-        mean_time = getattr(self, 'mean_training_time', target_latency / 1.15)
-        current_round = len(self.rs_test_acc)
+        mean_time = getattr(self, 'mean_training_time', None)
+        if mean_time is not None:
+            target_latency = 0.9 * mean_time
+        else:
+            target_latency = getattr(self, 'target_latency', 60.0)
         
-        # --- 1. REVERSÃO DE SEGURANÇA GLOBAL / ROLLBACK (Prioridade Máxima) ---
-        acc_signal = self._check_accuracy_signal(client_id, current_paca, paca_min, max_paca)
-        if acc_signal is not None and acc_signal > current_paca:
-            client_info['paca_before_change'] = current_paca
-            client_info['probing_paca'] = False
-            client_info['cooldown_until_round'] = current_round + 12
-            logger.warning(
-                f"PaCA adaptativo {client_id}: ROLLBACK DE SEGURANÇA {current_paca} -> {acc_signal} "
-                f"(acurácia global degradou). Bloqueando reduções por 12 rounds."
-            )
-            return acc_signal
+        # --- COOLDOWN UNIFICADO: intervalo controlado entre reduções ---
+        # Cooldown padrão: 5 rounds (conforme commit b946cf6)
+        last_reduction_round = client_info.get('last_paca_any_reduction_round', 0)
+        current_round = len(self.rs_aux_simple_avg_acc)
+        cooldown_rounds = getattr(self.args, 'adaptive_paca_cooldown', 5)
+        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
+        
+        # --- CRITÉRIO 2: ACURÁCIA (verificado primeiro) ---
+        # 1. Reversão por queda de acurácia SEMPRE permitida (mesmo em cooldown).
+        accuracy_signal = self._check_accuracy_signal(
+            client_id, current_paca, paca_min, max_paca, in_cooldown
+        )
+        if accuracy_signal is not None and accuracy_signal > current_paca:
+            # Reversão de segurança: acurácia caiu >2pp após redução
+            client_info['last_paca_reduction_reason'] = None
+            return accuracy_signal
 
-        # Verifica cooldown para novas reduções
-        cooldown_until = client_info.get('cooldown_until_round', 0)
-        in_cooldown = current_round < cooldown_until
+        # 2. Redução por plateau APENAS fora do cooldown
+        if accuracy_signal is not None and accuracy_signal < current_paca:
+            client_info['last_paca_any_reduction_round'] = current_round
+            client_info['last_paca_reduction_reason'] = 'plateau'
+            return accuracy_signal
 
-        # Confirmação de sondagem bem-sucedida (Commit)
-        if client_info.get('probing_paca', False):
-            probe_start = client_info.get('probe_start_round', 0)
-            if current_round >= probe_start + 5:
-                best_acc = max(self.rs_test_acc) if self.rs_test_acc else 0.0
-                baseline = client_info.get('probe_baseline_acc', best_acc)
-                recent_acc = sum(self.rs_test_acc[-3:]) / min(3, len(self.rs_test_acc))
-                if recent_acc >= baseline - 1.5:
-                    client_info['probing_paca'] = False
-                    client_info['cooldown_until_round'] = current_round + 6
-                    logger.info(
-                        f"PaCA adaptativo {client_id}: SONDAGEM CONFIRMADA COM SUCESSO! "
-                        f"PaCA {current_paca} sustentou acurácia ({recent_acc:.2f}% vs baseline {baseline:.2f}%)."
-                    )
-
-        # --- 2. SONDAGEM CAUTELOSA DE EFICIÊNCIA (Canary / Escalonada) ---
-        if acc_signal is not None and acc_signal < current_paca:
-            client_info['paca_before_change'] = current_paca
-            client_info['probing_paca'] = True
-            client_info['probe_start_round'] = current_round
-            client_info['probe_baseline_acc'] = max(self.rs_test_acc) if self.rs_test_acc else 0.0
-            client_info['cooldown_until_round'] = current_round + 5  # Janela probatória de 5 rounds
-            logger.info(f"PaCA adaptativo {client_id}: INICIANDO SONDAGEM {current_paca} -> {acc_signal} "
-                        f"(baseline={client_info['probe_baseline_acc']:.2f}%)")
-            return acc_signal
-
-        # --- 3. MITIGAÇÃO DE STRAGGLER POR LATÊNCIA (Individual por hardware) ---
-        if total_time > target_latency and not in_cooldown:
-            fixed_overhead = t_eval + t_proc + t_comm
-            available_train_time = max(0.1, target_latency - fixed_overhead)
-            time_per_paca_layer = t_train / max(current_paca, 1)
-            ideal_paca = int(available_train_time / time_per_paca_layer) if time_per_paca_layer > 0 else current_paca
-            ideal_paca = max(paca_min, min(max_paca, ideal_paca))
-
-            if ideal_paca < current_paca:
-                ideal_paca = max(ideal_paca, current_paca - 1)
-                client_info['paca_before_change'] = current_paca
-                client_info['cooldown_until_round'] = current_round + 5
-                client_info['probing_paca'] = False
-                logger.info(f"PaCA adaptativo {client_id}: reduzindo {current_paca} -> {ideal_paca} "
-                            f"(straggler: tempo_total={total_time:.1f}s > target={target_latency:.1f}s)")
-                return ideal_paca
+        # --- CRITÉRIO 1: LATÊNCIA (per-client) ---
+        last_reason = client_info.get('last_paca_reduction_reason')
+        paca_upscale_ratio = getattr(self.args, 'adaptive_paca_upscale_ratio', 0.7)
+        
+        # Subir PaCA por latência: permitido se o cliente havia sido reduzido por LATÊNCIA (straggler)
+        # e agora opera com folga significativa (training_time < target_latency * upscale_ratio), fora de cooldown.
+        # Em servidores rápidos (GPUs potentes), NÃO reverte reduções deliberadas de platô.
+        if training_time <= target_latency:
+            if (last_reason == 'latency'
+                    and not in_cooldown
+                    and paca_upscale_ratio > 0.0
+                    and training_time < target_latency * paca_upscale_ratio
+                    and current_paca < max_paca):
+                new_paca = min(current_paca + 1, max_paca)
+                logger.info(f"PaCA adaptativo {client_id}: subindo por folga de latência {current_paca} -> {new_paca} "
+                            f"(tempo={training_time:.1f}s << threshold={target_latency:.1f}s)")
+                client_info['last_paca_reduction_reason'] = None
+                return new_paca
             return current_paca
 
-        # Fast client upscale (opcional, padrão desligado)
-        if getattr(self.args, 'allow_fast_client_upscale', False) and getattr(self.args, 'allow_paca_upscale', False):
-            if total_time < mean_time * 0.80 and current_paca < max_paca:
-                new_paca = min(current_paca + 1, max_paca)
-                logger.info(f"PaCA adaptativo {client_id}: subindo {current_paca} -> {new_paca} "
-                            f"(tempo_total={total_time:.1f}s < 80% da média={mean_time:.1f}s) [--allow-fast-client-upscale ativo]")
-                return new_paca
+        # Em cooldown: não reduzir por latência
+        if in_cooldown:
+            return current_paca
 
-        return current_paca
+        # Cliente está lento (straggler): calcular quantas camadas cabem no budget
+        time_per_paca_layer = training_time / max(current_paca, 1)
+        ideal_paca = int(target_latency / time_per_paca_layer) if time_per_paca_layer > 0 else current_paca
+
+        ideal_paca = max(paca_min, min(max_paca, ideal_paca))
+
+        # Suavização: não reduzir mais que 1 camada por round (evita cascata destrutiva)
+        if ideal_paca < current_paca:
+            ideal_paca = max(ideal_paca, current_paca - 1)
+            client_info['last_paca_any_reduction_round'] = current_round
+            client_info['last_paca_reduction_reason'] = 'latency'
+            logger.info(f"PaCA adaptativo {client_id}: {current_paca} -> {ideal_paca} "
+                        f"(bw={bandwidth:.2f} MB/s, time={training_time:.1f}s, target={target_latency:.1f}s)")
+
+        return ideal_paca
 
     def calculate_adaptive_rank(self, client_id):
         try:
@@ -662,192 +640,202 @@ class FederatedLearningServer:
             return self.args.rank
             
         bandwidth = client_info.get('bandwidth')
-        t_train = client_info.get('training_time', 0.0) or 0.0
-        t_eval = client_info.get('client_eval_time', 0.0) or 0.0
-        t_proc = client_info.get('server_processing_time', 0.0) or 0.0
-        t_comm = client_info.get('comm_time', 0.0) or 0.0
-        total_time = t_train + t_eval + t_proc + t_comm
-        
+        training_time = client_info.get('training_time')
         current_rank = client_info.get('current_rank', self.args.rank)
         max_rank = getattr(self.args, 'adaptive_rank_max', 8)
         min_rank = getattr(self.args, 'adaptive_rank_min', 2)
 
         # Sem dados suficientes, mantém o atual
-        if bandwidth is None or t_train == 0.0:
+        if bandwidth is None or training_time is None:
             return current_rank
 
-        target_latency = getattr(self, 'target_latency', getattr(self, 'time_threshold', 60.0))
-        mean_time = getattr(self, 'mean_training_time', target_latency / 1.15)
+        mean_time = getattr(self, 'mean_training_time', None)
+        if mean_time is not None:
+            target_latency = 0.9 * mean_time
+        else:
+            target_latency = getattr(self, 'target_latency', getattr(self, 'time_threshold', 60.0))
         
-        # --- 1. Sinal da Acurácia Global (Rollback e Platô) ---
-        last_reduction_round = client_info.get('last_rank_reduction_round', None)
-        current_round = len(self.rs_test_acc)
-        cooldown_rounds = 4
-        in_cooldown = (last_reduction_round is not None and (current_round - last_reduction_round) < cooldown_rounds)
+        # --- 1. Sinal da Acurácia Auxiliar (Média simples dos clientes) ---
+        last_reduction_round = client_info.get('last_rank_reduction_round', 0)
+        current_round = len(self.rs_aux_simple_avg_acc)
+        cooldown_rounds = 5
+        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
 
         acc_signal = self._check_accuracy_signal_rank(client_id, current_rank, min_rank, max_rank, in_cooldown)
         
-        # Acurácia despencou (Rollback Imediato)
+        # Acurácia despencou (Pânico! Reversão tem prioridade)
         if acc_signal is not None and acc_signal > current_rank:
             client_info['last_rank_reduction_round'] = current_round
+            client_info['last_rank_reduction_reason'] = None
             return acc_signal
+            
+        # --- 2. Sinal de Loss Local (Dificuldade do cliente) ---
+        global_loss = self.rs_test_loss[-1] if self.rs_test_loss else 1.0
+        client_loss = client_info.get('last_loss', 0.0)
+        
+        is_difficult_client = (client_loss > 0.0 and global_loss > 0.0 and client_loss > global_loss * 1.2)
+        if is_difficult_client and current_rank < max_rank:
+            logger.info(f"Rank adaptativo {client_id}: cliente difícil (loss={client_loss:.4f} > global={global_loss:.4f}*1.2). Forçando subida {current_rank} -> {current_rank + 1}")
+            client_info['rank_before_change'] = current_rank
+            client_info['last_rank_reduction_reason'] = None
+            return current_rank + 1
 
-        # Redução por platô de convergência (Eckart-Young / AdaLoRA)
+        # --- 3. Acurácia Estável (Platô) ---
         if acc_signal is not None and acc_signal < current_rank:
             client_info['last_rank_reduction_round'] = current_round
+            client_info['last_rank_reduction_reason'] = 'plateau'
             return acc_signal
 
-        # --- 2. Mitigação de Straggler por Latência (Hardware lento, a partir do round 10) ---
-        if total_time > target_latency and not in_cooldown and current_round >= 10:
-            if current_rank > min_rank:
-                new_rank = current_rank - 1
-                logger.info(f"Rank adaptativo {client_id}: reduzindo {current_rank} -> {new_rank} "
-                            f"(straggler: tempo_total={total_time:.1f}s > target={target_latency:.1f}s)")
-                client_info['last_rank_reduction_round'] = current_round
+        # --- 4. Sinal de Latência ---
+        last_reason = client_info.get('last_rank_reduction_reason')
+        if training_time <= target_latency:
+            if (last_reason == 'latency'
+                    and not in_cooldown
+                    and training_time < target_latency * 0.7 
+                    and current_rank < max_rank):
+                new_rank = min(current_rank + 1, max_rank)
+                logger.debug(f"Rank adaptativo {client_id}: subindo {current_rank} -> {new_rank} "
+                             f"(tempo={training_time:.1f}s << threshold={target_latency:.1f}s)")
+                client_info['last_rank_reduction_reason'] = None
                 return new_rank
+            return current_rank
+
+        # Em cooldown: não reduzir por latência
+        if in_cooldown:
+            return current_rank
+
+        # Cliente está lento: reduz o rank em 1
+        if current_rank > min_rank:
+            new_rank = current_rank - 1
+            logger.info(f"Rank adaptativo {client_id}: reduzindo {current_rank} -> {new_rank} "
+                        f"(tempo={training_time:.1f}s > threshold={target_latency:.1f}s)")
+            client_info['last_rank_reduction_round'] = current_round
+            client_info['last_rank_reduction_reason'] = 'latency'
+            return new_rank
 
         return current_rank
         
     def _check_accuracy_signal_rank(self, client_id, current_rank, rank_min, max_rank, in_cooldown=False):
         """
-        Avalia se o Rank dos adaptadores pode ser reduzido com segurança:
-        - ROLLBACK (Prioridade Máxima): Reverte Rank se a acurácia cair > 2.0% abaixo de best_acc.
-        - REDUÇÃO POR PLATÔ: Quando a acurácia estabilizar em alto desempenho, reduz de forma escalonada.
+        Verifica se a acurácia indica que o Rank pode ser ajustado.
+        - Reversão (Pânico): SEMPRE ativa. Se a acurácia caiu >2pp após redução, reverte +2.
+        - Plateau: APENAS fora do cooldown. Se estabilizou, reduz -1.
+        
+        NOTA: Usa rs_aux_simple_avg_acc (média simples dos clientes) como sinal.
         """
-        acc_history = self.rs_test_acc
+        client_info = self.clients_info.get(client_id, {})
+        local_acc_history = client_info.get('acc_history', [])
         window = 5
         
-        if len(acc_history) < window:
+        if len(local_acc_history) >= window:
+            acc_history = local_acc_history
+            acc_type = "local"
+        elif len(self.rs_aux_simple_avg_acc) >= window:
+            acc_history = self.rs_aux_simple_avg_acc
+            acc_type = "global"
+        else:
             return None
         
         recent = acc_history[-window:]
         mean_acc = sum(recent) / len(recent)
-        latest_acc = acc_history[-1]
-        best_acc = max(acc_history) if acc_history else 0.0
         std_acc = (sum((x - mean_acc) ** 2 for x in recent) / len(recent)) ** 0.5
         
-        # --- Safety check: Reverte Rank se a acurácia degradar ---
-        recent_3 = acc_history[-3:]
-        recent_3_mean = sum(recent_3) / len(recent_3)
-        if current_rank < max_rank:
-            if (recent_3_mean < best_acc - 2.0) or (latest_acc < best_acc - 2.5):
+        rank_before_last_change = client_info.get('rank_before_change')
+        if rank_before_last_change is not None and rank_before_last_change > current_rank:
+            acc_before_window = acc_history[-(window + 1):-1] if len(acc_history) > window else acc_history[:window]
+            mean_before = sum(acc_before_window) / len(acc_before_window)
+            
+            if mean_acc < mean_before - 2.0:
                 new_rank = min(current_rank + 2, max_rank)
-                logger.warning(f"Rank adaptativo {client_id}: REVERTENDO {current_rank} -> {new_rank} "
-                               f"(acurácia caiu: atual={latest_acc:.1f}%, média3={recent_3_mean:.1f}%, melhor={best_acc:.1f}%)")
+                logger.info(f"Rank adaptativo {client_id}: REVERTENDO {current_rank} -> {new_rank} "
+                            f"(acurácia {acc_type} caiu: {mean_before:.1f}% -> {mean_acc:.1f}%)")
                 self.clients_info[client_id]['rank_before_change'] = current_rank
                 return new_rank
         
         if in_cooldown:
             return None
-
-        current_round = len(acc_history)
-        if current_round < 10:
-            return None  # Fase inicial de aprendizado do subespaço
             
-        # Escalonamento Canário: divide os clientes em 4 grupos (25% dos clientes por rodada)
-        try:
-            numeric_id = int(str(client_id).split('_')[-1]) if not isinstance(client_id, int) else client_id
-        except (ValueError, TypeError):
-            numeric_id = 0
-
-        if numeric_id % 4 != current_round % 4:
-            return None
-            
+        best_acc = max(acc_history) if acc_history else 0.0
         min_acc_for_plateau = best_acc * 0.90
-        is_plateau = (std_acc < 1.8 or (mean_acc > 0 and (std_acc / mean_acc) < 0.03))
+        
+        is_plateau = (std_acc < 1.5 or (mean_acc > 0 and (std_acc / mean_acc) < 0.03))
         if (is_plateau 
                 and current_rank > rank_min 
                 and mean_acc >= min_acc_for_plateau):
             new_rank = current_rank - 1
             logger.info(f"Rank adaptativo {client_id}: reduzindo {current_rank} -> {new_rank} "
-                        f"(acurácia estável: {mean_acc:.1f}% ± {std_acc:.2f}%)")
+                        f"(acurácia {acc_type} estável: {mean_acc:.1f}% ± {std_acc:.2f}%)")
             self.clients_info[client_id]['rank_before_change'] = current_rank
             return new_rank
         
         return None
 
-    def _check_accuracy_signal(self, client_id, current_paca, paca_min, max_paca):
+    def _check_accuracy_signal(self, client_id, current_paca, paca_min, max_paca, in_cooldown=False):
         """
-        Avalia a acurácia global e local para sinalizar Rollback ou Sondagem:
+        Verifica se a acurácia indica que o PaCA pode ser ajustado.
         
-        - ROLLBACK (Prioridade Máxima): Disparado se a acurácia média recente cair abaixo de:
-          * best_acc - 2.0% (rede de segurança geral contra degradação real), OU
-          * probe_baseline_acc - 2.0% (se o cliente estava em sondagem ativa), OU
-          * latest_acc cair > 2.5% em um único round crítico.
-          Retorna min(current_paca + 2, max_paca) para restaurar capacidade imediatamente.
+        - Reversão: SEMPRE ativa (mesmo em cooldown). Se a acurácia caiu >2pp
+          após uma redução de PaCA, reverte +2 como rede de segurança.
+        - Plateau: APENAS fora do cooldown. Se a acurácia estabilizou, reduz -1.
         
-        - SONDAGEM (Probe): Elegível se:
-          * current_round >= 20 (modelo maduro)
-          * mean_acc >= best_acc * 0.92 (em alto desempenho)
-          * client_loss <= global_loss * 0.95 (cliente domina os dados locais)
-          * Escalonamento canário: (numeric_id % 5 == current_round % 5) para evitar
-            efeito manada, garantindo que a grande maioria dos clientes continue em full-paca.
-          * current_paca > paca_min (respeitando paca_min = 2)
-          Retorna current_paca - 1.
+        NOTA: Usa rs_aux_simple_avg_acc (média simples dos clientes) como sinal.
+        
+        Retorna:
+            int: novo PaCA se a acurácia motivou uma mudança
+            None: se a acurácia não é conclusiva (deixa a latência decidir)
         """
-        acc_history = self.rs_test_acc
-        window = 5
+        client_info = self.clients_info.get(client_id, {})
+        local_acc_history = client_info.get('acc_history', [])
+        window = 5  # Janela de rounds para análise
         
-        if len(acc_history) < window:
+        if len(local_acc_history) >= window:
+            acc_history = local_acc_history
+            acc_type = "local"
+        elif len(self.rs_aux_simple_avg_acc) >= window:
+            acc_history = self.rs_aux_simple_avg_acc
+            acc_type = "global"
+        else:
             return None
         
         recent = acc_history[-window:]
         mean_acc = sum(recent) / len(recent)
-        recent_3 = acc_history[-3:]
-        recent_3_mean = sum(recent_3) / len(recent_3)
-        latest_acc = acc_history[-1]
-        best_acc = max(acc_history) if acc_history else 0.0
+        std_acc = (sum((x - mean_acc) ** 2 for x in recent) / len(recent)) ** 0.5
         
-        client_info = self.clients_info.get(client_id, {})
-        is_probing = client_info.get('probing_paca', False)
-        probe_baseline = client_info.get('probe_baseline_acc', best_acc)
-        
-        # --- A. VERIFICAÇÃO DE ROLLBACK (Prioridade Máxima) ---
-        if current_paca < max_paca:
-            # Tolerância calibrada para 2.0% (absorve o ruído estocástico normal de ~1.0% do OxfordPets):
-            probe_failed = is_probing and (
-                recent_3_mean < probe_baseline - 2.0 or latest_acc < probe_baseline - 2.5
-            )
-            safety_drop = (
-                recent_3_mean < best_acc - 2.0 or latest_acc < best_acc - 2.5
-            )
+        # --- SEGURANÇA: acurácia caiu após redução? Reverte com +2. ---
+        # (SEMPRE ativo, mesmo em cooldown — é uma rede de segurança)
+        paca_before_last_change = client_info.get('paca_before_change')
+        if paca_before_last_change is not None and paca_before_last_change > current_paca:
+            # PaCA foi reduzido. Verificar se a acurácia caiu.
+            acc_before_window = acc_history[-(window + 1):-1] if len(acc_history) > window else acc_history[:window]
+            mean_before = sum(acc_before_window) / len(acc_before_window)
             
-            if probe_failed or safety_drop:
-                new_paca = min(current_paca + 2, max_paca)
-                reason = "Sondagem falhou" if probe_failed else "Queda de acurácia global"
-                logger.warning(
-                    f"PaCA adaptativo {client_id}: {reason}! "
-                    f"(atual={latest_acc:.2f}%, média3={recent_3_mean:.2f}%, melhor={best_acc:.2f}%, âncora={probe_baseline:.2f}%). "
-                    f"Rollback {current_paca} -> {new_paca}"
-                )
+            if mean_acc < mean_before - 2.0:  # Caiu mais de 2 pontos percentuais
+                new_paca = min(current_paca + 2, max_paca)  # Reversão forte: +2
+                logger.info(f"PaCA adaptativo {client_id}: REVERTENDO {current_paca} -> {new_paca} "
+                            f"(acurácia {acc_type} caiu: {mean_before:.1f}% -> {mean_acc:.1f}%)")
+                self.clients_info[client_id]['paca_before_change'] = current_paca
                 return new_paca
-
-        # Se estiver em cooldown para novas reduções, encerra aqui
-        current_round = len(acc_history)
-        cooldown_until = client_info.get('cooldown_until_round', 0)
-        if current_round < cooldown_until:
+        
+        # --- PLATEAU: acurácia estabilizou? Tenta reduzir. ---
+        # (APENAS fora do cooldown — respeita o tempo de observação)
+        if in_cooldown:
             return None
-
-        # --- B. SONDAGEM CAUTELOSA DE EFICIÊNCIA (a partir do round 10) ---
-        if current_round < 10:
-            return None  # Fase inicial de aprendizado: não reduzir
             
-        if mean_acc < best_acc * 0.90:
-            return None  # Modelo ainda não está em alto desempenho estável
-            
-        # Escalonamento Canário: divide os clientes em 5 grupos baseados no round
-        try:
-            numeric_id = int(str(client_id).split('_')[-1]) if not isinstance(client_id, int) else client_id
-        except (ValueError, TypeError):
-            numeric_id = 0
-            
-        if numeric_id % 5 != current_round % 5:
-            return None  # Não é a vez canário deste cliente
-            
-        if current_paca > paca_min:
-            return current_paca - 1
-            
-        return None
+        best_acc = max(acc_history) if acc_history else 0.0
+        min_acc_for_plateau = best_acc * 0.90  # 90% da melhor acurácia observada
+        
+        # Em Non-IID local por cliente, desvio de até 2.0% ou relativo < 3% indica convergência estável
+        is_plateau = (std_acc < 2.0 or (mean_acc > 0 and (std_acc / mean_acc) < 0.03))
+        if (is_plateau 
+                and current_paca > paca_min 
+                and mean_acc >= min_acc_for_plateau):
+            new_paca = current_paca - 1
+            logger.info(f"PaCA adaptativo {client_id}: reduzindo {current_paca} -> {new_paca} "
+                        f"(acurácia {acc_type} estável: {mean_acc:.1f}% ± {std_acc:.2f}%, camadas extras desnecessárias)")
+            self.clients_info[client_id]['paca_before_change'] = current_paca
+            return new_paca
+        
+        return None  # Acurácia não é conclusiva, deixa latência decidir
 
 
     def _is_excluded_by_paca(self, key, min_layer_idx):
@@ -924,13 +912,16 @@ class FederatedLearningServer:
             start_time = time.time()
             logger.info(f"Round {round_num}: Handling client {client_id}")
             
-            with self.lock:
-                if self.args.model == 'clip':
-                    current_global_state = get_trainable_state_dict(self.global_model)
-                elif self.args.model == 'slm':
-                    current_global_state = get_trainable_state_dict_slm(self.global_model)
-                else:
-                    current_global_state = self.global_state.copy()
+            if hasattr(self, 'current_round_state') and self.current_round_state is not None:
+                current_global_state = self.current_round_state.copy()
+            else:
+                with self.lock:
+                    if self.args.model == 'clip':
+                        current_global_state = get_trainable_state_dict(self.global_model)
+                    elif self.args.model == 'slm':
+                        current_global_state = get_trainable_state_dict_slm(self.global_model)
+                    else:
+                        current_global_state = self.global_state.copy()
             
             # --- PaCA DINÂMICO (para CLIP e SLM, a partir do round 2, se ativado) ---
             if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
@@ -1040,7 +1031,15 @@ class FederatedLearningServer:
                     self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
                     self.sended_ammount.append(self.sended_ammount[-1] + size_after)
             else:
-                size_before = (len(pickle.dumps(current_global_state)) + 4) / (1024 * 1024)
+                ideal_paca = self.clients_info[client_id].get('current_paca', self.args.paca)
+                ideal_rank = self.clients_info[client_id].get('current_rank', self.args.rank)
+                cache_key = (ideal_paca, ideal_rank)
+                with self.lock:
+                    if not hasattr(self, 'size_before_cache'):
+                        self.size_before_cache = {}
+                    if cache_key not in self.size_before_cache:
+                        self.size_before_cache[cache_key] = (len(pickle.dumps(current_global_state)) + 4) / (1024 * 1024)
+                    size_before = self.size_before_cache[cache_key]
                 if use_lhdq:
                     prev_state = self.previous_sent_state.get(client_id, {})
                     current_global_state = lhdq_encode(current_global_state, prev_state)
@@ -1117,6 +1116,9 @@ class FederatedLearningServer:
                     client_accuracies.append(client_test_acc)
                     client_losses.append(client_test_loss)
                 self.clients_info[client_id]['last_loss'] = client_test_loss
+                if 'acc_history' not in self.clients_info[client_id]:
+                    self.clients_info[client_id]['acc_history'] = []
+                self.clients_info[client_id]['acc_history'].append(client_test_acc)
             
             media_rate = (sum(bit_rate) / len(bit_rate)) / 8 / (1024 * 1024)
             self.clients_info[client_id]['bandwidth'] = media_rate
@@ -1240,7 +1242,7 @@ class FederatedLearningServer:
                     X = T.Resize((224, 224), antialias=True)(X)
                 if not X.is_floating_point():
                     X = X.float() / 255.0
-                elif X.max() > 1.0:
+                elif X.min() >= 0.0 and X.max() > 1.0:
                     X = X / 255.0
                 if X.min() >= 0.0:
                     normalize = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
@@ -1288,6 +1290,7 @@ class FederatedLearningServer:
         with h5py.File(file_path, 'w') as hf:
             hf.create_dataset('rs_test_acc', data=self.rs_test_acc)
             hf.create_dataset('rs_test_loss', data=self.rs_test_loss)
+            hf.create_dataset('rs_aux_simple_avg_acc', data=self.rs_aux_simple_avg_acc)
             hf.create_dataset('sended_model_Mb', data=self.sended_ammount)
             hf.create_dataset('Sended_without_quant', data=self.sended_withouquant)
             hf.create_dataset('Aggregated_clients', data=self.aggregated_clients)
@@ -1353,6 +1356,7 @@ class FederatedLearningServer:
                     'probing_paca': False,
                     'probe_baseline_acc': 0.0,
                     'probe_start_round': 0,
+                    'acc_history': [],
                 }
                 
                 logger.info(f"Client {len(self.client_connections) + 1} connected: {addr}")
@@ -1375,6 +1379,17 @@ class FederatedLearningServer:
                 self.stop_event = threading.Event()
                 round_pruning_time = 0.0
                 
+                # Extrai o estado global treinável UMA ÚNICA VEZ para todas as threads deste round,
+                # eliminando a contenção de lock e execução redundante de get_trainable_state_dict.
+                with self.lock:
+                    if self.args.model == 'clip':
+                        self.current_round_state = get_trainable_state_dict(self.global_model)
+                    elif self.args.model == 'slm':
+                        self.current_round_state = get_trainable_state_dict_slm(self.global_model)
+                    else:
+                        self.current_round_state = self.global_state.copy()
+                self.size_before_cache = {}
+                
                 for i, conn in enumerate(self.client_connections):
                     t = threading.Thread(
                         target=self.handle_client, 
@@ -1389,7 +1404,7 @@ class FederatedLearningServer:
                     remaining_time = max(0.0, self.time_threshold - (time.time() - init_time))
                     t.join(timeout=remaining_time)
                 
-                if round_num == 0 or (self.args.model == 'slm' and client_updates):
+                if round_num <= 2 or (self.args.model == 'slm' and client_updates):
                     self.set_threshold()
                     
                 round_duration = time.time() - init_time
@@ -1411,12 +1426,13 @@ class FederatedLearningServer:
                     
                     if self.args.model in ['clip', 'slm'] and 'sora' in self.args.strategy and self.args.prune_freq > 0:
                         # Verifica se a rodada atual é múltipla da frequência desejada
+                        # Poda permanece ativa durante todas as rodadas (sem congelamento na reta final)
                         if (round_num + 1) % self.args.prune_freq == 0:
                             logger.info(f"--- SERVER: Iniciando Poda Iterativa do SoRA (Round {round_num + 1}) ---")
                             
                             sora_prune_start = time.time()
-                            # Threshold adaptativo: sobe progressivamente ao longo das rodadas
-                            # Limitado a 5x para não ser destrutivo
+                            # Threshold adaptativo: sobe progressivamente ao longo das rodadas (commit b946cf6)
+                            # 1x → 10x (1e-3 → 1e-2)
                             progress = (round_num + 1) / self.args.rounds  # 0.0 → 1.0
                             decay_factor = 1.0 + progress * 9.0  # 1x → 10x
                             adaptive_threshold = 1e-3 * decay_factor
@@ -1490,6 +1506,14 @@ class FederatedLearningServer:
                     else:
                         logger.info(f"Round {round_num + 1}: Model aggregated (no test data)")
                     
+                    # Acurácia auxiliar (média simples dos clientes) — usada pelo PaCA/Rank adaptativo
+                    if client_accuracies:
+                        aux_simple_avg = sum(client_accuracies) / len(client_accuracies)
+                        self.rs_aux_simple_avg_acc.append(aux_simple_avg)
+                        logger.info(f"Round {round_num + 1}: Aux Simple Avg Acc (from clients): {aux_simple_avg:.2f}%")
+                    else:
+                        self.rs_aux_simple_avg_acc.append(0.0)
+                    
                     size_trainable_mb, num_trainable_params = get_trainable_size_and_params(self.global_model)
                     logger.info(f'Size Trainable Adapters: {size_trainable_mb:.2f} MB | Trainable Params: {num_trainable_params:,}')
                     self.model_size_per_round.append(size_trainable_mb)
@@ -1502,9 +1526,15 @@ class FederatedLearningServer:
                     
                     paca_list = [self.clients_info[cid].get('current_paca', self.args.paca) for cid in sorted(self.clients_info.keys())]
                     self.rs_client_paca.append(paca_list)
+                    if getattr(self.args, 'adaptive_paca', False) and paca_list:
+                        paca_counts = {p: paca_list.count(p) for p in sorted(set(paca_list))}
+                        logger.info(f"Round {round_num + 1}: PaCA distribution: {paca_counts} (min={min(paca_list)}, max={max(paca_list)}, avg={sum(paca_list)/len(paca_list):.1f})")
                     
                     rank_list = [self.clients_info[cid].get('current_rank', self.args.rank) for cid in sorted(self.clients_info.keys())]
                     self.rs_client_rank.append(rank_list)
+                    if getattr(self.args, 'adaptive_rank', False) and rank_list:
+                        rank_counts = {r: rank_list.count(r) for r in sorted(set(rank_list))}
+                        logger.info(f"Round {round_num + 1}: Rank distribution: {rank_counts} (min={min(rank_list)}, max={max(rank_list)}, avg={sum(rank_list)/len(rank_list):.1f})")
                     
                     training_time_list = [self.clients_info[cid].get('training_time', 0.0) for cid in sorted(self.clients_info.keys())]
                     self.rs_client_training_time.append(training_time_list)
@@ -1595,13 +1625,15 @@ def parse_args():
     parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA')
     parser.add_argument('--paca', type=int, default=12, help='Número de camadas do modelo base para injetar adaptadores (PaCA)')
     parser.add_argument('--adaptive-paca', action='store_true', help='Ativa PaCA dinâmico: servidor ajusta automaticamente o número de camadas por cliente baseado em latência')
-    parser.add_argument('--adaptive-paca-min', type=int, default=2, help='Número mínimo de camadas que o PaCA adaptativo pode alcançar')
+    parser.add_argument('--adaptive-paca-min', type=int, default=2, help='Número mínimo de camadas que o PaCA adaptativo pode alcançar (default: 2)')
+    parser.add_argument('--adaptive-paca-cooldown', type=int, default=5, help='Intervalo de rodadas (cooldown) entre reduções consecutivas de PaCA (default: 5)')
+    parser.add_argument('--adaptive-paca-upscale-ratio', type=float, default=0.7, help='Fator do threshold de latência para permitir subida de PaCA (default: 0.7 conforme commit b946cf6)')
+    parser.add_argument('--annealing-ratio', type=float, default=0.82, help='Fração de rodadas a partir da qual congela busca e poda estrutural (default: 0.82)')
     parser.add_argument('--adaptive-rank', action='store_true', help='Ativa rank adaptativo: servidor ajusta automaticamente o rank por cliente baseado em latência')
-    parser.add_argument('--adaptive-rank-min', type=int, default=2, help='Rank mínimo para o rank adaptativo')
+    parser.add_argument('--adaptive-rank-min', type=int, default=2, help='Rank mínimo para o rank adaptativo (default: 2, conforme commit b946cf6)')
     parser.add_argument('--adaptive-rank-max', type=int, default=8, help='Rank máximo para o rank adaptativo')
-    parser.add_argument('--allow-paca-upscale', action='store_true', help='Permite a subida de PaCA para clientes difíceis (por padrão apenas desce)')
+    parser.add_argument('--adaptive-rank-upscale-ratio', type=float, default=0.7, help='Fator do threshold de latência para permitir subida de Rank (default: 0.7 conforme commit b946cf6)')
     parser.add_argument('--allow-rank-upscale', action='store_true', help='Permite a subida de Rank para clientes difíceis (por padrão apenas desce)')
-    parser.add_argument('--allow-fast-client-upscale', action='store_true', help='Permite subida de PaCA/Rank para clientes rápidos (<80%% do tempo médio). Por padrão desativado para evitar efeito ping-pong.')
     parser.add_argument('--min-rank', type=int, default=2, help='Rank mínimo permitido por módulo SoRA durante poda iterativa')
     parser.add_argument('--sora-prune', action='store_true', help='Ativa poda iterativa de rank do SoRA (independente do --prune CNN)')
     parser.add_argument('--delta-coding', action='store_true', help='Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8')
