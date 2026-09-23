@@ -509,13 +509,23 @@ class FederatedLearningServer:
         
         Onde:
             η^c = T_target / T_full^c   (viabilidade de tempo e rede, Eq. 4 do PUMA ISCC 2026)
-            ψ^c = (Acc^c / Acc_avg)^δ   (fator de qualidade / acurácia)
+            ψ^c = (Acc_avg / Acc^c)^δ   (fator de necessidade de qualidade/acurácia)
+        
+        Dinâmica do fator de qualidade (ψ^c):
+            - Clientes com acurácia abaixo da média (Acc^c < Acc_avg) necessitam de MAIS
+              capacidade de modelo (ψ > 1.0) para convergir sobre dados heterogêneos locais,
+              prevenindo o ciclo vicioso de compressão punitiva.
+            - Clientes com acurácia acima da média (Acc^c >= Acc_avg) já convergiram bem
+              e toleram maior compressão estrutural (ψ <= 1.0).
+            - Clientes com alta perda local (loss local > 1.2 * loss global) têm sua
+              capacidade preservada.
         
         Variáveis de entrada (client_info):
-            - training_time  → T^c
-            - dataset_size   → |D^c|
-            - bandwidth      → B^c (MB/s)
+            - training_time   → T^c
+            - dataset_size    → |D^c|
+            - bandwidth       → B^c (MB/s)
             - acc_history[-1] → Acc^c
+            - last_loss       → Loss^c
         
         Retorna:
             float: γ^c no intervalo [γ_min, 1.0]
@@ -563,11 +573,10 @@ class FederatedLearningServer:
         else:
             eta = target_latency / t_full
         
-        # ── TERMO 2: Fator de Qualidade / Acurácia (ψ^c) ────────────────
-        # ψ^c = (Acc^c / Acc_avg)^δ
-        #
-        # Protege clientes com aprendizado em andamento de serem
-        # comprimidos agressivamente quando ainda precisam convergir.
+        # ── TERMO 2: Fator de Necessidade / Qualidade (ψ^c) ─────────────
+        # ψ^c = (Acc_avg / Acc^c)^δ
+        # Clientes com dificuldade recebem estímulo de capacidade (ψ > 1.0)
+        # Clientes bem consolidados toleram compressão (ψ <= 1.0)
         
         delta = getattr(self.args, 'gamma_delta', 0.5)  # Expoente de sensibilidade
         
@@ -576,14 +585,21 @@ class FederatedLearningServer:
             acc_avg = self.rs_aux_simple_avg_acc[-1] if self.rs_aux_simple_avg_acc[-1] > 0 else 1.0
             
             if acc_c > 0 and acc_avg > 0:
-                ratio = acc_c / acc_avg
-                # Limita a razão para evitar que um outlier de acurácia altíssima distorça
-                ratio = max(0.5, min(1.5, ratio))
-                psi = ratio ** delta
+                need_ratio = acc_avg / acc_c
+                # Clamping da razão para manter estabilidade numérica [0.80, 1.35]
+                need_ratio = max(0.8, min(1.35, need_ratio))
+                psi = need_ratio ** delta
             else:
                 psi = 1.0
         else:
-            psi = 1.0  # Sem histórico de acurácia, não penaliza
+            psi = 1.0  # Sem histórico de acurácia, neutro
+            
+        # Proteção adicional por Loss: clientes com alta perda relativa aos demais
+        # (dados heterogêneos/não-IID desafiadores) recebem reforço de capacidade
+        client_loss = client_info.get('last_loss', 0.0) or 0.0
+        global_loss = self.rs_test_loss[-1] if self.rs_test_loss else 0.0
+        if client_loss > 0 and global_loss > 0 and client_loss > global_loss * 1.2:
+            psi = max(psi, 1.15)
         
         # ── COMPOSIÇÃO FINAL ─────────────────────────────────────────────
         gamma = max(gamma_min, min(1.0, eta * psi))
@@ -601,57 +617,134 @@ class FederatedLearningServer:
 
     def calculate_adaptive_paca(self, client_id):
         """
-        Calcula o PaCA ideal para um cliente usando o Índice de Capacidade γ^c.
+        Calcula o PaCA ideal para um cliente usando o Índice de Capacidade γ^c
+        com rede de segurança (Panic Reversal) e Cooldown de reduções.
         
-        PaCA^c = round(γ^c × L_max), clamped em [paca_min, paca_max]
-        
-        Suavização: limita a mudança a ±2 camadas por rodada para estabilidade.
+        1. Panic Reversal: se a acurácia do cliente caiu >2pp após redução, reverte imediatamente (+2).
+        2. Cooldown: impede reduções consecutivas antes da estabilização (default: 3 rounds).
+        3. PaCA^c = round(γ^c × L_max), suavizado em ±2 camadas/round.
         """
-        gamma = self.calculate_capacity_index(client_id)
+        client_info = self.clients_info.get(client_id, {})
         max_paca = self.args.paca
         paca_min = getattr(self.args, 'adaptive_paca_min', 2)
+        current_paca = client_info.get('current_paca', max_paca)
+        acc_history = client_info.get('acc_history', [])
+        current_round = len(self.rs_aux_simple_avg_acc)
+        cooldown_rounds = getattr(self.args, 'adaptive_paca_cooldown', 3)
+        last_reduction_round = client_info.get('last_paca_reduction_round', -999)
         
+        # ── 1. REDE DE SEGURANÇA: PANIC REVERSAL ─────────────────────────
+        paca_before = client_info.get('paca_before_change')
+        paca_acc_at_reduction = client_info.get('paca_acc_at_reduction')
+        if paca_before is not None and paca_before > current_paca and acc_history and paca_acc_at_reduction is not None:
+            recent_acc = acc_history[-1]
+            if recent_acc < paca_acc_at_reduction - 2.0:
+                reverted_paca = min(current_paca + 2, max_paca)
+                logger.warning(
+                    f"PANIC REVERSAL PaCA {client_id}: acurácia caiu de {paca_acc_at_reduction:.1f}% "
+                    f"para {recent_acc:.1f}%. Revertendo {current_paca} → {reverted_paca}!"
+                )
+                client_info['paca_before_change'] = None
+                client_info['paca_acc_at_reduction'] = None
+                client_info['last_paca_reduction_round'] = current_round
+                return reverted_paca
+            elif (current_round - last_reduction_round) >= cooldown_rounds:
+                # Estabilizou com sucesso na capacidade reduzida
+                client_info['paca_before_change'] = None
+                client_info['paca_acc_at_reduction'] = None
+        
+        # ── 2. CÁLCULO BASE VIA ÍNDICE DE CAPACIDADE γ ─────────────────────
+        gamma = self.calculate_capacity_index(client_id)
         ideal_paca = round(gamma * max_paca)
         ideal_paca = max(paca_min, min(max_paca, ideal_paca))
         
-        # Suavização: limitar mudança a ±2 por rodada para estabilidade
-        current_paca = self.clients_info[client_id].get('current_paca', max_paca)
-        ideal_paca = max(current_paca - 2, min(current_paca + 2, ideal_paca))
-        ideal_paca = max(paca_min, min(max_paca, ideal_paca))
+        # ── 3. COOLDOWN & SUAVIZAÇÃO DE TRANSIÇÃO ─────────────────────────
+        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
         
-        if ideal_paca != current_paca:
-            logger.info(f"PaCA γ-driven {client_id}: {current_paca} → {ideal_paca} (γ={gamma:.3f})")
+        if ideal_paca < current_paca:
+            if in_cooldown:
+                logger.debug(f"PaCA {client_id} em cooldown (round {current_round}, última redução: {last_reduction_round}). Mantendo {current_paca}")
+                return current_paca
+            # Suavização: limitar redução a no máximo -2 por rodada
+            ideal_paca = max(current_paca - 2, ideal_paca)
+            client_info['paca_before_change'] = current_paca
+            client_info['paca_acc_at_reduction'] = acc_history[-1] if acc_history else 0.0
+            client_info['last_paca_reduction_round'] = current_round
+            logger.info(f"PaCA γ-driven {client_id}: reduzindo {current_paca} → {ideal_paca} (γ={gamma:.3f})")
+        elif ideal_paca > current_paca:
+            # Subida/recuperação é permitida mesmo em cooldown quando as condições físicas/acurácia melhoram
+            ideal_paca = min(current_paca + 2, ideal_paca)
+            client_info['paca_before_change'] = None
+            client_info['paca_acc_at_reduction'] = None
+            logger.info(f"PaCA γ-driven {client_id}: subindo {current_paca} → {ideal_paca} (γ={gamma:.3f})")
         
         return ideal_paca
 
     def calculate_adaptive_rank(self, client_id):
         """
-        Calcula o Rank ideal para um cliente usando o Índice de Capacidade γ^c.
+        Calcula o Rank ideal para um cliente usando o Índice de Capacidade γ^c
+        com rede de segurança (Panic Reversal) e Cooldown de reduções.
         
-        Rank^c = round(γ^c × R_max), clamped em [rank_min, rank_max]
-        
-        Suavização: limita a mudança a ±2 por rodada para estabilidade.
+        1. Panic Reversal: se a acurácia do cliente caiu >2pp após redução, reverte imediatamente (+2).
+        2. Cooldown: impede reduções consecutivas antes da estabilização (default: 3 rounds).
+        3. Rank^c = round(γ^c × R_max), suavizado em ±2 por round.
         """
-        gamma = self.calculate_capacity_index(client_id)
+        client_info = self.clients_info.get(client_id, {})
         max_rank = getattr(self.args, 'adaptive_rank_max', 8)
         min_rank = getattr(self.args, 'adaptive_rank_min', 2)
+        current_rank = client_info.get('current_rank', max_rank)
+        acc_history = client_info.get('acc_history', [])
+        current_round = len(self.rs_aux_simple_avg_acc)
+        cooldown_rounds = getattr(self.args, 'adaptive_paca_cooldown', 3)
+        last_reduction_round = client_info.get('last_rank_reduction_round', -999)
         
+        # ── 1. REDE DE SEGURANÇA: PANIC REVERSAL ─────────────────────────
+        rank_before = client_info.get('rank_before_change')
+        rank_acc_at_reduction = client_info.get('rank_acc_at_reduction')
+        if rank_before is not None and rank_before > current_rank and acc_history and rank_acc_at_reduction is not None:
+            recent_acc = acc_history[-1]
+            if recent_acc < rank_acc_at_reduction - 2.0:
+                reverted_rank = min(current_rank + 2, max_rank)
+                logger.warning(
+                    f"PANIC REVERSAL Rank {client_id}: acurácia caiu de {rank_acc_at_reduction:.1f}% "
+                    f"para {recent_acc:.1f}%. Revertendo {current_rank} → {reverted_rank}!"
+                )
+                client_info['rank_before_change'] = None
+                client_info['rank_acc_at_reduction'] = None
+                client_info['last_rank_reduction_round'] = current_round
+                return reverted_rank
+            elif (current_round - last_reduction_round) >= cooldown_rounds:
+                # Estabilizou com sucesso no rank reduzido
+                client_info['rank_before_change'] = None
+                client_info['rank_acc_at_reduction'] = None
+        
+        # ── 2. CÁLCULO BASE VIA ÍNDICE DE CAPACIDADE γ ─────────────────────
+        gamma = self.calculate_capacity_index(client_id)
         ideal_rank = round(gamma * max_rank)
         ideal_rank = max(min_rank, min(max_rank, ideal_rank))
         
-        # Suavização: limitar mudança a ±2 por rodada
-        current_rank = self.clients_info[client_id].get('current_rank', max_rank)
-        ideal_rank = max(current_rank - 2, min(current_rank + 2, ideal_rank))
-        ideal_rank = max(min_rank, min(max_rank, ideal_rank))
+        # ── 3. COOLDOWN & SUAVIZAÇÃO DE TRANSIÇÃO ─────────────────────────
+        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
+        allow_upscale = getattr(self.args, 'allow_rank_upscale', True)
         
-        if ideal_rank != current_rank:
-            logger.info(f"Rank γ-driven {client_id}: {current_rank} → {ideal_rank} (γ={gamma:.3f})")
+        if ideal_rank < current_rank:
+            if in_cooldown:
+                logger.debug(f"Rank {client_id} em cooldown (round {current_round}, última redução: {last_reduction_round}). Mantendo {current_rank}")
+                return current_rank
+            ideal_rank = max(current_rank - 2, ideal_rank)
+            client_info['rank_before_change'] = current_rank
+            client_info['rank_acc_at_reduction'] = acc_history[-1] if acc_history else 0.0
+            client_info['last_rank_reduction_round'] = current_round
+            logger.info(f"Rank γ-driven {client_id}: reduzindo {current_rank} → {ideal_rank} (γ={gamma:.3f})")
+        elif ideal_rank > current_rank:
+            if not allow_upscale:
+                return current_rank
+            ideal_rank = min(current_rank + 2, ideal_rank)
+            client_info['rank_before_change'] = None
+            client_info['rank_acc_at_reduction'] = None
+            logger.info(f"Rank γ-driven {client_id}: subindo {current_rank} → {ideal_rank} (γ={gamma:.3f})")
         
         return ideal_rank
-        
-    # Os métodos _check_accuracy_signal e _check_accuracy_signal_rank foram substituídos
-    # pelo componente ψ^c (fator de acurácia) dentro de calculate_capacity_index.
-    # A acurácia agora influencia diretamente o γ^c em vez de operar como regras isoladas.
 
 
     def _is_excluded_by_paca(self, key, min_layer_idx):
@@ -1142,11 +1235,12 @@ class FederatedLearningServer:
                     'dataset_size': 1.0,
                     'current_paca': self.args.paca,  # PaCA atual do cliente (dinâmico)
                     'current_rank': self.args.rank,  # Rank atual do cliente (dinâmico)
-                    'paca_before_change': self.args.paca,
-                    'cooldown_until_round': 0,
-                    'probing_paca': False,
-                    'probe_baseline_acc': 0.0,
-                    'probe_start_round': 0,
+                    'paca_before_change': None,
+                    'paca_acc_at_reduction': None,
+                    'last_paca_reduction_round': -999,
+                    'rank_before_change': None,
+                    'rank_acc_at_reduction': None,
+                    'last_rank_reduction_round': -999,
                     'acc_history': [],
                 }
                 
@@ -1430,6 +1524,8 @@ def parse_args():
     parser.add_argument('--min-rank', type=int, default=2, help='Rank mínimo permitido por módulo SoRA durante poda iterativa')
     parser.add_argument('--sora-prune', action='store_true', help='Ativa poda iterativa de rank do SoRA (independente do --prune CNN)')
     parser.add_argument('--delta-coding', action='store_true', help='Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8')
+    parser.add_argument('--adaptive-paca-cooldown', type=int, default=3, help='Número de rodadas de cooldown entre reduções consecutivas de capacidade (default: 3)')
+    parser.add_argument('--allow-rank-upscale', action='store_true', default=True, help='Permite subida de rank quando condições melhoram ou para reversão de pânico (default: True)')
     parser.add_argument('--gamma-delta', type=float, default=0.5, help='Expoente de sensibilidade da acurácia no índice de capacidade γ (default: 0.5)')
     return parser.parse_args()
 
