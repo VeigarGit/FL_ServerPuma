@@ -1,0 +1,21 @@
+study,dataset,source,method,metric,value,unit,condition
+PUMA,CIFAR-10,Table II page 6,Default FL,average_model_per_client,0.810,MB,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,NISP,average_model_per_client,0.317,MB,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,SNIP,average_model_per_client,0.344,MB,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,PUMA Default,average_model_per_client,0.144,MB,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,PUMA 500mb,average_model_per_client,0.148,MB,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,PUMA 100mb,average_model_per_client,0.153,MB,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,Default FL,round_time,115.17,s,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,NISP,round_time,112.64,s,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,SNIP,round_time,73.04,s,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,PUMA Default,round_time,54.13,s,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,PUMA 500mb,round_time,54.92,s,8 clients 25 rounds
+PUMA,CIFAR-10,Table II page 6,PUMA 100mb,round_time,55.32,s,8 clients 25 rounds
+PUMA,CIFAR-10,Figure 3 page 5,Default FL,total_transmitted_model_size,670.8,MB,non-quantized 25 rounds
+PUMA,CIFAR-10,Figure 3 page 5,Default FL,total_transmitted_model_size,168.5,MB,quantized 25 rounds
+PUMA,CIFAR-10,Figure 3 page 5,PUMA Default,total_transmitted_model_size,116.4,MB,non-quantized 25 rounds
+PUMA,CIFAR-10,Figure 3 page 5,PUMA Default,total_transmitted_model_size,29.9,MB,quantized 25 rounds
+OPALA,CIFAR-100,Section IV.B page 6,Baseline FL,accuracy,35.49,percent,threshold 1.65 s
+OPALA,CIFAR-100,Section IV.B page 6,OPALA,accuracy,58.94,percent,threshold 1.65 s
+OPALA,CIFAR-100,Section IV.B page 6,Baseline FL,training_time,1.53,s,threshold 1.65 s
+OPALA,CIFAR-100,Section IV.B page 6,OPALA,training_time,1.23,s,threshold 1.65 s
