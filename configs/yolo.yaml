@@ -1,0 +1,24 @@
+# O path do data.yaml original é substituído por --dataset-root.
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: motorcycle
+  4: airplane
+  5: bus
+  6: train
+  7: truck
+weights: yolo11n.pt
+rounds: 20
+local_epochs: 1
+imgsz: 640
+batch: 4
+optimizer: AdamW
+lr0: 0.001
+seed: 42
+amp: false
+device: '0'
+workers: 0
+output: src/results/yolo
+allow_missing_labels: false
+timeout: 3600

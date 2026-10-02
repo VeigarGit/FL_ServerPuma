@@ -1,3 +1,16 @@
+# Dispatch YOLO before importing the legacy CNN/CLIP/SLM dependencies.
+import sys as _yolo_sys
+
+if __name__ == "__main__" and any(
+    value == "--model=yolo"
+    or (value == "--model" and index + 1 < len(_yolo_sys.argv)
+        and _yolo_sys.argv[index + 1] == "yolo")
+    for index, value in enumerate(_yolo_sys.argv)
+):
+    from yolo.run import main as _yolo_main
+    _yolo_main()
+    raise SystemExit(0)
+
 import socket
 import pickle
 import struct

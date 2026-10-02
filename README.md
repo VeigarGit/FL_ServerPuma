@@ -1,435 +1,206 @@
-# FL_ServerPuma: Adaptive Federated Learning Simulator
+# FL_ServerPuma — YOLO federada por câmera
 
-## 📋 Overview
-
-**FL_ServerPuma** is a research-focused Federated Learning simulator designed to evaluate the performance of distributed training under constrained network and hardware conditions. 
-
-The system features:
-* **Adaptive Structural Pruning:** The server dynamically calculates and applies pruning masks based on network latency bottlenecks and computational complexity (FLOPs).
-* **FedALA Support:** Integrates Adaptive Local Aggregation to handle Non-IID data distribution efficiently.
-* **Network Simulation:** Uses `docker-tc` to accurately simulate real-world conditions like bandwidth limits (e.g., 1Mbit/s) and packet loss (e.g., 10%).
-* **Modern Reproducible Infrastructure:** Powered by `uv` and Multi-stage Docker builds, ensuring hermetic, extremely fast, and deterministic executions across any hardware without dependency conflicts.
-* **Multi-Execution Environments:** Run the simulation via Docker Compose, automated Tmux sessions, or isolated manual terminals.
-
----
-
-## ⚙️ Prerequisites
-
-Depending on your chosen execution method, ensure the following tools are installed:
-
-### For Local Execution (Bash/Tmux or Manual)
-1. **uv:** The modern, lightning-fast Python package and project manager (replaces Conda/pip).
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
-2. **Tmux:** For the automated bash script.
-   ```bash
-   sudo apt update && sudo apt install tmux
-   ```
-
-### For Docker Execution
-1. **Docker & Docker Compose V2:** Ensure you are using the modern `docker compose` plugin (without the hyphen).
-2. **Docker Traffic Control (docker-tc):** Required to simulate network delays and bandwidth limits. Run this daemon once on your host machine:
-   ```bash
-   docker run -d --name docker-tc --network host --cap-add NET_ADMIN --restart always --volume /var/run/docker.sock:/var/run/docker.sock lukaszlach/docker-tc
-   ```
-
----
-
-## 🛠️ Step 0: Environment Setup & Dataset Generation
-
-Regardless of the execution method, the environment must be synced and the partitioned dataset generated first. You **do not** need to manually activate environments; `uv` handles isolation automatically.
-
-1. **Sync the hermetic environment (installs Python and all dependencies from `uv.lock`):**
-   ```bash
-   uv sync
-   ```
-
-2. **Generate the Non-IID Dataset:**
-   ```bash
-   # Example with MNIST (lightest, recommended for initial testing)
-   uv run python src/dataset/generate_MNIST.py noniid - dir
-
-   # Example with Cifar100
-   uv run python src/dataset/generate_Cifar100.py noniid - dir
-
-   # Example with Flowers102
-   uv run python src/dataset/generate_Flowers102.py noniid - dir
-   ```
-
-> **⚠️ Important:** The number of data partitions is defined by the `num_clients` variable **inside each dataset generator script** (e.g., `generate_MNIST.py`). Make sure this value matches or exceeds the `--clients` count you plan to use in Docker Compose. Otherwise, some clients will have no data and the experiment will fail.
-
----
-
-## 🚀 Method 1: Docker Execution
-
-This method containerizes the server and clients using highly optimized Multi-stage builds, automatically applying network constraints and mounting local volumes to save results persistently.
-
-**1. Generate the Docker Compose file dynamically:**
-Use `generate_compose.py` to set up your experiment parameters.
-```bash
-cd docker/
-uv run python generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --prune 1 --ala 0
-```
-*Parameters:*
-* `--clients`: Number of clients to simulate.
-* `--dataset`: `Cifar100`, `Cifar10`, `MNIST`, `FashionMNIST` or `OxfordPets`.
-* `--rounds`: Number of training rounds.
-* `--prune`: `1` to enable Adaptive Pruning, `0` to disable.
-* `--ala`: `0` to enable FedALA, `1` to use standard FedAvg. **⚠️ Note: the semantics are inverted — `0` means ON.**
-* `--model`: `cnn` or `clip`.
-* `--strategy`: `lora`, `sora_with_schedule`, or `sora_no_schedule`.
-
-**2. Build and run the simulation:**
-```bash
-# Build the images and start the containers in the background
-docker compose --project-directory .. -f docker-compose.generated.yml up --build -d
-```
-*(Always use `--build` so the containers capture any recent changes in your local Python scripts).*
-
-**3. Monitor the live logs:**
-```bash
-# Follow the live logs to monitor the training process
-docker compose --project-directory .. -f docker-compose.generated.yml logs -f
-```
-
-**4. End of simulation & Cleanup (CRITICAL):**
-When the simulation finishes ("Training completed"), the containers will stay running idly. You must tear them down before starting a new experiment:
-```bash
-docker compose --project-directory .. -f docker-compose.generated.yml down
-```
-> **⚠️ Important:** DO NOT use the `-v` flag when running `down` (unless you want to do a deep clean). The setup uses a shared `hf-cache` volume to cache HuggingFace models (like the 600MB CLIP model). Using `-v` will delete this cache, forcing the containers to download the heavy model all over again on the next run.
-
-### 🔄 Standard Workflow to Change Parameters
-To run a new experiment with different parameters, simply repeat the cycle:
-1. Run `generate_compose.py` with the new flags.
-2. Run `docker compose ... up --build -d`.
-3. Run `docker compose ... logs -f`.
-4. Run `docker compose ... down` when finished.
-
----
-
-## 🚀 Method 2: Tmux Automation Script (Local)
-
-This script automates the setup on the host machine using `tmux` to manage multiple processes, assigning a separate Tmux window (tab) for the Server and each Client. The script safely encapsulates all runs using `uv run`.
+Esta é a versão da branch **`yolo_review`**: YOLO11n da Ultralytics, uma câmera por cliente e **FedAvg ponderado pelo número de imagens de treino**. Um servidor e clientes locais trocam pesos por TCP em `127.0.0.1`. Os clientes treinam **em sequência**, usando uma única GPU; as imagens permanecem no dataset. O README descreve apenas essa versão.
 
 ```bash
-cd src/system/
-chmod +x run.sh    # first time only
-
-# View all available arguments
-./run.sh --help
-
-# Run with default values (2 clients, MNIST, 5 rounds)
-./run.sh
-
-# Example with CLIP + LoRA
-./run.sh --model clip --strategy lora --dataset OxfordPets --clients 5 --rounds 50 --num-classes 37
-
-# Example with SoRA + adaptive PaCA
-./run.sh --model clip --strategy sora_with_schedule --adaptive-paca --sora-prune --rounds 50
-
-# Example with CLIP + LoRA across multiple rounds and simulations (Flowers102)
-./run.sh --simulations 10 --clients 25 --strategy lora --model clip --rounds 150 --dataset Flowers102 --auto-next --skip-train-eval --num-classes 102 -did 0
+git clone --branch yolo_review --single-branch \
+  https://github.com/VeigarGit/FL_ServerPuma.git
+cd FL_ServerPuma
+uv sync --project yolo --locked
 ```
 
-### 📖 `run.sh` Arguments
+## Requisitos e instalação
 
-**Network:**
+Use Linux com GPU NVIDIA para o treinamento completo, Python 3.11 e [uv](https://docs.astral.sh/uv/getting-started/installation/). O ambiente isolado `yolo/.venv` fixa Ultralytics 8.3.0, PyTorch 2.0.1, torchvision 0.15.2 e NumPy 1.26.4; `yolo/uv.lock` registra as dependências. Não é necessário instalar o ambiente principal do repositório, Docker, tmux ou bibliotecas CLIP/SLM.
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-h`, `--host` | Server host | `localhost` |
-| `-p`, `--port` | Server port | `9500` |
-
-**Session / Execution:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-s`, `--session` | Tmux session name | `fl_puma` |
-| `--simulations` | Number of sequential simulations | `1` |
-| `--start-run` | Index of the first simulation run | `1` |
-| `--exp-name` | Custom experiment name | auto-generated |
-| `--auto-next` | Do not pause between simulations | disabled |
-
-**Training:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-c`, `--clients` | Number of clients | `2` |
-| `-r`, `--rounds` | Number of rounds | `5` |
-| `-d`, `--dataset` | Dataset (`MNIST`, `Cifar10`, `Cifar100`, `OxfordPets`, `Flowers102`, etc. — any dataset with `generate_<Name>.py`) | `MNIST` |
-| `--batch-size` | Batch size | `32` |
-| `--max-clients` | Maximum allowed clients | `25` |
-| `--ala` | 0=FedALA, 1=FedAvg | `1` |
-
-**Model:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-m`, `--model` | Model type (`cnn` or `clip`) | `cnn` |
-| `--strategy` | Strategy (`lora`, `sora_with_schedule`, etc.) | `lora` |
-| `--rank` | LoRA/SoRA rank | `8` |
-| `--config` | Path to YAML config file (required for CLIP) | `lora_clip/train_config.yml` |
-
-**Device:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--device` | Device (`cuda`, `cpu`, `mps`) | auto-detected |
-| `-did`, `--device-id` | GPU ID | `0` |
-| `--cpu` | Force CPU usage | disabled |
-
-**Pruning:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--prune` | Enable pruning (`0` or `1`) | `1` |
-| `--prune-freq` | Pruning frequency | `1` |
-| `--sora-prune` | Enable SoRA pruning | disabled |
-
-**PaCA:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--paca` | Fixed PaCA value | `12` |
-| `--adaptive-paca` | Adaptive PaCA on server | disabled |
-| `--random-paca` | Random PaCA per client | disabled |
-| `--paca-min` | Minimum PaCA (random mode) | `1` |
-| `--paca-max` | Maximum PaCA (random mode) | `12` |
-| `--paca-list` | List of PaCA per client (e.g. `"4,8,12"`) | — |
-
-**Adaptive Rank:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--adaptive-rank` | Enable adaptive rank on server | disabled |
-| `--adaptive-rank-min` | Minimum rank in adaptive mode | `2` |
-| `--adaptive-rank-max` | Maximum rank in adaptive mode | `8` |
-
-**Architecture and Classification:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--in-features` | Input channels (CNN) | `3` |
-| `--dim` | Intermediate dimension (CNN) | `1600` |
-| `--num-classes` | Number of dataset classes (e.g. `10` for MNIST/Cifar10, `37` for OxfordPets, `102` for Flowers102) | `10` |
-| `-t`, `--test-client-idx` | Test client index | `0` |
-
-**Model Persistence:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--save [path]` | Save model (optional custom path) | disabled |
-| `--load [path]` | Load model (optional custom path) | disabled |
-
-**Evaluation Optimization:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--skip-train-eval` | Skip evaluation on the training set post-training (speeds up round completion) | disabled |
-| `--skip-post-eval` | Skip all local post-training evaluations (retains only Global Model Test Acc) | disabled |
-
-**Compression:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--delta-coding` | Enable LHDQ (Low Huffman-coded Delta Quantization) instead of int8 | disabled |
-
-### 🖥️ Quick Tmux Guide
-
-The script runs the session in the background (detached). Each process (server + clients) is assigned its own **window** (tab) inside the tmux session.
-
-**Attach and detach:**
-```bash
-# Attach to the session (default name: fl_puma)
-tmux attach -t fl_puma
-
-# Detach without terminating processes (from inside tmux)
-# Press: Ctrl+b, then d
-```
-
-**Window navigation (tabs):**
-
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+b n` | Next window |
-| `Ctrl+b p` | Previous window |
-| `Ctrl+b w` | List windows (select with arrow keys + Enter) |
-| `Ctrl+b 0..9` | Jump directly to window by number |
-
-**Scroll and search in logs:**
-
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+b [` | Enter scroll mode (use arrow keys / PgUp / PgDn) |
-| `q` | Exit scroll mode |
-| `Ctrl+b [` → `/` | Search text in log (inside scroll mode) |
-
-**Session management (from outside tmux):**
-```bash
-# List active sessions
-tmux ls
-
-# Terminate a specific session
-tmux kill-session -t fl_puma
-
-# Terminate all tmux sessions
-tmux kill-server
-```
-
-> **Tip:** If training hangs and you want to force shutdown, run `tmux kill-session -t fl_puma` from another terminal. This terminates the server and all clients at once.
-
----
-
-## 🚀 Method 3: V2V-Docker Execution
-
-This method simulates **Vehicular Federated Learning (V2V)** using [SUMO](https://eclipse.dev/sumo/) for urban vehicle mobility and Docker containers as decentralized FL clients. Vehicles train locally and exchange model weights via **D-PSGD (Decentralized Parallel SGD)** when they come within communication range; no central server is required.
-
-### Prerequisites
-
-In addition to the base prerequisites (Docker, docker-tc), you need **SUMO** installed:
+Verifique a GPU após `uv sync`:
 
 ```bash
-sudo apt install sumo sumo-tools
+nvidia-smi
+uv run --project yolo --locked python -c \
+  "import torch; print('torch:', torch.__version__); print('CUDA:', torch.version.cuda); print('GPU disponível:', torch.cuda.is_available())"
 ```
 
-Verify the installation:
-```bash
-sumo --version
-```
-
-### Step 1: Generate the Non-IID Dataset
+O wheel Linux de PyTorch 2.0.1 do ambiente usa CUDA 11.7. É necessário um driver NVIDIA compatível; o toolkit CUDA instalado no sistema não substitui o runtime do wheel. Consulte a [matriz oficial do PyTorch 2.0.1](https://pytorch.org/get-started/previous-versions/#v201). Para usar deliberadamente CUDA 11.8, mantenha as versões e instale os wheels cu118 no ambiente:
 
 ```bash
-uv run python src/dataset/generate_MNIST.py noniid - dir
+uv pip install --python yolo/.venv/bin/python \
+  torch==2.0.1 torchvision==0.15.2 \
+  --index-url https://download.pytorch.org/whl/cu118
 ```
 
-### Step 2: Run the V2X Simulation
+Nesse caso, execute com `yolo/.venv/bin/python` diretamente: `uv run`/`uv sync` pode restaurar os wheels do lock padrão. Registre a alteração no relatório do experimento. CPU é suportada para testes pequenos; esta versão não oferece MPS nem execução distribuída entre máquinas.
 
-Navigate to the `sumo_adapter` directory and execute the orchestrator:
+Os pesos `yolo11n.pt` são baixados no primeiro treino. Para uma máquina sem internet, baixe antecipadamente e passe `--weights /caminho/yolo11n.pt`.
+
+## Dataset já dividido por câmera
+
+```text
+dataset/
+├── camera_01/
+│   ├── images/
+│   │   ├── train/
+│   │   ├── val/
+│   │   └── test/
+│   └── labels/
+│       ├── train/
+│       ├── val/
+│       └── test/
+└── camera_02/
+    ├── images/{train,val,test}/
+    └── labels/{train,val,test}/
+```
+
+Cada imagem deve ter um `.txt` de mesmo nome e caminho relativo em `labels`. As linhas usam `classe x_centro y_centro largura altura`, com coordenadas normalizadas. Um `.txt` vazio indica uma imagem negativa. Os IDs do YAML fornecido são:
+
+| ID | Classe |
+|---|---|
+| 0 | person |
+| 1 | bicycle |
+| 2 | car |
+| 3 | motorcycle |
+| 4 | airplane |
+| 5 | bus |
+| 6 | train |
+| 7 | truck |
+
+`configs/yolo.yaml` preserva essas classes e os splits `images/train`, `images/val` e `images/test`. O `path` absoluto do YAML original é substituído por `--dataset-root`. As câmeras são descobertas nas subpastas, ordenadas por nome e associadas a IDs de cliente no arquivo `data/clients.yaml` de cada execução.
+
+Nenhuma imagem é copiada ou reparticionada. O preparador gera YAMLs por câmera e um YAML global com listas de diretórios. Todos os três splits devem ter imagens, e cada câmera precisa de pelo menos um objeto anotado no treino. Classes, caixas, imagens corrompidas, labels órfãos e conteúdo duplicado entre splits são verificados antes do treinamento. A Ultralytics poderá criar caches de labels ao lado dos dados.
+
+A comparação de conteúdo não comprova separação temporal: confira na origem que frames vizinhos do mesmo vídeo não vazaram entre treino, validação e teste.
+
+Valide primeiro, sem carregar pesos ou usar GPU:
 
 ```bash
-cd src/sumo_adapter/
-
-# First run or after code changes
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg \
-    --build --gui"
-
-# Default run (headless, 5 vehicles, MNIST, max 4 encounters)
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg"
-
-# With SUMO GUI + custom parameters
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg \
-    --gui \
-    --total-clients 5 \
-    --encounters 4 \
-    --radius 300 \
-    --dataset MNIST \
-    --warmup 60 \
-    --cooldown 30"
+uv run --project yolo --locked python src/system/yolo/run.py \
+  --config configs/yolo.yaml \
+  --dataset-root /caminho/dataset \
+  --validate-only
 ```
 
-> **Note:** `sg docker -c "..."` runs the command with Docker group permissions. Alternatively, run `sudo chmod 666 /var/run/docker.sock` once to avoid wrapping every command.
+Labels ausentes causam erro por padrão. Se tiver confirmado que representam imagens negativas, use `--allow-missing-labels`; os arquivos ausentes continuam listados em `data/validation_report.yaml`.
 
-### 📖 Orchestrator Arguments
+## Executar
 
-**SUMO & Simulation:**
+Execute os comandos a partir da raiz do repositório.
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--sumo-cfg` | Path to the `.sumocfg` file (**required**) | — |
-| `--gui` | Open SUMO graphical interface | headless |
-| `--step-length` | Duration of each SUMO step in seconds | `1.0` |
+Teste inicial com duas câmeras e duas rodadas:
 
-**V2V Communication:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--radius` | V2V communication radius in meters | `300` |
-| `--min-clients` | Minimum vehicles to form a cluster | `2` |
-| `--min-contact-time` | Minimum ETC (seconds) to trigger encounter | `6.0` |
-
-**Simulation Control:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--total-clients` | Total vehicle containers to create | `5` |
-| `--encounters` | Maximum viable encounters before stopping | `4` |
-| `--warmup` | Seconds to wait before signaling encounters (containers boot + first epoch) | `60` |
-| `--cooldown` | Seconds between consecutive encounters (prevents encounter spam) | `30` |
-
-**Training:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--dataset` | Dataset: `MNIST`, `Cifar10`, `Cifar100` | `MNIST` |
-| `--prune` | Adaptive pruning: `0`=yes, `1`=no | `1` |
-| `--ala` | FedALA: `0`=yes, `1`=no (FedAvg) | `1` |
-| `--build` | Force Docker image rebuild | disabled |
-
-### Step 3: Monitor the Simulation
-
-The orchestrator prints real-time logs showing encounter formation, ETC values, and P2P exchange progress:
-
-```
-10:27:42 [INFO] Encontro 1/4! Veiculos ['veh_0', 'veh_3'] (Clientes [0, 1]) | ETC=120.0s
-10:27:42 [INFO] SUMO PAUSADO. Aguardando 2 clientes completarem troca P2P do encontro 1...
-10:27:57 [INFO]   ... 1/2 .pt recebidos (15s)
-10:28:20 [INFO] Todos os 2 .pt recebidos em 38s! Aguardando 5s para agregacao...
-10:28:25 [INFO] SUMO RETOMADO.
-```
-
-To inspect individual container logs during execution:
 ```bash
-sg docker -c "docker compose -f docker-compose.v2x.yml logs -f fl-client-v2v-0"
+uv run --project yolo python src/system/yolo/run.py \
+  --config configs/yolo.yaml \
+  --dataset-root /caminho/dataset \
+  --cameras camera_01 camera_02 \
+  --rounds 2
 ```
 
-## 🚀 Method 4: Manual Execution
+Treinamento completo, com todas as câmeras descobertas:
 
-To isolate logs and debug specific client-server interactions, open multiple terminal windows manually. There is no need to activate virtual environments.
-
-**Terminal 1 (Server):**
 ```bash
-cd src/system/
-uv run server.py --dataset Cifar100 --clients-per-round 3 --rounds 5 --prune 1
+uv run --project yolo python src/system/yolo/run.py \
+  --config configs/yolo.yaml \
+  --dataset-root /caminho/dataset
 ```
 
-**Terminal 2 (Client 0):**
+Teste reduzido em CPU:
+
 ```bash
-cd src/system/
-uv run client.py --client-idx 0 --dataset Cifar100 --rounds 5 --ala 0
+uv run --project yolo --locked python src/system/yolo/run.py \
+  --config configs/yolo.yaml \
+  --dataset-root /caminho/dataset \
+  --cameras camera_01 camera_02 \
+  --rounds 2 --device cpu --imgsz 64 --batch 2
 ```
 
-**Terminal 3 (Client 1):**
+O servidor também aceita o mesmo fluxo pelo ponto de entrada existente:
+
 ```bash
-cd src/system/
-uv run client.py --client-idx 1 --dataset Cifar100 --rounds 5 --ala 0
+uv run --project yolo --locked python src/system/server.py \
+  --model yolo --config configs/yolo.yaml --dataset-root /caminho/dataset
 ```
-*(Repeat for as many clients as specified in `--clients-per-round`)*
 
----
+O lançador inicia e encerra `client.py --model yolo` automaticamente, um processo por câmera e rodada; não é necessário abrir terminais adicionais. Não inicie clientes extras manualmente na porta interna do experimento.
 
-## 📊 Results & Outputs
+### Parâmetros
 
-After the simulation completes, performance metrics (Accuracy, Loss, Model Size variations) and logs are generated.
+| Opção | Padrão | Uso |
+|---|---|---|
+| `--cameras` | Todas | Nomes exatos das subpastas, separados por espaços |
+| `--rounds` | 20 | Rodadas globais |
+| `--local-epochs` | 1 | Épocas de cada cliente em cada rodada |
+| `--imgsz` | 640 | Resolução, múltiplo de 32 |
+| `--batch` | 4 | Imagens por batch; reduza em caso de falta de memória |
+| `--device` | `0` | Índice de uma GPU CUDA ou `cpu` |
+| `--weights` | `yolo11n.pt` | Checkpoint inicial; arquitetura de detecção YOLO11n |
+| `--output` | `src/results/yolo` | Pasta base; cada execução cria uma subpasta única |
+| `--timeout` | 3600 | Segundos máximos de espera pela resposta de um cliente |
 
-- **Logs & Results**: Saved in the `src/results/<experiment_name>/` directory.
-- **Model Weights**: Saved in the `src/system/saved_weights/` directory (if saving is enabled).
-- **Aggregated Data**: May also be exported to `src/system/dados_compartilhados/`.
+AdamW, `lr0=0.001`, seed 42, AMP desativado e `workers=0` estão em `configs/yolo.yaml`. Opções de linha de comando prevalecem sobre a configuração. Cada rodada recria o otimizador, desativa warmup e parada antecipada local, usa `nbs=batch` e `close_mosaic=0`. As demais opções de aumento de dados seguem a Ultralytics 8.3.0.
 
----
+A cabeça com oito classes é inicializada uma vez, carregando os pesos compatíveis do modelo pré-treinado. Todos os clientes começam cada rodada com exatamente os mesmos pesos globais. O servidor agrega o modelo bruto da última época local, antes da seleção de checkpoint/EMA da Ultralytics. Tensores flutuantes, incluindo estatísticas de BatchNorm, são agregados em FP32; buffers inteiros permanecem iguais aos globais. A versão não aplica poda, FedALA, LoRA ou compressão.
 
-## ❓ Troubleshooting
+## Avaliação e resultados
 
-| Problem | Cause | Solution |
-|---------|-------|----------|
-| `CUDA not available` inside containers | NVIDIA Container Toolkit not installed | Install `nvidia-container-toolkit`, or remove the `deploy.resources` GPU block from `generate_compose.py` to run on CPU |
-| Clients exit immediately with data errors | Dataset not generated, or fewer partitions than clients | Ensure `num_clients` in the generator script ≥ `--clients` in compose, then regenerate the dataset |
-| `docker-tc` rules not applying | Daemon not running | Check with `docker ps | grep docker-tc`; restart if needed |
-| First Docker build is very slow | Downloading all Python dependencies | Subsequent builds are cached; only rebuilds if `pyproject.toml` or `uv.lock` change |
-| Port conflict on `9000` | Another service using the port | Change `--port` in server args or stop the conflicting service |
-| Build context is huge (several GB) | `.dockerignore` not filtering `.venv`/data | Ensure `.dockerignore` excludes `.venv/`, `src/dataset/*/data/`, and other large directories |
+O caminho de resultados é impresso ao iniciar. Cada execução produz:
+
+```text
+src/results/yolo/<execucao>/
+├── config.yaml
+├── data/                  # YAMLs, clientes e relatório do dataset
+├── baseline.json          # Avaliação inicial antes do ajuste federado
+├── metrics.csv
+├── metrics.json           # Global, câmeras, classes, tempos e bytes
+├── test.json              # Teste final do melhor modelo
+├── best_global.pt
+├── last_global.pt
+├── checkpoints/round_001.pt
+├── clients/               # Artefatos do treinamento local
+├── evaluation/            # Avaliações globais e por câmera
+└── logs/                  # Um log por câmera e rodada
+```
+
+A referência inicial é o modelo de oito classes recém-inicializado a partir dos pesos pré-treinados, antes de ajustar ao dataset. Ela não representa o detector COCO original de 80 classes.
+
+O modelo global é avaliado após cada rodada sobre a **união das imagens de validação**. O mAP global é calculado nessa união, não pela média dos mAPs das câmeras. São registrados mAP50, mAP50–95, precisão e recall, além de resultados por câmera e por classe com anotações no split. Classes ausentes não recebem uma métrica fictícia.
+
+O melhor modelo é selecionado por mAP50–95 de validação; em empate, permanece a primeira rodada. `test` é usado somente ao concluir, para avaliar esse modelo globalmente e por câmera. Os tempos locais incluem treino e validação interna da Ultralytics; `exchange_seconds` inclui o tempo esperando o cliente. Os bytes incluem o cabeçalho de transporte.
+
+Se um cliente falhar, nenhum update daquela rodada será agregado nem substituirá o último checkpoint global concluído. A execução encerra com erro e indica o log. Não há retomada automática de rodada nesta versão.
+
+### Inferência
+
+```bash
+uv run --project yolo --locked python - <<'PY'
+from ultralytics import YOLO
+model = YOLO('src/results/yolo/<execucao>/best_global.pt')
+model.predict(source='/caminho/imagem.jpg', device=0, save=True)
+PY
+```
+
+Para CPU, troque `device=0` por `device='cpu'`.
+
+## Testes e solução de erros
+
+```bash
+uv run --project yolo --locked pytest tests/yolo -q
+```
+
+Teste completo sintético, duas câmeras e duas rodadas em CPU (baixa os pesos se necessário):
+
+```bash
+PUMA_YOLO_SMOKE=1 uv run --project yolo --locked \
+  pytest tests/yolo/test_smoke.py -q -s
+```
+
+| Problema | Ação |
+|---|---|
+| CUDA indisponível | Verifique driver e wheel PyTorch; use `--device cpu` para teste pequeno |
+| Falta de memória | Reduza `--batch 2` ou `--batch 1`, e depois a resolução; reinicie o experimento |
+| Dataset inválido | Leia `data/validation_report.yaml` na pasta de resultados |
+| Label ausente | Crie `.txt` vazio se a imagem for negativa, ou autorize explicitamente os negativos sem label |
+| Conteúdo duplicado entre splits | Corrija os splits na origem e valide novamente |
+| Cliente falhou ou excedeu tempo | Consulte `logs/`; aumente `--timeout` se o treino local precisa de mais tempo |
+| Download de pesos falhou | Passe um checkpoint local com `--weights` |
+
+Os testes sintéticos verificam funcionamento e contratos de agregação; não estimam qualidade no dataset real.

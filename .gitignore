@@ -57,3 +57,8 @@ docker-tc/
 *.net.xml
 *.rou.xml
 *.sumocfg
+# YOLO environment and local runtime
+.venv/
+.yolo-settings/
+.pytest_cache/
+*.cache
