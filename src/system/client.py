@@ -979,13 +979,13 @@ def main():
                     )
                     logger.info(f"Client {args.client_idx}: Agregação OTA concluída com sucesso!")
 
-                    # Passo 3i: FedAvg final — média entre o resultado OTA (transmissores)
-                    # e o modelo local do aggregator (que não viajou pelo ar)
+                    # Passo 3i: FedAvg ponderado
+                    # n_tx já está definido no Passo 3c como len(transmitter_ids)
                     for k in snapshot.keys():
                         ota_val = ota_aggregated[k].float()
                         local_val = snapshot[k].float()
-                        # Média simples: (meu_modelo + modelo_OTA) / 2
-                        snapshot[k] = ((local_val + ota_val) / 2.0).to(snapshot[k].dtype)
+                        # Média ponderada: (1 parte local + n_tx partes do OTA) / total de nós
+                        snapshot[k] = ((local_val + (n_tx * ota_val)) / (n_tx + 1)).to(snapshot[k].dtype)
 
                     # Carregar o modelo agregado no PyTorch
                     if args.model in ['clip', 'slm']:
