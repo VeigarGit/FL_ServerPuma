@@ -433,3 +433,54 @@ After the simulation completes, performance metrics (Accuracy, Loss, Model Size 
 | First Docker build is very slow | Downloading all Python dependencies | Subsequent builds are cached; only rebuilds if `pyproject.toml` or `uv.lock` change |
 | Port conflict on `9000` | Another service using the port | Change `--port` in server args or stop the conflicting service |
 | Build context is huge (several GB) | `.dockerignore` not filtering `.venv`/data | Ensure `.dockerignore` excludes `.venv/`, `src/dataset/*/data/`, and other large directories |
+
+---
+
+## 📚 Citation
+
+If you use this simulator or build upon the OPALA and PUMA approaches in your research, please cite the following papers:
+
+### OPALA
+
+[OPALA: Optimized Pruning Adaptive Learning Approach for Federated Learning Scenarios](https://ieeexplore.ieee.org/document/11325972/)
+
+```bibtex
+@inproceedings{veiga2025opala,
+  author    = {Veiga, Rafael and
+               Morais, Renan and
+               Bustincio, R{\'o}mulo and
+               Bastos, Lucas de Lima and
+               Ros{\'a}rio, Denis Lima and
+               Sargento, Susana and
+               Cerqueira, Eduardo},
+  title     = {{OPALA}: Optimized Pruning Adaptive Learning Approach
+               for Federated Learning Scenarios},
+  booktitle = {2025 IEEE Symposium on Computers and Communications (ISCC)},
+  year      = {2025},
+  publisher = {IEEE},
+  doi       = {10.1109/ISCC65549.2025.11325972},
+  url       = {https://ieeexplore.ieee.org/document/11325972/}
+}
+```
+
+### PUMA
+
+[PUMA: Client Resource-Aware Adaptive Pruning with Heterogeneous Sub-model Aggregation](https://www.researchgate.net/publication/410979250_PUMA_Client_Resource-Aware_Adaptive_Pruning_with_Heterogeneous_Sub-model_Aggregation)
+
+```bibtex
+@misc{veiga2026puma,
+  author = {Veiga, Rafael and
+            Sousa, John Lucas Rodrigues Portilho de and
+            Barreto, Bernardo and
+            Bastos, Lucas de Lima and
+            Ros{\'a}rio, Denis Lima and
+            Sargento, Susana and
+            Cerqueira, Eduardo},
+  title  = {{PUMA}: Client Resource-Aware Adaptive Pruning
+            with Heterogeneous Sub-model Aggregation},
+  year   = {2026},
+  month  = jul,
+  note   = {Preprint},
+  url    = {https://www.researchgate.net/publication/410979250_PUMA_Client_Resource-Aware_Adaptive_Pruning_with_Heterogeneous_Sub-model_Aggregation}
+}
+```
