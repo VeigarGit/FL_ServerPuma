@@ -58,3 +58,8 @@ docker-tc/
 *.net.xml
 *.rou.xml
 *.sumocfg
+
+# Cenário SUMO versionado: Marambaia
+!/src/v2v_fl/maps/marambaia.net.xml
+!/src/v2v_fl/maps/marambaia.rou.xml
+!/src/v2v_fl/maps/marambaia.sumocfg

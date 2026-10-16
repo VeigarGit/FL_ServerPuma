@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<configuration>
+    <input>
+        <net-file value="marambaia.net.xml" />
+        <route-files value="marambaia.rou.xml" />
+    </input>
+    <time>
+        <begin value="0" />
+        <end value="2098" />
+        <step-length value="1.0" />
+    </time>
+    <processing>
+        <collision.action value="warn" />
+    </processing>
+</configuration>
