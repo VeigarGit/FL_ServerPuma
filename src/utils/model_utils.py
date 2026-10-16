@@ -1,4 +1,24 @@
+import os
+import tempfile
+from pathlib import Path
+
 import torch
+
+
+def save_state_dict_atomic(state_dict: dict, path: Path) -> None:
+    """Publish complete weights readable by both container and host users."""
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            torch.save(state_dict, tmp_file)
+            tmp_file.flush()
+            # mkstemp defaults to 0600; Docker and host may have different UIDs.
+            os.fchmod(tmp_file.fileno(), 0o644)
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 def dequantization(global_state):
     """Dequantizes a state dictionary."""
