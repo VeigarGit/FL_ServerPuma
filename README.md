@@ -314,16 +314,16 @@ cd src/v2v_fl/
 
 # First run or after code changes
 sg docker -c "uv run python3 v2v_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg \
+    --sumo-cfg maps/marambaia.sumocfg \
     --build --gui"
 
 # Default run (headless, 5 vehicles, MNIST, max 4 encounters)
 sg docker -c "uv run python3 v2v_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg"
+    --sumo-cfg maps/marambaia.sumocfg"
 
 # With SUMO GUI + custom parameters
 sg docker -c "uv run python3 v2v_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg \
+    --sumo-cfg maps/marambaia.sumocfg \
     --gui \
     --total-clients 5 \
     --encounters 4 \
@@ -388,7 +388,66 @@ To inspect individual container logs during execution:
 sg docker -c "docker compose -f docker-compose.v2x.yml logs -f fl-client-v2v-0"
 ```
 
-## 🚀 Method 4: Manual Execution
+## 🚀 Method 4: V2I-OTA with Stateless RSUs
+
+V2I uses fixed Road Side Units (RSUs) as OTA receivers. Vehicles train locally;
+the host simulates path loss, Rayleigh fading, reception beamforming, and thermal
+noise using the same OTA pipeline as V2V. Every vehicle in an encounter transmits
+with equal aggregation weight. The RSU contributes no model of its own and keeps
+no model between encounters. Knowledge remains in the vehicles.
+
+Prepare the environment and generate enough dataset partitions for the clients:
+
+```bash
+uv sync
+PYTHONPATH=src uv run python src/dataset/generate_MNIST.py noniid - dir --num-clients 5
+```
+
+The Marambaia scenario uses `marambaia.sumocfg`, `marambaia.net.xml`,
+`marambaia.rou.xml`, and `rsu_config_marambaia.json` in `src/v2v_fl/maps/`.
+To generate RSUs at randomly selected junctions instead:
+
+```bash
+uv run python src/v2v_fl/maps/randomAntenna.py \
+    --net-file src/v2v_fl/maps/marambaia.net.xml \
+    --n-antennas 5 --n-antennas-per-antenna 16 \
+    --radius 1000 --near-junctions --seed 42 \
+    --output src/v2v_fl/maps/rsu_config_marambaia.json
+```
+
+Run from the repository root, with Docker and SUMO available:
+
+```bash
+PYTHONPATH=src uv run python -m v2v_fl.v2i_docker_orchestrator \
+    --sumo-cfg src/v2v_fl/maps/marambaia.sumocfg \
+    --rsu-config src/v2v_fl/maps/rsu_config_marambaia.json \
+    --total-clients 5 --encounters 6 --dataset MNIST --model cnn \
+    --ala 1 --prune 1 --build
+```
+
+Add `--gui` to view traffic. The generated Compose currently reserves NVIDIA
+GPUs, so Docker requires NVIDIA Container Toolkit and a compatible GPU.
+
+- `--min-contact-time`: minimum estimated remaining coverage time (default: 4 s).
+- `--warmup`: wall-clock startup delay (default: 60 s).
+- `--cooldown`: simulation-time delay per RSU (default: 15 s).
+- `--ota-epsilon`: channel estimation error in `[0, 1)` (default: 0.1).
+- `--ota-bandwidth-hz`: bandwidth for thermal noise (default: 100000 Hz).
+- `n_antennas` in the RSU JSON sets the receiver's antenna count (default: 16).
+
+SUMO pauses during weight exchange and training. Shared files transport tensors;
+OTA degradation is simulated numerically on the host, rather than by `docker-tc`.
+Only vehicles associated with the first `--total-clients` containers participate.
+`--encounters` counts encounters across all RSUs; the same unchanged group is
+suppressed until it changes or leaves coverage.
+
+Client metrics are saved in `src/results/default_exp_v2i/`, and events in
+`src/results/v2i_events.jsonl`. Encounter weights are discarded after exchange;
+no `rsu_global_*.pt` checkpoints are created. V2I and V2V share the Compose and
+encounter directory, so run these modes separately. Repeated V2I runs overwrite
+the default metrics and event log.
+
+## 🚀 Method 5: Manual Execution
 
 To isolate logs and debug specific client-server interactions, open multiple terminal windows manually. There is no need to activate virtual environments.
 
