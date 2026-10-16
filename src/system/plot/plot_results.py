@@ -32,6 +32,7 @@ import glob
 import numpy as np
 import h5py
 import re
+import shutil
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -395,17 +396,20 @@ def _load_client_h5(files, dataset=None):
         test_dir = os.path.normpath(os.path.join(SCRIPT_DIR, '..', '..', 'dataset', dataset, 'test'))
         if os.path.isdir(test_dir):
             counts = []
+            sample_cache = {}
             for cid in clients_order:
-                npz_path = os.path.join(test_dir, f"{cid}.npz")
-                if os.path.isfile(npz_path):
-                    try:
-                        d = np.load(npz_path, allow_pickle=True)
-                        item = d['data'].item()
-                        counts.append(len(item['y']))
-                    except Exception:
-                        counts.append(1)
-                else:
-                    counts.append(1)
+                if cid not in sample_cache:
+                    npz_path = os.path.join(test_dir, f"{cid}.npz")
+                    if os.path.isfile(npz_path):
+                        try:
+                            d = np.load(npz_path, allow_pickle=True)
+                            item = d['data'].item()
+                            sample_cache[cid] = len(item['y'])
+                        except Exception:
+                            sample_cache[cid] = 1
+                    else:
+                        sample_cache[cid] = 1
+                counts.append(sample_cache[cid])
             total_samples = sum(counts)
             if total_samples > 0:
                 weights = np.array(counts, dtype=float) / total_samples
@@ -1033,9 +1037,11 @@ def plot_12_decomposicao_temporal(experiments, output_dir):
 # ==============================================================================
 
 def plot_13_acuracia_vs_tempo(experiments, output_dir):
-    """Mostra a eficiência temporal de cada estratégia em dois gráficos separados:
-    (a) Acurácia vs tempo real (wall-clock acumulado)
-    (b) Acurácia vs tempo estimado (treino real + rede simulada a 100 Mbps)
+    """Mostra a eficiência temporal de cada estratégia em gráficos separados:
+    (a) Acurácia global vs tempo real (wall-clock acumulado)
+    (b) Acurácia global vs tempo estimado (treino real + rede simulada a 100 Mbps)
+    (c) Acurácia auxiliar ponderada vs tempo real (wall-clock acumulado)
+    (d) Acurácia auxiliar ponderada vs tempo estimado (treino real + rede simulada a 100 Mbps)
     """
     BANDWIDTH_MBPS = 100
     BANDWIDTH_MBs = BANDWIDTH_MBPS / 8  # MB/s
@@ -1095,6 +1101,90 @@ def plot_13_acuracia_vs_tempo(experiments, output_dir):
     ax2.grid(True, ls='--', alpha=0.4)
     fig2.tight_layout()
     _save_and_close(fig2, output_dir, "13b_acuracia_vs_tempo_simulado.pdf")
+
+    # --- Gráficos (c) e (d): Acurácia Auxiliar Ponderada vs Tempo ---
+    has_weighted_data = any(
+        e.get('client') is not None and e['client'].get('weighted_acc_mean') is not None
+        for e in experiments
+    )
+    if has_weighted_data:
+        # --- Gráfico (c): Acurácia Auxiliar Ponderada vs Tempo Real ---
+        fig3, ax3 = plt.subplots(figsize=(12, 7))
+        for i, exp in enumerate(experiments):
+            if exp.get('client') is None or exp['client'].get('weighted_acc_mean') is None:
+                continue
+            s = STYLES[i % len(STYLES)]
+            d = exp['server']
+            w_acc = exp['client']['weighted_acc_mean']
+            accumulated_time = np.cumsum(d['time_mean'])
+
+            min_len = min(len(accumulated_time), len(w_acc))
+            t_plot = accumulated_time[:min_len]
+            acc_plot = w_acc[:min_len]
+
+            lbl = f"{exp['label']} (Final: {acc_plot[-1]:.2f}%)"
+            ax3.plot(t_plot, acc_plot, color=s['color'], marker=s['marker'],
+                     markevery=_mark_every(len(acc_plot)), linestyle=s['ls'],
+                     linewidth=2.5, label=lbl)
+
+        _set_title(ax3, "Weighted Client Auxiliary Accuracy vs Accumulated Real Time")
+        ax3.set_xlabel("Accumulated Time (s)")
+        ax3.set_ylabel("Weighted Client Accuracy (%)")
+        ax3.set_ylim(bottom=0, top=100)
+        ax3.legend(loc='lower right')
+        ax3.grid(True, ls='--', alpha=0.4)
+        fig3.tight_layout()
+        _save_and_close(fig3, output_dir, "13c_acuracia_auxiliar_vs_tempo_real.pdf")
+
+        # --- Gráfico (d): Acurácia Auxiliar Ponderada vs Tempo Estimado (Simulado) ---
+        fig4, ax4 = plt.subplots(figsize=(12, 7))
+        for i, exp in enumerate(experiments):
+            if exp.get('client') is None or exp['client'].get('weighted_acc_mean') is None:
+                continue
+            s = STYLES[i % len(STYLES)]
+            d = exp['server']
+            w_acc = exp['client']['weighted_acc_mean']
+
+            num_rounds = len(d['time_mean'])
+            result = _compute_mb_per_round(d)
+            if result is None:
+                continue
+            mb_discrete, _, _ = result
+
+            train_per_round = _get_train_time_per_round(d)
+
+            estimated_round_time = []
+            for r in range(num_rounds):
+                t_net = mb_discrete[r] / BANDWIDTH_MBs if r < len(mb_discrete) else 0
+                t_tr = train_per_round[r] if r < len(train_per_round) else np.mean(train_per_round)
+                estimated_round_time.append(t_tr + t_net)
+
+            accumulated_time = np.cumsum(estimated_round_time)
+            min_len = min(len(accumulated_time), len(w_acc))
+            t_plot = accumulated_time[:min_len]
+            acc_plot = w_acc[:min_len]
+
+            lbl = f"{exp['label']} (Final: {acc_plot[-1]:.2f}%)"
+            ax4.plot(t_plot, acc_plot, color=s['color'], marker=s['marker'],
+                     markevery=_mark_every(len(acc_plot)), linestyle=s['ls'],
+                     linewidth=2.5, label=lbl)
+
+        _set_title(ax4, f"Weighted Client Auxiliary Accuracy vs Estimated Time ({BANDWIDTH_MBPS} Mbps Network)")
+        ax4.set_xlabel("Accumulated Estimated Time (s)")
+        ax4.set_ylabel("Weighted Client Accuracy (%)")
+        ax4.set_ylim(bottom=0, top=100)
+        ax4.legend(loc='lower right')
+        ax4.grid(True, ls='--', alpha=0.4)
+        fig4.tight_layout()
+        _save_and_close(fig4, output_dir, "13d_acuracia_auxiliar_vs_tempo_simulado.pdf")
+
+        # Cópia de conveniência nomeada 13c_acuracia_auxiliar_vs_tempo_simulado
+        pdf_src = os.path.join(output_dir, "13d_acuracia_auxiliar_vs_tempo_simulado.pdf")
+        png_src = os.path.join(output_dir, "13d_acuracia_auxiliar_vs_tempo_simulado.png")
+        if os.path.exists(pdf_src):
+            shutil.copy2(pdf_src, os.path.join(output_dir, "13c_acuracia_auxiliar_vs_tempo_simulado.pdf"))
+        if os.path.exists(png_src):
+            shutil.copy2(png_src, os.path.join(output_dir, "13c_acuracia_auxiliar_vs_tempo_simulado.png"))
 
 
 # ==============================================================================
