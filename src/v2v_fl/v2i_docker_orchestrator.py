@@ -11,22 +11,20 @@ Diferenças em relação ao V2V (v2v_docker_orchestrator.py):
   - As RSUs são pontos fixos no mapa (definidos em rsu_config.json).
   - A detecção é veículo ↔ RSU (não veículo ↔ veículo).
   - ≥1 veículo no raio da RSU é suficiente para agregar.
-  - A agregação OTA é feita NO HOST (neste script), não nos containers.
+  - A agregação OTA é feita no serviço único rsu-service, em CPU.
   - As RSUs são stateless: só agregam os modelos do encontro atual.
   - O conhecimento permanece nos veículos, sem modelo global persistido na RSU.
 
 Fluxo:
   1. Carrega posições das RSUs do rsu_config.json.
-  2. Inicia containers Docker dos veículos (mesmos do V2V).
+  2. Inicia containers Docker dos veículos e o rsu-service.
   3. Inicia SUMO e conecta via TraCI.
   4. A cada step do SUMO:
      a) Detecta veículos dentro do raio de cada RSU.
      b) Calcula o ETC de cada veículo com a RSU.
-     c) Se ETC suficiente: gera sinal de encontro V2I.
-     d) Espera veículos salvarem seus .pt no volume compartilhado.
-     e) Carrega os .pt e simula canal, beamforming e superposição OTA na RSU.
-     f) Salva o modelo agregado para os veículos carregarem.
-     g) Descarta os pesos temporários após a confirmação dos veículos.
+     c) Se ETC suficiente: publica identificadores, endereço e posições em JSON.
+     d) O serviço recebe os pesos por TCP, agrega e aguarda APPLIED dos veículos.
+     e) Espera o status terminal do servidor e a avaliação dos clientes.
   5. Encerra quando o número máximo de encontros é atingido.
 
 Uso:
@@ -44,18 +42,26 @@ import argparse
 import json
 import logging
 import math
-import os
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from runpy import run_path
 
-from utils.model_utils import save_state_dict_atomic
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.append(str(PROJECT_ROOT / "src"))
 
-# Importar o gerador de compose do modo V2V (mesmo formato de containers)
-from v2v_fl.generate_v2v_compose import generate as compose_generate
+from utils.model_utils import (  # noqa: E402
+    prepare_run,
+    summarize_encounter_metrics,
+    write_json_atomic,
+)
+from v2v_fl.over_the_air.ota_aggregation import (  # noqa: E402
+    DEFAULT_OTA_BANDWIDTH_HZ,
+    DEFAULT_OTA_EPSILON,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -86,18 +92,21 @@ DEFAULT_WARMUP = 60
 DEFAULT_COOLDOWN = 15
 
 DEFAULT_EXCHANGE_TIMEOUT = 300
-DEFAULT_OTA_EPSILON = 0.1
-DEFAULT_OTA_BANDWIDTH_HZ = 100e3
+DEFAULT_EVALUATION_TIMEOUT = 300
+DEFAULT_RSU_HOST = "rsu-service"
+DEFAULT_RSU_PORT = 9000
 
 # Raiz do projeto (FL_ServerPuma/)
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+compose_generate = run_path(str(PROJECT_ROOT / "docker/generate_v2v_compose.py"))["generate"]
 
 
 # ── Estruturas de Dados ──────────────────────────────────────────────────────
 
+
 @dataclass
 class VehicleState:
     """Estado instantâneo de um veículo no SUMO (idêntico ao V2V)."""
+
     veh_id: str
     x: float
     y: float
@@ -109,6 +118,7 @@ class VehicleState:
 @dataclass
 class V2IEvent:
     """Evento de log da simulação V2I para análise posterior."""
+
     sim_time: float
     event_type: str
     rsu_id: str
@@ -117,6 +127,7 @@ class V2IEvent:
 
 
 # ── Funções de Geometria ─────────────────────────────────────────────────────
+
 
 def distance_to_rsu(vehicle: VehicleState, rsu: dict) -> float:
     """Calcula a distância euclidiana entre um veículo e uma RSU."""
@@ -155,8 +166,8 @@ def estimate_contact_time_v2i(
     # Decompor velocidade do veículo em componentes X e Y
     # Convenção SUMO: 0=Norte, sentido horário
     angle_rad = math.radians(vehicle.angle)
-    vx = vehicle.speed * math.sin(angle_rad)   # Componente Leste
-    vy = vehicle.speed * math.cos(angle_rad)   # Componente Norte
+    vx = vehicle.speed * math.sin(angle_rad)  # Componente Leste
+    vy = vehicle.speed * math.cos(angle_rad)  # Componente Norte
 
     # Posição relativa (RSU - veículo)
     dp_x = rsu["x"] - vehicle.x
@@ -167,7 +178,7 @@ def estimate_contact_time_v2i(
     dv_y = -vy
 
     # Coeficientes da equação quadrática
-    A = dv_x * dv_x + dv_y * dv_y         # |dv|^2 = speed^2
+    A = dv_x * dv_x + dv_y * dv_y  # |dv|^2 = speed^2
     B = 2.0 * (dp_x * dv_x + dp_y * dv_y)
     C = dp_x * dp_x + dp_y * dp_y - radius * radius
 
@@ -193,6 +204,7 @@ def estimate_contact_time_v2i(
 
 
 # ── Detecção de Proximidade V2I ──────────────────────────────────────────────
+
 
 def find_vehicles_in_rsu_range(
     vehicles: list[VehicleState],
@@ -222,6 +234,7 @@ def find_vehicles_in_rsu_range(
 
 # ── Escrita Atômica de Sinais de Encontro ────────────────────────────────────
 
+
 def write_encounter_signal(
     encounters_dir: Path,
     encounter_data: dict,
@@ -232,27 +245,13 @@ def write_encounter_signal(
     Idêntico ao V2V: write-to-temp + rename para evitar leituras parciais.
     """
     final_path = encounters_dir / f"encounter_{encounter_id}.json"
-
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(encounters_dir),
-        prefix=".encounter_",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w") as tmp_file:
-            json.dump(encounter_data, tmp_file)
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())
-        os.rename(tmp_path, final_path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
+    write_json_atomic(encounter_data, final_path)
 
     return final_path
 
 
 # ── Controle Docker (reutilizado do V2V) ─────────────────────────────────────
+
 
 def wait_all_clients_epoch_done(
     encounters_dir: Path,
@@ -269,7 +268,8 @@ def wait_all_clients_epoch_done(
 
     log.info(
         "Aguardando todos os %d clientes completarem a época da rodada %d...",
-        len(client_indices), round_num,
+        len(client_indices),
+        round_num,
     )
 
     for tick in range(timeout):
@@ -290,7 +290,7 @@ def wait_all_clients_epoch_done(
 
 
 def docker_compose_up(compose_file: Path, project_root: Path, build: bool = False) -> bool:
-    """Inicia todos os containers de veículos."""
+    """Inicia os veículos após o healthcheck TCP do rsu-service."""
     cmd = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file), "up", "-d"]
     if build:
         cmd.insert(-1, "--build")
@@ -308,81 +308,179 @@ def docker_compose_down(compose_file: str, project_root: Path) -> None:
     """Destrói os containers ao final da simulação."""
     log.info("Encerrando containers Docker...")
     subprocess.run(
-        ["docker", "compose", "--project-directory", ".", "-f", compose_file,
-         "down", "--remove-orphans", "-v"],
+        [
+            "docker",
+            "compose",
+            "--project-directory",
+            ".",
+            "-f",
+            compose_file,
+            "down",
+            "--remove-orphans",
+            "-v",
+        ],
         cwd=str(project_root),
-        capture_output=True, text=True, timeout=120,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     log.info("Containers removidos.")
 
 
-# ── Agregação OTA Stateless no Host ──────────────────────────────────────────
-
-def ota_aggregate(
-    client_states: dict[int, dict],
-    positions: dict[int, tuple[float, float]],
-    rsu: dict,
-    *,
-    epsilon: float = DEFAULT_OTA_EPSILON,
-    bandwidth_hz: float = DEFAULT_OTA_BANDWIDTH_HZ,
-) -> dict:
-    """Agrega apenas os veículos deste encontro pelo canal OTA veículo → RSU.
-
-    Todos os veículos são transmissores com peso uniforme. A RSU é somente
-    receptora, sem pesos próprios ou memória de modelos de encontros anteriores.
-    Usa o mesmo pipeline de path loss, fading, beamforming e ruído do V2V.
-    """
-    import numpy as np
-
-    from v2v_fl.over_the_air.ota_aggregation import (
-        apply_ota_channel,
-        compute_weight_variance,
-        mmse_beamforming,
-    )
-    from v2v_fl.over_the_air.ota_channel import build_channel_matrices, compute_noise_variance
-
-    if not client_states:
-        raise ValueError("Agregação V2I requer pelo menos um veículo transmissor.")
-    n_antennas = rsu.get("n_antennas", 16)
-    if not isinstance(n_antennas, int) or n_antennas < 1:
-        raise ValueError("A RSU deve ter um número inteiro positivo de antenas.")
-    if not 0 <= epsilon < 1:
-        raise ValueError("O erro de estimação OTA deve estar no intervalo [0, 1).")
-    if not math.isfinite(bandwidth_hz) or bandwidth_hz <= 0:
-        raise ValueError("A largura de banda OTA deve ser positiva e finita.")
-
-    transmitter_ids = sorted(client_states)
-    distances = np.array([
-        math.hypot(positions[c][0] - rsu["x"], positions[c][1] - rsu["y"])
-        for c in transmitter_ids
-    ])
-    # Mesma distância mínima do V2V para evitar singularidade no path loss.
-    distances = np.maximum(distances, 1.0)
-    n_samples = np.ones(len(transmitter_ids), dtype=np.float64)
-    H_est, H_true, _, _ = build_channel_matrices(
-        distances, n_antennas, n_samples, epsilon=epsilon,
-    )
-    variances, _ = compute_weight_variance(client_states)
-    weight_vars = np.maximum([variances[c] for c in transmitter_ids], 1e-12)
-    f_prime, transmit_scalars = mmse_beamforming(H_est, weight_vars, n_samples)
-
-    return apply_ota_channel(
-        state_dicts=client_states,
-        transmitter_ids=transmitter_ids,
-        n_samples=n_samples,
-        H_true=H_true,
-        transmit_scalars=transmit_scalars,
-        f_prime=f_prime,
-        noise_variance=compute_noise_variance(bandwidth_hz),
-        weight_variances=weight_vars,
-    )
-
-
 # ── Loop Principal ───────────────────────────────────────────────────────────
+
+
+def check_client_failures(
+    encounters_dir: Path, run_id: str, rsu_id: str, encounter_id: int, clients: list[int]
+) -> None:
+    """Falhas do transporte ou da avaliação não podem parecer encontros concluídos."""
+    for client_id in clients:
+        path = encounters_dir / f".failed_enc_{encounter_id}_client_{client_id}.json"
+        if not path.exists():
+            continue
+        with path.open() as stream:
+            failure = json.load(stream)
+        if not isinstance(failure, dict):
+            raise ValueError("Registro de falha do cliente inválido.")
+        if all(
+            failure.get(key) == value
+            for key, value in (
+                ("run_id", run_id),
+                ("rsu_id", rsu_id),
+                ("encounter_id", encounter_id),
+                ("client_id", client_id),
+            )
+        ):
+            raise RuntimeError(
+                f"Cliente {client_id}: {failure.get('error', 'Falha V2I sem descrição.')}"
+            )
+
+
+def wait_for_rsu_status(
+    encounters_dir: Path,
+    *,
+    run_id: str,
+    rsu_id: str,
+    encounter_id: int,
+    clients: list[int],
+    timeout: float,
+) -> dict:
+    """Espera o status final da RSU; um arquivo de outra execução não libera a espera."""
+    path = encounters_dir / f"rsu_status_enc_{encounter_id}.json"
+    deadline = time.monotonic() + timeout
+    expected = set(clients)
+    while True:
+        check_client_failures(encounters_dir, run_id, rsu_id, encounter_id, clients)
+        if path.exists():
+            with path.open() as stream:
+                status = json.load(stream)
+            if not isinstance(status, dict):
+                raise ValueError("Status da RSU deve ser um objeto JSON.")
+            if status.get("run_id") == run_id:
+                if (
+                    status.get("rsu_id") != rsu_id
+                    or type(status.get("encounter_id")) is not int
+                    or status["encounter_id"] != encounter_id
+                ):
+                    raise ValueError("Status da RSU contém identificadores incorretos.")
+                terminal = status.get("status")
+                if not isinstance(terminal, str) or terminal not in {
+                    "completed",
+                    "failed",
+                    "timed_out",
+                }:
+                    raise ValueError("Status terminal da RSU desconhecido.")
+                for key in ("clients", "received_clients", "applied_clients"):
+                    values = status.get(key)
+                    if (
+                        not isinstance(values, list)
+                        or any(type(value) is not int for value in values)
+                        or len(values) != len(set(values))
+                        or not set(values) <= expected
+                    ):
+                        raise ValueError(f"Participantes inválidos em {key} no status da RSU.")
+                if set(status["clients"]) != expected or not set(status["applied_clients"]) <= set(
+                    status["received_clients"]
+                ):
+                    raise ValueError(
+                        "Participantes do status diferem dos participantes do encontro."
+                    )
+                if status["status"] == "completed" and (
+                    set(status["received_clients"]) != expected
+                    or set(status["applied_clients"]) != expected
+                ):
+                    raise ValueError(
+                        "A RSU declarou sucesso sem confirmar todos os participantes."
+                    )
+                for key in ("upload_bytes", "download_bytes"):
+                    if type(status.get(key)) is not int or status[key] < 0:
+                        raise ValueError(f"Contagem inválida em {key} no status da RSU.")
+                duration = status.get("exchange_time")
+                if (
+                    isinstance(duration, bool)
+                    or not isinstance(duration, (int, float))
+                    or not math.isfinite(duration)
+                    or duration < 0
+                ):
+                    raise ValueError("Duração inválida no status da RSU.")
+                return status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Sem status da RSU {rsu_id} para o encontro {encounter_id}.")
+        time.sleep(min(0.1, remaining))
+
+
+def wait_for_client_evaluations(
+    encounters_dir: Path,
+    clients: list[int],
+    encounter_id: int,
+    timeout: float,
+    *,
+    run_id: str | None = None,
+    rsu_id: str | None = None,
+) -> None:
+    """APPLIED confirma os pesos; .done confirma avaliação e persistência das métricas."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if run_id is not None and rsu_id is not None:
+            check_client_failures(encounters_dir, run_id, rsu_id, encounter_id, clients)
+        if run_id is not None and rsu_id is not None:
+            summary = summarize_encounter_metrics(
+                encounters_dir,
+                {
+                    "run_id": run_id,
+                    "rsu_id": rsu_id,
+                    "encounter_id": encounter_id,
+                    "clients": clients,
+                    "type": "v2i",
+                },
+            )
+            completed = {
+                r["client_id"]
+                for r in summary["client_metrics"]
+                if r.get("status") == "completed" and r.get("applied")
+            }
+            missing = [client_id for client_id in clients if client_id not in completed]
+        else:
+            missing = [
+                client_id
+                for client_id in clients
+                if not (encounters_dir / f".done_enc_{encounter_id}_client_{client_id}").exists()
+            ]
+        if not missing:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Avaliação do encontro {encounter_id} pendente: clientes {missing}."
+            )
+        time.sleep(min(0.1, remaining))
+
 
 def run_orchestrator(args: argparse.Namespace) -> None:
     """Loop principal do orquestrador V2I."""
-    import torch
+    exchange_timeout = getattr(args, "exchange_timeout", DEFAULT_EXCHANGE_TIMEOUT)
+    evaluation_timeout = getattr(args, "evaluation_timeout", DEFAULT_EVALUATION_TIMEOUT)
 
     # Importar TraCI
     try:
@@ -400,7 +498,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         log.error("Arquivo de configuração das RSUs não encontrado: %s", rsu_config_path)
         sys.exit(1)
 
-    with open(rsu_config_path, "r") as f:
+    with open(rsu_config_path) as f:
         rsu_data = json.load(f)
     rsus = rsu_data["rsus"]
     log.info("Carregadas %d RSUs do arquivo %s", len(rsus), rsu_config_path.name)
@@ -413,8 +511,12 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
     sumo_cmd = [
         "sumo-gui" if args.gui else "sumo",
-        "-c", str(sumo_cfg),
-        "--step-length", str(args.step_length),
+        "-c",
+        str(sumo_cfg),
+        "--step-length",
+        str(args.step_length),
+        "--seed",
+        str(getattr(args, "seed", 42)),
     ]
 
     # ── Banner de configuração ────────────────────────────────────────────
@@ -428,23 +530,23 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     log.info("  Warmup            : %d s", args.warmup)
     log.info("  Cooldown (por RSU): %d s", args.cooldown)
     log.info("  Dataset           : %s", args.dataset)
+    log.info("  Serviço RSU       : %s:%d", DEFAULT_RSU_HOST, DEFAULT_RSU_PORT)
     log.info("  Erro CSI OTA      : %.2f", args.ota_epsilon)
     log.info("  Banda OTA         : %.0f Hz", args.ota_bandwidth_hz)
     for rsu in rsus:
-        log.info("  RSU %s: (%.0f, %.0f) raio=%.0fm antenas=%d",
-                 rsu["id"], rsu["x"], rsu["y"], rsu["radius"],
-                 rsu.get("n_antennas", 16))
+        log.info(
+            "  RSU %s: (%.0f, %.0f) raio=%.0fm antenas=%d",
+            rsu["id"],
+            rsu["x"],
+            rsu["y"],
+            rsu["radius"],
+            rsu.get("n_antennas", 16),
+        )
     log.info("=" * 60)
 
-    # ── PASSO 1: Limpar e criar pasta de sinalização ─────────────────────
-    encounters_dir = PROJECT_ROOT / "src" / "results" / "encounters"
-    encounters_dir.mkdir(parents=True, exist_ok=True)
-
-    # Limpar arquivos de execuções anteriores
-    for pattern in ["*.json", "*.pt", ".done_enc_*", ".start_round_*",
-                     ".epoch_done_*", ".simulation_done", ".encounter_*.tmp"]:
-        for f in encounters_dir.glob(pattern):
-            f.unlink()
+    # Cada execução preserva os resultados e sinais das anteriores.
+    run_id, run_dir, encounters_dir = prepare_run(PROJECT_ROOT, "v2i", args)
+    log.info("Resultados desta execução: %s", run_dir)
 
     # ── PASSO 2: Gerar Docker Compose e iniciar containers ───────────────
     client_indices = list(range(args.total_clients))
@@ -455,32 +557,21 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         rounds=3,
         prune=args.prune,
         ala=args.ala,
-        exp_name='default_exp_v2i',
+        exp_name="default_exp_v2i",
         max_epochs=args.max_epochs,
         model=args.model,
         config=args.config,
         strategy=args.strategy,
         rank=args.rank,
         paca=args.paca,
+        mode="v2i",
+        results_dir=run_dir / "clients",
+        encounters_dir=encounters_dir,
+        seed=getattr(args, "seed", 42),
+        run_id=run_id,
+        rsu_config=rsu_config_path,
+        exchange_timeout=exchange_timeout,
     )
-
-    if not docker_compose_up(compose_file, PROJECT_ROOT, build=args.build):
-        sys.exit(1)
-
-    # ── PASSO 3: Warmup ──────────────────────────────────────────────────
-    if args.warmup > 0:
-        log.info("Aguardando %ds de warmup...", args.warmup)
-        time.sleep(args.warmup)
-        log.info("Warmup concluído!")
-
-    # ── PASSO 3.5: Treino Inicial (Rodada 0) ─────────────────────────────
-    all_client_indices = list(range(args.total_clients))
-    log.info("--- Iniciando Treino (Rodada 0) ---")
-    wait_all_clients_epoch_done(encounters_dir, all_client_indices, round_num=0, timeout=300)
-
-    # ── PASSO 4: Iniciar simulação SUMO ──────────────────────────────────
-    log.info("Iniciando SUMO...")
-    traci.start(sumo_cmd)
 
     # Contadores e estado da simulação
     encounter_count = 0
@@ -490,15 +581,25 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     next_client_idx = 0
 
     # Cooldown POR RSU (cada RSU tem seu próprio timer)
-    last_encounter_per_rsu: dict[str, float] = {
-        rsu["id"]: -float('inf') for rsu in rsus
-    }
+    last_encounter_per_rsu: dict[str, float] = {rsu["id"]: -float("inf") for rsu in rsus}
 
     # Controle de duplicação: evitar re-sinalizar o mesmo grupo na mesma RSU
     prev_clients_per_rsu: dict[str, frozenset[int]] = {}
 
+    step = 0
+    sumo_started = False
     try:
-        step = 0
+        if not docker_compose_up(compose_file, PROJECT_ROOT, build=args.build):
+            raise RuntimeError("Falha ao iniciar os veículos e o serviço de RSUs.")
+        if args.warmup > 0:
+            log.info("Aguardando %ds de warmup...", args.warmup)
+            time.sleep(args.warmup)
+        all_client_indices = list(range(args.total_clients))
+        if not wait_all_clients_epoch_done(encounters_dir, all_client_indices, 0, timeout=300):
+            raise TimeoutError("Os clientes não concluíram o treinamento inicial.")
+        log.info("Iniciando SUMO...")
+        traci.start(sumo_cmd)
+        sumo_started = True
         while traci.simulation.getMinExpectedNumber() > 0:
             traci.simulationStep()
             sim_time = traci.simulation.getTime()
@@ -514,7 +615,8 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     next_client_idx += 1
                     log.info(
                         "Veículo SUMO '%s' vinculado ao container cliente %d",
-                        vid, veh_to_client_idx[vid],
+                        vid,
+                        veh_to_client_idx[vid],
                     )
 
                 if vid in veh_to_client_idx:
@@ -522,10 +624,16 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     speed = traci.vehicle.getSpeed(vid)
                     edge = traci.vehicle.getRoadID(vid)
                     angle = traci.vehicle.getAngle(vid)
-                    vehicles.append(VehicleState(
-                        veh_id=vid, x=x, y=y,
-                        speed=speed, edge=edge, angle=angle,
-                    ))
+                    vehicles.append(
+                        VehicleState(
+                            veh_id=vid,
+                            x=x,
+                            y=y,
+                            speed=speed,
+                            edge=edge,
+                            angle=angle,
+                        )
+                    )
 
             if not vehicles:
                 continue
@@ -563,9 +671,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     continue
 
                 # ── Verificar se é um NOVO grupo (não repetição) ──────────
-                c_indices = sorted(
-                    veh_to_client_idx[v.veh_id] for v, _, _ in viable
-                )
+                c_indices = sorted(veh_to_client_idx[v.veh_id] for v, _, _ in viable)
                 current_clients_key = frozenset(c_indices)
 
                 if prev_clients_per_rsu.get(rsu_id) == current_clients_key:
@@ -578,8 +684,12 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                 veh_names = [v.veh_id for v, _, _ in viable]
                 log.info(
                     "Encontro V2I %d/%d! RSU %s ← Veículos %s (Clientes %s) | ETC=%.1fs",
-                    encounter_count, args.encounters,
-                    rsu_id, veh_names, c_indices, min_etc,
+                    encounter_count,
+                    args.encounters,
+                    rsu_id,
+                    veh_names,
+                    c_indices,
+                    min_etc,
                 )
 
                 # ── Montar sinal de encontro V2I ──────────────────────────
@@ -590,157 +700,116 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     "clients": c_indices,
                     "timestamp": sim_time,
                     "etc_seconds": min_etc,
-                    "positions": {
-                        veh_to_client_idx[v.veh_id]: (v.x, v.y)
-                        for v, _, _ in viable
-                    },
+                    "positions": {veh_to_client_idx[v.veh_id]: (v.x, v.y) for v, _, _ in viable},
                     "rsu_position": (rsu["x"], rsu["y"]),
                     "rsu_n_antennas": rsu.get("n_antennas", 16),
-                    "exchange_timeout": DEFAULT_EXCHANGE_TIMEOUT,
+                    "run_id": run_id,
+                    "rsu_host": DEFAULT_RSU_HOST,
+                    "rsu_port": DEFAULT_RSU_PORT,
+                    "exchange_timeout": exchange_timeout,
+                    "ota_epsilon": args.ota_epsilon,
+                    "ota_bandwidth_hz": args.ota_bandwidth_hz,
                 }
 
+                # O relógio total inclui controle, protocolo e avaliação dos clientes.
+                exchange_start = time.monotonic()
                 # Escrita atômica do JSON
                 write_encounter_signal(encounters_dir, encounter_data, encounter_count)
 
                 # Registrar evento
-                event_log.append(V2IEvent(
-                    sim_time=sim_time,
-                    event_type="encounter_formed",
-                    rsu_id=rsu_id,
-                    vehicles=veh_names,
-                    details={
-                        "encounter_id": encounter_count,
-                        "clients": c_indices,
-                        "etc_seconds": round(min_etc, 1),
-                        "aggregation": "ota",
-                        "n_antennas": rsu.get("n_antennas", 16),
-                        "ota_epsilon": args.ota_epsilon,
-                        "ota_bandwidth_hz": args.ota_bandwidth_hz,
-                        "distances": {
-                            veh_to_client_idx[v.veh_id]: round(dist, 1)
-                            for v, dist, _ in viable
+                event_log.append(
+                    V2IEvent(
+                        sim_time=sim_time,
+                        event_type="encounter_formed",
+                        rsu_id=rsu_id,
+                        vehicles=veh_names,
+                        details={
+                            "encounter_id": encounter_count,
+                            "run_id": run_id,
+                            "rsu_host": DEFAULT_RSU_HOST,
+                            "rsu_port": DEFAULT_RSU_PORT,
+                            "status": "pending",
+                            "clients": c_indices,
+                            "etc_seconds": round(min_etc, 1),
+                            "aggregation": "ota",
+                            "n_antennas": rsu.get("n_antennas", 16),
+                            "ota_epsilon": args.ota_epsilon,
+                            "ota_bandwidth_hz": args.ota_bandwidth_hz,
+                            "distances": {
+                                veh_to_client_idx[v.veh_id]: round(dist, 1)
+                                for v, dist, _ in viable
+                            },
                         },
-                    },
-                ))
+                    )
+                )
 
                 # Atualizar estado
                 prev_clients_per_rsu[rsu_id] = current_clients_key
                 last_encounter_per_rsu[rsu_id] = sim_time
 
-                # ── PAUSAR SUMO e esperar veículos salvarem .pt ───────────
-                log.info(
-                    "SUMO PAUSADO. Aguardando %d clientes salvarem pesos para RSU %s...",
-                    len(c_indices), rsu_id,
-                )
-
-                exchange_start = time.time()
-                exchange_timeout = DEFAULT_EXCHANGE_TIMEOUT
-
-                # Esperar que cada veículo salve seu .pt
-                expected_pt_files = [
-                    encounters_dir / f"client_{c}_enc_{encounter_count}.pt"
-                    for c in c_indices
-                ]
-
-                for tick in range(exchange_timeout):
-                    received = [f.exists() for f in expected_pt_files]
-                    if all(received):
-                        log.info("  Todos os %d .pt recebidos!", len(c_indices))
-                        break
-                    if tick > 0 and tick % 15 == 0:
-                        log.info(
-                            "  ... %d/%d .pt recebidos (%ds)",
-                            sum(received), len(expected_pt_files), tick,
-                        )
-                    time.sleep(1)
-                else:
-                    received_count = sum(f.exists() for f in expected_pt_files)
-                    log.warning(
-                        "Timeout (%ds) esperando .pt do encontro %d (%d/%d recebidos)",
-                        exchange_timeout, encounter_count,
-                        received_count, len(expected_pt_files),
+                # O host espera apenas controle e métricas; os tensores passam por TCP.
+                log.info("SUMO PAUSADO. Aguardando status da RSU %s...", rsu_id)
+                details = event_log[-1].details
+                status = None
+                try:
+                    status = wait_for_rsu_status(
+                        encounters_dir,
+                        run_id=run_id,
+                        rsu_id=rsu_id,
+                        encounter_id=encounter_count,
+                        clients=c_indices,
+                        # Dar tempo para a RSU encerrar conexões e publicar o status.
+                        timeout=exchange_timeout + 5.0,
                     )
-
-                # ── AGREGAÇÃO OTA STATELESS NO HOST ───────────────────────
-                log.info("  Realizando agregação OTA na RSU %s...", rsu_id)
-
-                # Carregar pesos dos veículos
-                client_states = {}
-                for c in c_indices:
-                    pt_path = encounters_dir / f"client_{c}_enc_{encounter_count}.pt"
-                    if pt_path.exists():
-                        client_states[c] = torch.load(
-                            pt_path, map_location="cpu", weights_only=True,
-                        )
-
-                if not client_states:
-                    log.warning("  Nenhum .pt carregado! Pulando agregação.")
-                else:
-                    positions = {
-                        veh_to_client_idx[v.veh_id]: (v.x, v.y)
-                        for v, _, _ in viable
-                    }
-                    aggregated = ota_aggregate(
-                        client_states, positions, rsu,
-                        epsilon=args.ota_epsilon,
-                        bandwidth_hz=args.ota_bandwidth_hz,
+                    details.update(
+                        {
+                            "rsu_status": status["status"],
+                            "status": status["status"],
+                            "received_clients": status["received_clients"],
+                            "applied_clients": status["applied_clients"],
+                            "upload_bytes": status["upload_bytes"],
+                            "download_bytes": status["download_bytes"],
+                            "protocol_time": status["exchange_time"],
+                        }
                     )
-                    event_log[-1].details["received_clients"] = sorted(client_states)
-
-                    # Salvar resultado para cada veículo carregar
-                    for c in c_indices:
-                        result_path = encounters_dir / (
-                            f"rsu_result_enc_{encounter_count}_client_{c}.pt"
-                        )
-                        save_state_dict_atomic(aggregated, result_path)
-
-                    log.info("  Resultado disponível para %d clientes.", len(c_indices))
-                    del aggregated
-                # Nenhum tensor é retido pela RSU para o próximo encontro.
-                del client_states
-
-                # ── Esperar confirmação .done dos clientes ────────────────
-                expected_done_files = [
-                    encounters_dir / f".done_enc_{encounter_count}_client_{c}"
-                    for c in c_indices
-                ]
-
-                for tick in range(exchange_timeout):
-                    received = [f.exists() for f in expected_done_files]
-                    if all(received):
-                        exchange_time = time.time() - exchange_start
-                        log.info(
-                            "Todas as %d confirmações recebidas em %.0fs!",
-                            len(expected_done_files), exchange_time,
-                        )
-                        event_log[-1].details["exchange_time"] = round(exchange_time, 1)
-                        time.sleep(3)
-                        break
-                    if tick > 0 and tick % 15 == 0:
-                        count = sum(f.exists() for f in expected_done_files)
-                        log.info(
-                            "  ... %d/%d confirmações (%ds)",
-                            count, len(expected_done_files), tick,
-                        )
-                    time.sleep(1)
-                else:
-                    exchange_time = time.time() - exchange_start
-                    received_count = sum(f.exists() for f in expected_done_files)
-                    log.warning(
-                        "Timeout (%ds) esperando confirmações do encontro %d (%d/%d)",
-                        exchange_timeout, encounter_count,
-                        received_count, len(expected_done_files),
+                    if status["status"] != "completed":
+                        raise RuntimeError(status.get("error") or "A RSU não concluiu o encontro.")
+                    details["status"] = "evaluating"
+                    evaluation_start = time.monotonic()
+                    wait_for_client_evaluations(
+                        encounters_dir,
+                        c_indices,
+                        encounter_count,
+                        evaluation_timeout,
+                        run_id=run_id,
+                        rsu_id=rsu_id,
                     )
-                    event_log[-1].details["exchange_time"] = round(exchange_time, 1)
-
-                # Os arquivos .pt são apenas transporte temporário deste encontro.
-                for c in c_indices:
-                    (encounters_dir / f"client_{c}_enc_{encounter_count}.pt").unlink(
-                        missing_ok=True,
+                    details["evaluation_wait_time"] = round(
+                        time.monotonic() - evaluation_start,
+                        6,
                     )
-                    (encounters_dir / f"rsu_result_enc_{encounter_count}_client_{c}.pt").unlink(
-                        missing_ok=True,
+                    details["status"] = "completed"
+                except TimeoutError as exc:
+                    details["status"] = (
+                        "evaluation_timed_out"
+                        if details["status"] == "evaluating"
+                        else "timed_out"
                     )
+                    details["error"] = str(exc)
+                    raise
+                except (OSError, ValueError, RuntimeError) as exc:
+                    if details["status"] != "timed_out":
+                        details["status"] = "failed"
+                    details["error"] = str(exc)
+                    raise
+                finally:
+                    details["exchange_time"] = round(time.monotonic() - exchange_start, 6)
+                    details.update(
+                        summarize_encounter_metrics(encounters_dir, encounter_data, status)
+                    )
+                    details["total_time"] = details["exchange_time"]
+                    if status is not None:
+                        details["server_protocol_time"] = status["exchange_time"]
 
                 log.info("SUMO RETOMADO.")
 
@@ -754,30 +823,40 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
                 # ── Iniciar nova rodada de treino ─────────────────────────
                 log.info(f"--- Iniciando Treino (Rodada {encounter_count}) ---")
-                wait_all_clients_epoch_done(
-                    encounters_dir, all_client_indices,
-                    round_num=encounter_count, timeout=300,
-                )
+                if not wait_all_clients_epoch_done(
+                    encounters_dir,
+                    all_client_indices,
+                    round_num=encounter_count,
+                    timeout=300,
+                ):
+                    raise TimeoutError(f"Treinamento da rodada {encounter_count} incompleto.")
 
             # Verificar limite após iterar todas as RSUs
             if encounter_count >= args.encounters:
                 break
 
     except KeyboardInterrupt:
+        if event_log and event_log[-1].details["status"] in {"pending", "evaluating"}:
+            event_log[-1].details.update(
+                status="failed",
+                error="Execução interrompida pelo usuário.",
+            )
         log.info("\nSimulação interrompida pelo usuário.")
     finally:
         # ── PASSO 5: Limpeza geral ───────────────────────────────────────
         log.info("Encerrando simulação V2I...")
         done_file = encounters_dir / ".simulation_done"
         done_file.touch()
-        time.sleep(5)
-        docker_compose_down(compose_file, PROJECT_ROOT)
-        traci.close()
-        log.info("SUMO encerrado.")
-        # Também descartar pesos temporários se um encontro foi interrompido.
-        for pattern in ["client_*_enc_*.pt", "rsu_result_enc_*.pt"]:
-            for path in encounters_dir.glob(pattern):
-                path.unlink(missing_ok=True)
+        time.sleep(1)
+        try:
+            docker_compose_down(compose_file, PROJECT_ROOT)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.error("Falha ao encerrar os contêineres: %s", exc)
+        if sumo_started:
+            try:
+                traci.close()
+            except Exception as exc:
+                log.error("Falha ao encerrar SUMO: %s", exc)
 
         # Estatísticas finais
         log.info("=" * 60)
@@ -789,27 +868,33 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         for rsu in rsus:
             rsu_id = rsu["id"]
             rsu_encounters = sum(
-                1 for e in event_log
-                if e.event_type == "encounter_formed" and e.rsu_id == rsu_id
+                1 for e in event_log if e.event_type == "encounter_formed" and e.rsu_id == rsu_id
             )
             log.info("  %s: %d encontros OTA (RSU stateless)", rsu_id, rsu_encounters)
         log.info("=" * 60)
 
         # Salvar log de eventos
-        log_path = PROJECT_ROOT / "src" / "results" / "v2i_events.jsonl"
+        log_path = run_dir / "v2i_events.jsonl"
         with open(log_path, "w") as f:
             for event in event_log:
-                f.write(json.dumps({
-                    "sim_time": event.sim_time,
-                    "type": event.event_type,
-                    "rsu_id": event.rsu_id,
-                    "vehicles": event.vehicles,
-                    **event.details,
-                }, default=str) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "sim_time": event.sim_time,
+                            "type": event.event_type,
+                            "rsu_id": event.rsu_id,
+                            "vehicles": event.vehicles,
+                            **event.details,
+                        },
+                        default=str,
+                    )
+                    + "\n"
+                )
         log.info("Log de eventos salvo em: %s", log_path)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -818,92 +903,155 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument(
-        "--sumo-cfg", required=True,
+        "--sumo-cfg",
+        required=True,
         help="Caminho para o arquivo .sumocfg do SUMO",
     )
     parser.add_argument(
-        "--rsu-config", required=True,
+        "--rsu-config",
+        required=True,
         help="Caminho para o rsu_config.json com posições das RSUs",
     )
     parser.add_argument(
-        "--total-clients", type=int, default=5,
+        "--total-clients",
+        type=int,
+        default=5,
         help="Total de veículos (containers) a criar no Docker (default: 5)",
     )
     parser.add_argument(
-        "--encounters", type=int, default=6,
+        "--encounters",
+        type=int,
+        default=6,
         help="Número máximo de encontros V2I viáveis (default: 6)",
     )
     parser.add_argument(
-        "--min-contact-time", type=float, default=DEFAULT_MIN_CONTACT_TIME,
+        "--min-contact-time",
+        type=float,
+        default=DEFAULT_MIN_CONTACT_TIME,
         help=f"Tempo mínimo de contato (ETC) em segundos (default: {DEFAULT_MIN_CONTACT_TIME})",
     )
     parser.add_argument(
-        "--dataset", type=str, default="MNIST",
+        "--dataset",
+        type=str,
+        default="MNIST",
         choices=["MNIST", "Cifar10", "Cifar100"],
         help="Dataset para o treinamento (default: MNIST)",
     )
     parser.add_argument(
-        "--prune", type=int, default=1, choices=[0, 1],
+        "--prune",
+        type=int,
+        default=1,
+        choices=[0, 1],
         help="Habilitar pruning adaptativo (0=sim, 1=não, default: 1)",
     )
     parser.add_argument(
-        "--ala", type=int, default=1, choices=[0, 1],
+        "--ala",
+        type=int,
+        default=1,
+        choices=[0, 1],
         help="Habilitar FedALA (0=sim, 1=não/FedAvg, default: 1)",
     )
     parser.add_argument(
-        "--gui", action="store_true",
+        "--gui",
+        action="store_true",
         help="Usar sumo-gui (interface gráfica)",
     )
     parser.add_argument(
-        "--build", action="store_true",
+        "--build",
+        action="store_true",
         help="Forçar o rebuild das imagens Docker",
     )
     parser.add_argument(
-        "--warmup", type=int, default=DEFAULT_WARMUP,
+        "--warmup",
+        type=int,
+        default=DEFAULT_WARMUP,
         help=f"Segundos de warmup (default: {DEFAULT_WARMUP})",
     )
     parser.add_argument(
-        "--cooldown", type=int, default=DEFAULT_COOLDOWN,
+        "--cooldown",
+        type=int,
+        default=DEFAULT_COOLDOWN,
         help=f"Segundos de cooldown por RSU (default: {DEFAULT_COOLDOWN})",
     )
     parser.add_argument(
-        "--step-length", type=float, default=DEFAULT_STEP_LENGTH,
+        "--step-length",
+        type=float,
+        default=DEFAULT_STEP_LENGTH,
         help=f"Duração de cada step do SUMO (default: {DEFAULT_STEP_LENGTH})",
     )
     parser.add_argument(
-        "--max-epochs", type=int, default=0,
+        "--max-epochs",
+        type=int,
+        default=0,
         help="Limite de épocas por cliente (0 = sem limite, default: 0)",
     )
     parser.add_argument(
-        "--ota-epsilon", type=float, default=DEFAULT_OTA_EPSILON,
+        "--run-id",
+        help="Identificador da execução (padrão: UUID gerado automaticamente)",
+    )
+    parser.add_argument(
+        "--exchange-timeout",
+        type=float,
+        default=DEFAULT_EXCHANGE_TIMEOUT,
+        help="Prazo do protocolo TCP até APPLIED de todos os participantes, em segundos",
+    )
+    parser.add_argument(
+        "--evaluation-timeout",
+        type=float,
+        default=DEFAULT_EVALUATION_TIMEOUT,
+        help="Prazo adicional para avaliações e métricas após APPLIED, em segundos",
+    )
+    parser.add_argument(
+        "--ota-epsilon",
+        type=float,
+        default=DEFAULT_OTA_EPSILON,
         help="Erro de estimação do canal OTA no intervalo [0, 1) (default: 0.1)",
     )
     parser.add_argument(
-        "--ota-bandwidth-hz", type=float, default=DEFAULT_OTA_BANDWIDTH_HZ,
+        "--ota-bandwidth-hz",
+        type=float,
+        default=DEFAULT_OTA_BANDWIDTH_HZ,
         help="Largura de banda usada no ruído térmico OTA em Hz (default: 100000)",
     )
     # ── Parâmetros do Modelo ──────────────────────────────────────────────
-    parser.add_argument("--model", type=str, default="cnn",
-                        choices=["cnn", "clip"],
-                        help="Modelo a ser utilizado (default: cnn)")
-    parser.add_argument("--config", type=str,
-                        default="lora_clip/train_config.yml",
-                        help="Caminho do config YAML para o CLIP")
-    parser.add_argument("--strategy", type=str, default="lora",
-                        choices=["lora", "adalora", "sora_with_schedule",
-                                 "sora_no_schedule"],
-                        help="Estratégia de PEFT")
-    parser.add_argument("--rank", type=int, default=8,
-                        help="Rank para LoRA/SoRA")
-    parser.add_argument("--paca", type=int, default=12,
-                        help="Número de camadas upper para PaCA")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="cnn",
+        choices=["cnn", "clip"],
+        help="Modelo a ser utilizado (default: cnn)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="lora_clip/train_config.yml",
+        help="Caminho do config YAML para o CLIP",
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="lora",
+        choices=["lora", "adalora", "sora_with_schedule", "sora_no_schedule"],
+        help="Estratégia de PEFT",
+    )
+    parser.add_argument("--rank", type=int, default=8, help="Rank para LoRA/SoRA")
+    parser.add_argument("--paca", type=int, default=12, help="Número de camadas upper para PaCA")
 
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if not 0 <= args.ota_epsilon < 1:
         parser.error("--ota-epsilon deve estar no intervalo [0, 1).")
     if not math.isfinite(args.ota_bandwidth_hz) or args.ota_bandwidth_hz <= 0:
         parser.error("--ota-bandwidth-hz deve ser positivo e finito.")
-    run_orchestrator(args)
+    if args.run_id is not None and not args.run_id.strip():
+        parser.error("--run-id deve ser uma string não vazia.")
+    for name in ("exchange_timeout", "evaluation_timeout"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} deve ser positivo e finito.")
+    try:
+        run_orchestrator(args)
+    except (OSError, ValueError, RuntimeError) as exc:
+        parser.exit(1, f"Erro na execução V2I: {exc}\n")
 
 
 if __name__ == "__main__":

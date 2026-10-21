@@ -1,7 +1,5 @@
 
 import socket
-import pickle
-import struct
 import copy
 import time
 import os
@@ -9,6 +7,8 @@ import sys
 import argparse
 import logging
 import random
+import math
+import json
 from pathlib import Path
 
 # Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
@@ -40,13 +40,20 @@ if str(parent_dir) not in sys.path:
     sys.path.append(str(parent_dir))
 # -----------------------------------------------------------------
 
+from utils.model_utils import write_json_atomic  # noqa: E402
 from utils.data_utils import read_client_data
-from utils.model_utils import save_state_dict_atomic
 from prunning import prune_and_restructure
 from ALA import ALA
 from ALA_LoRA import ALA_LoRA
 from model import SimpleModel
-from utils.network_utils import send_data, recv_data
+from utils.network_utils import (  # noqa: E402
+    V2IProtocolError,
+    make_v2i_message,
+    recv_data,
+    recv_v2i_message,
+    send_data,
+    send_v2i_message,
+)
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
 from utils.fl_math import resize_model_to_pruned
 from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
@@ -60,17 +67,126 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # --------------------------------------------------------
 
+
+def exchange_v2i_model(
+    model, encounter: dict, client_id: int, *, cancelled=None, metrics=None
+) -> dict:
+    """Troca uma CNN por TCP e confirma APPLIED somente após carregar o resultado.
+
+    Em caso de falha, preserva os pesos locais anteriores ao encontro. O prazo
+    abrange conexão, upload, espera, download, aplicação e confirmação.
+    """
+    host = encounter.get("rsu_host")
+    port = encounter.get("rsu_port")
+    timeout = encounter.get("exchange_timeout")
+    if (
+        not isinstance(host, str)
+        or not host.strip()
+        or type(port) is not int
+        or not 1 <= port <= 65535
+    ):
+        raise V2IProtocolError("Endereço TCP da RSU inválido no sinal de encontro.")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise V2IProtocolError("exchange_timeout deve ser positivo e finito.")
+    if client_id not in encounter.get("clients", []):
+        raise V2IProtocolError("Cliente ausente dos participantes do encontro.")
+    context = {key: encounter.get(key) for key in ("run_id", "rsu_id", "encounter_id")}
+    context["client_id"] = client_id
+    started = time.monotonic()
+    metrics = metrics if metrics is not None else {}
+    deadline = started + timeout
+    snapshot = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
+    upload = make_v2i_message("UPLOAD", **context, weights=snapshot)
+    load_started = False
+
+    def remaining() -> float:
+        if cancelled is not None and cancelled():
+            raise ConnectionAbortedError("Simulação encerrada durante a troca V2I.")
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("Prazo da troca V2I esgotado.")
+        return value
+
+    try:
+        with socket.create_connection((host, port), timeout=remaining()) as connection:
+            sent = send_v2i_message(connection, upload, deadline=deadline, cancelled=cancelled)
+            metrics["upload_bytes"] = sent
+            del upload
+            response, _, received = recv_v2i_message(
+                connection,
+                **context,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+            if response["type"] == "ERROR":
+                metrics["control_download_bytes"] = received
+                raise V2IProtocolError(f"RSU recusou o encontro: {response['error']}")
+            if response["type"] != "RESULT":
+                raise V2IProtocolError("Esperado RESULT após UPLOAD.")
+            metrics["download_bytes"] = received
+            metrics["aggregation_time"] = response.get("aggregation_time", 0.0)
+            state = response["weights"]
+            if state.keys() != snapshot.keys() or any(
+                state[key].shape != snapshot[key].shape or state[key].dtype != snapshot[key].dtype
+                for key in snapshot
+            ):
+                raise V2IProtocolError("O resultado da RSU é incompatível com a CNN local.")
+            remaining()
+            load_started = True
+            model.load_state_dict(state, strict=True)
+            remaining()
+            control = send_v2i_message(
+                connection,
+                make_v2i_message("APPLIED", **context),
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+        metrics.update(applied=True, control_upload_bytes=control)
+        return {
+            "upload_bytes": sent,
+            "download_bytes": received,
+            "control_bytes": control,
+            "protocol_time": time.monotonic() - started,
+        }
+    except Exception:
+        if load_started:
+            # Copiar os tensores também desfaz uma aplicação interrompida por um hook.
+            with torch.no_grad():
+                for key, tensor in model.state_dict().items():
+                    tensor.copy_(snapshot[key])
+        raise
+    finally:
+        metrics["protocol_time"] = time.monotonic() - started
+
+
+def write_v2i_failure(
+    encounters_dir: Path, encounter: dict, client_id: int, error: str, metrics: dict | None = None
+) -> None:
+    """Publica a falha com os contadores já concluídos, sem emitir .done."""
+    data = dict(metrics or {})
+    data.update({key: encounter.get(key) for key in ("run_id", "rsu_id", "encounter_id")})
+    data.update(client_id=client_id, status="failed", error=error)
+    write_json_atomic(
+        data, encounters_dir / f".failed_enc_{data['encounter_id']}_client_{client_id}.json"
+    )
+
+
 def map_sequential_to_simplemodel(state_dict):
     mapped_dict = {}
     mapping = {
-        '0.weight': 'conv1.0.weight',
-        '0.bias': 'conv1.0.bias',
-        '3.weight': 'conv2.0.weight', 
-        '3.bias': 'conv2.0.bias',
-        '7.weight': 'fc1.0.weight',
-        '7.bias': 'fc1.0.bias',
-        '9.weight': 'fc.weight',
-        '9.bias': 'fc.bias'
+        "0.weight": "conv1.0.weight",
+        "0.bias": "conv1.0.bias",
+        "3.weight": "conv2.0.weight",
+        "3.bias": "conv2.0.bias",
+        "7.weight": "fc1.0.weight",
+        "7.bias": "fc1.0.bias",
+        "9.weight": "fc.weight",
+        "9.bias": "fc.bias",
     }
     for sequential_key, simple_key in mapping.items():
         if sequential_key in state_dict:
@@ -306,48 +422,117 @@ def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 
-
-def save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=0, argalgo=0, rs_post_p2p_acc=None, rs_post_p2p_encounter_ids=None, rs_p2p_data_sent_mb=None, rs_p2p_data_sent_enc_ids=None, rs_ota_encounter_epochs=None, rs_ota_mean_distances=None, rs_ota_is_aggregator=None):
+def save_results(
+    args,
+    rs_global_acc,
+    rs_global_loss,
+    rs_ala_acc,
+    rs_local_acc,
+    rs_train_acc,
+    idx=0,
+    argalgo=0,
+    rs_post_p2p_acc=None,
+    rs_post_p2p_encounter_ids=None,
+    rs_p2p_data_sent_mb=None,
+    rs_p2p_data_sent_enc_ids=None,
+    rs_ota_encounter_epochs=None,
+    rs_ota_mean_distances=None,
+    rs_ota_is_aggregator=None,
+):
     b = "FedALA" if argalgo == 0 else "FedAVG"
-    
-    paca_val = args.paca if (isinstance(args.paca, (int, float)) and not isinstance(args.paca, bool) and args.paca > 0) else 0
-    rank_val = args.rank if (isinstance(args.rank, (int, float)) and not isinstance(args.rank, bool) and args.rank > 0) else 8
-    ts_suffix = f"_{args.timestamp}" if hasattr(args, 'timestamp') and args.timestamp else ""
+
+    paca_val = (
+        args.paca
+        if (
+            isinstance(args.paca, (int, float))
+            and not isinstance(args.paca, bool)
+            and args.paca > 0
+        )
+        else 0
+    )
+    rank_val = (
+        args.rank
+        if (
+            isinstance(args.rank, (int, float))
+            and not isinstance(args.rank, bool)
+            and args.rank > 0
+        )
+        else 8
+    )
+    ts_suffix = f"_{args.timestamp}" if hasattr(args, "timestamp") and args.timestamp else ""
     algo = f"client_{idx}_{args.dataset}_{args.strategy}_rank{rank_val}_paca{paca_val}_{b}_run{args.run_id}{ts_suffix}"
-    
+
     current_dir = Path(__file__).resolve().parent
-    result_path = current_dir.parent / "results" / args.exp_name
+    result_path = (
+        getattr(args, "results_dir", None) or current_dir.parent / "results" / args.exp_name
+    )
     result_path.mkdir(parents=True, exist_ok=True)
-    
+
     file_path = result_path / f"{algo}.h5"
     logger.info(f"Salvando resultados em: {file_path}")
-    
-    with h5py.File(file_path, 'w') as hf:
-        hf.create_dataset('rs_global_acc', data=rs_global_acc)
-        hf.create_dataset('rs_global_loss', data=rs_global_loss)
+
+    with h5py.File(file_path, "w") as hf:
+        hf.create_dataset("rs_global_acc", data=rs_global_acc)
+        hf.create_dataset("rs_global_loss", data=rs_global_loss)
         if rs_ala_acc is not None and len(rs_ala_acc) > 0:
-            hf.create_dataset('rs_ala_acc', data=rs_ala_acc)
-        hf.create_dataset('rs_local_acc', data=rs_local_acc)
-        hf.create_dataset('rs_train_acc', data=rs_train_acc)
+            hf.create_dataset("rs_ala_acc", data=rs_ala_acc)
+        hf.create_dataset("rs_local_acc", data=rs_local_acc)
+        hf.create_dataset("rs_train_acc", data=rs_train_acc)
         if rs_post_p2p_acc is not None and len(rs_post_p2p_acc) > 0:
-            hf.create_dataset('rs_post_p2p_acc', data=rs_post_p2p_acc)
+            hf.create_dataset("rs_post_p2p_acc", data=rs_post_p2p_acc)
         if rs_post_p2p_encounter_ids is not None and len(rs_post_p2p_encounter_ids) > 0:
-            hf.create_dataset('rs_post_p2p_encounter_ids', data=rs_post_p2p_encounter_ids)
+            hf.create_dataset("rs_post_p2p_encounter_ids", data=rs_post_p2p_encounter_ids)
         if rs_p2p_data_sent_mb is not None and len(rs_p2p_data_sent_mb) > 0:
-            hf.create_dataset('rs_p2p_data_sent_mb', data=rs_p2p_data_sent_mb)
+            hf.create_dataset("rs_p2p_data_sent_mb", data=rs_p2p_data_sent_mb)
+            hf["rs_p2p_data_sent_mb"].attrs["unit"] = "MiB (2**20 bytes)"
         if rs_p2p_data_sent_enc_ids is not None and len(rs_p2p_data_sent_enc_ids) > 0:
-            hf.create_dataset('rs_p2p_data_sent_enc_ids', data=rs_p2p_data_sent_enc_ids)
+            hf.create_dataset("rs_p2p_data_sent_enc_ids", data=rs_p2p_data_sent_enc_ids)
         # Métricas OTA (Fase 3): distância, época do encontro, papel do cliente
         if rs_ota_encounter_epochs is not None and len(rs_ota_encounter_epochs) > 0:
-            hf.create_dataset('rs_ota_encounter_epochs', data=rs_ota_encounter_epochs)
+            hf.create_dataset("rs_ota_encounter_epochs", data=rs_ota_encounter_epochs)
         if rs_ota_mean_distances is not None and len(rs_ota_mean_distances) > 0:
-            hf.create_dataset('rs_ota_mean_distances', data=rs_ota_mean_distances)
+            hf.create_dataset("rs_ota_mean_distances", data=rs_ota_mean_distances)
         if rs_ota_is_aggregator is not None and len(rs_ota_is_aggregator) > 0:
-            hf.create_dataset('rs_ota_is_aggregator', data=rs_ota_is_aggregator)
-        hf.attrs['paca_used'] = paca_val
+            hf.create_dataset("rs_ota_is_aggregator", data=rs_ota_is_aggregator)
+        hf.attrs["paca_used"] = paca_val
+        hf.attrs["execution_id"] = getattr(args, "execution_id", "")
+        hf.attrs["seed"] = getattr(args, "seed", 42)
+        records = getattr(args, "encounter_metrics", [])
+        if records:
+            group = hf.create_group("encounters")
+            group.attrs["bytes_unit"] = "bytes of completed application frames"
+            group.attrs["time_unit"] = "seconds"
+            group.attrs["accuracy_unit"] = "percent"
+            group.create_dataset(
+                "records",
+                data=[json.dumps(r, allow_nan=False) for r in records],
+                dtype=h5py.string_dtype("utf-8"),
+            )
+            for key in (
+                "encounter_id",
+                "participant_count",
+                "upload_bytes",
+                "download_bytes",
+                "control_upload_bytes",
+                "control_download_bytes",
+                "aggregation_time",
+                "protocol_time",
+                "evaluation_time",
+                "accuracy_before",
+                "accuracy_after",
+                "test_samples",
+                "epoch",
+                "mean_distance",
+                "is_aggregator",
+            ):
+                group.create_dataset(
+                    key, data=[r.get(key) if r.get(key) is not None else np.nan for r in records]
+                )
+
 
 def local_initialization(ala, received_global_model, model, mask=None):
     ala.adaptive_local_aggregation(received_global_model, model, mask=mask)
+
 
 # def resize_model_to_pruned(model, pruned_dict):
 #     """ Redimensiona o modelo existente para as dimensões podadas """
@@ -395,6 +580,10 @@ def parse_args():
     parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
     parser.add_argument('--experiments', type=int, default=1)
     parser.add_argument('--run-id', type=int, default=1)
+    parser.add_argument('--execution-id', default='', help='ID da simulação V2V/V2I')
+    parser.add_argument('--results-dir', type=Path)
+    parser.add_argument('--encounters-dir', type=Path)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão')
     parser.add_argument('--timestamp', type=str, default='', help='Timestamp para diferenciar rodadas de simulação')
     parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'adalora', 'sora_with_schedule', 'sora_no_schedule'])
@@ -423,6 +612,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    random.seed(args.seed + args.client_idx)
+    np.random.seed(args.seed + args.client_idx)
+    torch.manual_seed(args.seed + args.client_idx)
+    args.encounter_metrics = []
     
     # Configuração inteligente de device: MPS > CUDA > CPU
     if args.device == "mps":
@@ -711,8 +904,9 @@ def main():
         import json
         import threading
         logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
-        encounters_dir = Path(__file__).resolve().parents[1] / "results" / "encounters"
+        encounters_dir = args.encounters_dir or Path(__file__).resolve().parents[1] / "results" / "encounters"
         in_memory_weights = {}
+        in_memory_bytes = {}
         in_memory_lock = threading.Lock()
         def wait_for_round_signal(encounters_dir: Path, round_num: int) -> bool:
             while True:
@@ -734,6 +928,8 @@ def main():
                         try:
                             with open(ef, "r") as f:
                                 data = json.load(f)
+                            if args.execution_id and data.get("run_id") != args.execution_id:
+                                continue
                             enc_id = data.get("encounter_id", 0)
                             if enc_id <= last_processed:
                                 continue
@@ -752,18 +948,22 @@ def main():
             while True:
                 try:
                     conn, addr = server_socket.accept()
-                    data, _ = recv_data(conn)
+                    data, _, received_bytes = recv_data(conn, return_bytes=True)
                     if data is not None:
                         sender_id, enc_id, state = data
                         with in_memory_lock:
                             if enc_id not in in_memory_weights:
                                 in_memory_weights[enc_id] = {}
                             in_memory_weights[enc_id][sender_id] = state
+                            in_memory_bytes.setdefault(enc_id, {})[sender_id] = (
+                                in_memory_bytes.get(enc_id, {}).get(sender_id, 0) + received_bytes
+                            )
                         logger.info(f"Client {args.client_idx}: Recebeu pesos do Cliente {sender_id} para encontro {enc_id}")
                     conn.close()
                 except Exception as e:
                     logger.error(f"Erro no P2P Server: {e}")
-        threading.Thread(target=p2p_server_thread, daemon=True).start()
+        p2p_started = False
+        encounter_failure = None
         epoch = 1
         last_processed_encounter = 0
         max_epochs = args.max_epochs if args.max_epochs > 0 else float('inf')
@@ -803,129 +1003,190 @@ def main():
                     rs_train_acc.append(train_accuracy)
                 else:
                     rs_train_acc.append(0.0)
-                logger.info(f"Client {args.client_idx}: Epoca {epoch} Local Test Acc: {local_test_acc:.2f}%")
-            
-            save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, 
-                         idx=args.client_idx, argalgo=args.ala, 
-                         rs_post_p2p_acc=rs_post_p2p_acc, 
-                         rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
-                         rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                         rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids)
-            
+                logger.info(
+                    f"Client {args.client_idx}: Epoca {epoch} Local Test Acc: {local_test_acc:.2f}%"
+                )
+
+            save_results(
+                args,
+                rs_global_acc,
+                rs_global_loss,
+                rs_ala_acc,
+                rs_local_acc,
+                rs_train_acc,
+                idx=args.client_idx,
+                argalgo=args.ala,
+                rs_post_p2p_acc=rs_post_p2p_acc,
+                rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
+                rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
+                rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
+            )
+
             # ── FASE 4: Sinalizar conclusão da época ────────────────────────
             (encounters_dir / f".epoch_done_client_{args.client_idx}").touch()
             logger.info(f"Client {args.client_idx}: Epoca concluida. Aguardando encontro P2P...")
-            
+
             # ── FASE 5: Aguardar e Processar Encontro ───────────────────────
-            encounter_data = wait_for_encounter(encounters_dir, args.client_idx, last_processed_encounter, current_round=epoch)
-            
+            encounter_data = wait_for_encounter(
+                encounters_dir, args.client_idx, last_processed_encounter, current_round=epoch
+            )
+
             if encounter_data is None:
-                logger.info(f"Client {args.client_idx}: Sinal de fim de simulacao recebido. Encerrando.")
+                logger.info(
+                    f"Client {args.client_idx}: Sinal de fim de simulacao recebido. Encerrando."
+                )
                 break
-                
+
             if encounter_data == "skip":
-                logger.info(f"Client {args.client_idx}: Encontro nao ocorreu para mim nesta rodada. Avancando para prox epoca.")
+                logger.info(
+                    f"Client {args.client_idx}: Encontro nao ocorreu para mim nesta rodada. Avancando para prox epoca."
+                )
                 epoch += 1
                 continue
-                
+
             enc_id = encounter_data.get("encounter_id", 0)
             clients_in_encounter = encounter_data.get("clients", [])
             etc_seconds = encounter_data.get("etc_seconds", 60)
             encounter_type = encounter_data.get("type", "v2v")  # "v2v" ou "v2i"
-            
+
             # Converter chaves do JSON de volta para int
             positions = {int(k): tuple(v) for k, v in encounter_data.get("positions", {}).items()}
-            
+
             if isinstance(etc_seconds, str) and etc_seconds == "Carros Parados":
-                poll_timeout = 115 
+                poll_timeout = 115
             else:
                 poll_timeout = max(5, int(etc_seconds - 5))
-            
+
+            encounter_started = time.monotonic()
+            metrics = {
+                "schema_version": 1,
+                "run_id": encounter_data.get("run_id"),
+                "rsu_id": encounter_data.get("rsu_id"),
+                "mode": encounter_type,
+                "encounter_id": enc_id,
+                "client_id": args.client_idx,
+                "participant_count": len(clients_in_encounter),
+                "epoch": epoch,
+                "status": "pending",
+                "applied": False,
+                "is_aggregator": False,
+                "upload_bytes": 0,
+                "download_bytes": 0,
+                "control_upload_bytes": 0,
+                "control_download_bytes": 0,
+                "received_upload_bytes": 0,
+                "sent_download_bytes": 0,
+                "protocol_time": 0.0,
+                "aggregation_time": 0.0,
+                "evaluation_time": 0.0,
+                "accuracy_before": rs_local_acc[-1]
+                if rs_local_acc and not args.skip_post_eval
+                else None,
+                "accuracy_after": None,
+                "test_samples": len(test_loader.dataset),
+                "evaluation_skipped": args.skip_post_eval,
+                "error": None,
+            }
+            args.encounter_metrics.append(metrics)
+
             # ══════════════════════════════════════════════════════════════════
-            # BRANCH V2I: Fluxo simplificado com RSU (antena fixa)
-            # A agregação é feita pelo orquestrador no host.
-            # O cliente salva .pt → espera a RSU stateless agregar via OTA → carrega resultado.
+            # BRANCH V2I: CNN → rsu-service por TCP → CNN
             # ══════════════════════════════════════════════════════════════════
             if encounter_type == "v2i":
-                rsu_id = encounter_data.get("rsu_id", "rsu_0")
-                rsu_position = encounter_data.get("rsu_position", (0, 0))
+                try:
+                    if args.model != "cnn":
+                        raise NotImplementedError("A troca V2I por TCP está disponível para CNN.")
+                    rsu_id = encounter_data["rsu_id"]
+                    rsu_position = encounter_data["rsu_position"]
+                    my_position = positions[args.client_idx]
+                    enc_mean_distance = math.hypot(
+                        my_position[0] - rsu_position[0],
+                        my_position[1] - rsu_position[1],
+                    )
+                    logger.info(
+                        "Client %d: [V2I] Encontro %d com %s via %s:%s.",
+                        args.client_idx,
+                        enc_id,
+                        rsu_id,
+                        encounter_data.get("rsu_host"),
+                        encounter_data.get("rsu_port"),
+                    )
+                    exchange = exchange_v2i_model(
+                        model,
+                        encounter_data,
+                        args.client_idx,
+                        cancelled=lambda: (encounters_dir / ".simulation_done").exists(),
+                        metrics=metrics,
+                    )
+                    logger.info(
+                        "Client %d: Resultado da RSU aplicado; APPLIED enviado.", args.client_idx
+                    )
+                    rs_p2p_data_sent_mb.append(exchange["upload_bytes"] / (1024 * 1024))
+                    rs_p2p_data_sent_enc_ids.append(enc_id)
 
-                logger.info(f"Client {args.client_idx}: [V2I] Encontro {enc_id} com RSU {rsu_id}! ETC={etc_seconds}s.")
-
-                # Calcular distância deste veículo até a RSU
-                import numpy as np
-                my_pos = positions.get(args.client_idx, (0, 0))
-                enc_mean_distance = float(np.sqrt(
-                    (my_pos[0] - rsu_position[0])**2 +
-                    (my_pos[1] - rsu_position[1])**2
-                ))
-                logger.info(f"Client {args.client_idx}: Distância até RSU {rsu_id}: {enc_mean_distance:.1f}m")
-
-                # 1. Salvar meus pesos para o orquestrador ler
-                if args.model == 'clip':
-                    from lora_clip.sora import get_trainable_state_dict
-                    snapshot = get_trainable_state_dict(model)
-                else:
-                    import copy
-                    snapshot = copy.deepcopy(model.state_dict())
-
-                my_weights_path = encounters_dir / f"client_{args.client_idx}_enc_{enc_id}.pt"
-                save_state_dict_atomic(snapshot, my_weights_path)
-                logger.info(f"Client {args.client_idx}: Pesos salvos em {my_weights_path.name}")
-
-                # 2. Esperar o orquestrador agregar e salvar o resultado
-                result_path = encounters_dir / f"rsu_result_enc_{enc_id}_client_{args.client_idx}.pt"
-                logger.info(f"Client {args.client_idx}: Aguardando resultado OTA da RSU {rsu_id}...")
-
-                result_loaded = False
-                result_timeout = int(encounter_data.get("exchange_timeout", 300)) + 60
-                for tick in range(result_timeout):
-                    if result_path.exists():
+                    metrics["mean_distance"] = enc_mean_distance
+                    metrics["status"] = "applied"
+                    write_json_atomic(
+                        metrics,
+                        encounters_dir / f".applied_enc_{enc_id}_client_{args.client_idx}.json",
+                    )
+                    # APPLIED é enviado antes da avaliação; .done exige métricas salvas.
+                    if not args.skip_post_eval:
+                        evaluation_started = time.monotonic()
                         try:
-                            aggregated_state = torch.load(result_path, map_location=device, weights_only=True)
-                            # Carregar somente a agregação do encontro atual.
-                            if args.model in ['clip', 'slm']:
-                                from lora_clip.sora import load_trainable_state_dict
-                                load_trainable_state_dict(model, aggregated_state)
-                            else:
-                                model.load_state_dict(aggregated_state)
-                            result_loaded = True
-                            logger.info(f"Client {args.client_idx}: Resultado OTA da RSU {rsu_id} carregado!")
-                            break
-                        except Exception as e:
-                            logger.warning(f"Client {args.client_idx}: Erro ao carregar resultado: {e}. Tentando novamente...")
-                            time.sleep(1)
-                    time.sleep(1)
-
-                if not result_loaded:
-                    logger.warning(f"Client {args.client_idx}: Timeout esperando resultado da RSU {rsu_id}. Continuando com modelo local.")
-
-                # 3. Avaliação pós-agregação e métricas
-                if not args.skip_post_eval:
-                    post_p2p_acc, _ = evaluate_model(model, test_loader)
-                    logger.info(f"Client {args.client_idx}: Post-V2I Test Accuracy: {post_p2p_acc:.2f}%")
-                    rs_post_p2p_acc.append(post_p2p_acc)
-                    rs_post_p2p_encounter_ids.append(enc_id)
-
-                # Registrar métricas (is_aggregator = 0 no V2I, a RSU agrega)
-                rs_ota_encounter_epochs.append(epoch)
-                rs_ota_mean_distances.append(enc_mean_distance)
-                rs_ota_is_aggregator.append(0)
-
-                if not args.skip_post_eval:
-                    save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc,
-                                 idx=args.client_idx, argalgo=args.ala,
-                                 rs_post_p2p_acc=rs_post_p2p_acc,
-                                 rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
-                                 rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                                 rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
-                                 rs_ota_encounter_epochs=rs_ota_encounter_epochs,
-                                 rs_ota_mean_distances=rs_ota_mean_distances,
-                                 rs_ota_is_aggregator=rs_ota_is_aggregator)
-
-                # 4. Sinalizar conclusão ao orquestrador
-                (encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}").touch()
-                logger.info(f"Client {args.client_idx}: Encontro V2I concluído. .done_enc enviado.")
+                            post_p2p_acc, _ = evaluate_model(model, test_loader)
+                        finally:
+                            metrics["evaluation_time"] = time.monotonic() - evaluation_started
+                        if not math.isfinite(post_p2p_acc):
+                            raise ValueError("A avaliação pós-V2I retornou uma acurácia inválida.")
+                        metrics["accuracy_after"] = float(post_p2p_acc)
+                        rs_post_p2p_acc.append(post_p2p_acc)
+                        rs_post_p2p_encounter_ids.append(enc_id)
+                        logger.info(
+                            "Client %d: Post-V2I Test Accuracy: %.2f%%",
+                            args.client_idx,
+                            post_p2p_acc,
+                        )
+                    metrics["status"] = "completed"
+                    rs_ota_encounter_epochs.append(epoch)
+                    rs_ota_mean_distances.append(enc_mean_distance)
+                    rs_ota_is_aggregator.append(0)
+                    save_results(
+                        args,
+                        rs_global_acc,
+                        rs_global_loss,
+                        rs_ala_acc,
+                        rs_local_acc,
+                        rs_train_acc,
+                        idx=args.client_idx,
+                        argalgo=args.ala,
+                        rs_post_p2p_acc=rs_post_p2p_acc,
+                        rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
+                        rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
+                        rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
+                        rs_ota_encounter_epochs=rs_ota_encounter_epochs,
+                        rs_ota_mean_distances=rs_ota_mean_distances,
+                        rs_ota_is_aggregator=rs_ota_is_aggregator,
+                    )
+                    write_json_atomic(
+                        metrics, encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
+                    )
+                    logger.info(
+                        "Client %d: Encontro V2I concluído; métricas salvas.", args.client_idx
+                    )
+                except Exception as exc:
+                    encounter_failure = str(exc) or type(exc).__name__
+                    logger.error(
+                        "Client %d: Falha no encontro V2I %d: %s",
+                        args.client_idx,
+                        enc_id,
+                        encounter_failure,
+                    )
+                    metrics.update(status="failed", error=encounter_failure)
+                    write_v2i_failure(
+                        encounters_dir, encounter_data, args.client_idx, encounter_failure, metrics
+                    )
+                    break
                 last_processed_encounter = enc_id
                 epoch += 1
                 continue
@@ -933,259 +1194,380 @@ def main():
             # ══════════════════════════════════════════════════════════════════
             # BRANCH V2V: Fluxo original com OTA e eleição de Aggregator
             # ══════════════════════════════════════════════════════════════════
-            else:
+            try:
+                if not p2p_started:
+                    threading.Thread(target=p2p_server_thread, daemon=True).start()
+                    p2p_started = True
                 # Eleição do Aggregator via Medoid
                 from v2v_fl.over_the_air.ota_channel import find_medoid
-                aggregator_id = find_medoid(positions)
-                is_aggregator = (args.client_idx == aggregator_id)
 
-                logger.info(f"Client {args.client_idx}: [D-PSGD] Encontro {enc_id} detectado! ETC={etc_seconds}s.")
-                logger.info(f"Client {args.client_idx}: Aggregator eleito: {aggregator_id}. Sou aggregator? {is_aggregator}")
+                aggregator_id = find_medoid(positions)
+                is_aggregator = args.client_idx == aggregator_id
+                metrics["is_aggregator"] = is_aggregator
+
+                logger.info(
+                    f"Client {args.client_idx}: [D-PSGD] Encontro {enc_id} detectado! ETC={etc_seconds}s."
+                )
+                logger.info(
+                    f"Client {args.client_idx}: Aggregator eleito: {aggregator_id}. Sou aggregator? {is_aggregator}"
+                )
 
                 # Calcular distância média TX→Aggregator para métricas OTA
-                import numpy as np
                 from v2v_fl.over_the_air.ota_channel import distances_from_positions
+
                 _, enc_distances = distances_from_positions(positions, aggregator_id)
-                enc_mean_distance = float(np.mean(enc_distances)) if len(enc_distances) > 0 else 0.0
+                enc_mean_distance = (
+                    float(np.mean(enc_distances)) if len(enc_distances) > 0 else 0.0
+                )
 
                 # ── FASE 6: Troca P2P e Agregação (D-PSGD Assimétrico) ──────────────
-                if args.model == 'clip':
+                if args.model == "clip":
                     from lora_clip.sora import get_trainable_state_dict
+
                     snapshot = get_trainable_state_dict(model)
                 else:
-                    import copy
-                    snapshot = copy.deepcopy(model.state_dict())
 
+                    snapshot = {
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
+                    }
+
+                metrics["mean_distance"] = enc_mean_distance
                 other_clients = [c for c in clients_in_encounter if c != args.client_idx]
 
                 # 1. Transmissores enviam seus pesos para o Aggregator
                 if not is_aggregator:
                     target_host = f"fl-client-v2v-{aggregator_id}"
                     sent = False
-                    for attempt in range(poll_timeout):
+                    for retry in range(5):
                         try:
                             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                                 s.settimeout(2.0)
                                 s.connect((target_host, 9000))
-                                import pickle
-                                snapshot_bytes = len(pickle.dumps((args.client_idx, enc_id, snapshot)))
-                                rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
-                                rs_p2p_data_sent_enc_ids.append(enc_id)
-                                send_data(s, (args.client_idx, enc_id, snapshot))
-                            logger.info(f"Client {args.client_idx}: Enviou pesos para o Aggregator {target_host} ({snapshot_bytes / (1024*1024):.2f} MB)")
+                                snapshot_bytes = send_data(s, (args.client_idx, enc_id, snapshot))
+                            metrics["upload_bytes"] += snapshot_bytes
+                            rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
+                            rs_p2p_data_sent_enc_ids.append(enc_id)
+                            logger.info("Client %d: Enviou pesos para %s (%d bytes).",
+                                        args.client_idx, target_host, snapshot_bytes)
                             sent = True
                             break
                         except (ConnectionRefusedError, socket.timeout):
                             time.sleep(1)
                     if not sent:
-                        logger.warning(f"Client {args.client_idx}: Falhou ao enviar pesos para o Aggregator após {poll_timeout}s")
+                        raise TimeoutError(f"Falha ao enviar pesos V2V para {target_host}.")
 
                     # Aguardar resposta do Aggregator (pesos consolidados)
-                    logger.info(f"Client {args.client_idx}: Aguardando resposta do Aggregator {aggregator_id}...")
+                    logger.info(
+                        f"Client {args.client_idx}: Aguardando resposta do Aggregator {aggregator_id}..."
+                    )
                     received_states = []
                     for attempt in range(poll_timeout):
                         with in_memory_lock:
-                            if enc_id in in_memory_weights and aggregator_id in in_memory_weights[enc_id]:
+                            if (
+                                enc_id in in_memory_weights
+                                and aggregator_id in in_memory_weights[enc_id]
+                            ):
                                 received_states.append(in_memory_weights[enc_id][aggregator_id])
                                 break
                         time.sleep(1)
 
-            # 2. Aggregator recebe de todos os transmissores e consolida
-            if is_aggregator:
-                logger.info(f"Client {args.client_idx}: Aguardando receber pesos dos transmissores {other_clients}...")
-                received_states = []
-                for attempt in range(poll_timeout):
-                    with in_memory_lock:
-                        if enc_id in in_memory_weights:
-                            missing = [c for c in other_clients if c not in in_memory_weights[enc_id]]
-                            if not missing:
-                                for c in other_clients:
-                                    received_states.append(in_memory_weights[enc_id][c])
-                                break
-                    time.sleep(1)
-
-            # 3. Consolidação (No Aggregator) ou Atualização (Nos Transmissores)
-            if (is_aggregator and len(received_states) == len(other_clients)) or (not is_aggregator and len(received_states) == 1):
-
-                # ── AGGREGATOR: Pipeline OTA (Over-the-Air) ──────────────────
+                # 2. Aggregator recebe de todos os transmissores e consolida
                 if is_aggregator:
-                    logger.info(f"Client {args.client_idx}: Todos os pesos recebidos! Iniciando agregação OTA...")
-
-                    import numpy as np
-                    from v2v_fl.over_the_air.ota_channel import (
-                        distances_from_positions,
-                        build_channel_matrices,
-                        compute_noise_variance,
+                    logger.info(
+                        f"Client {args.client_idx}: Aguardando receber pesos dos transmissores {other_clients}..."
                     )
-                    from v2v_fl.over_the_air.ota_aggregation import (
-                        compute_weight_variance,
-                        mmse_beamforming,
-                        apply_ota_channel,
-                    )
+                    received_states = []
+                    for attempt in range(poll_timeout):
+                        with in_memory_lock:
+                            if enc_id in in_memory_weights:
+                                missing = [
+                                    c for c in other_clients if c not in in_memory_weights[enc_id]
+                                ]
+                                if not missing:
+                                    for c in other_clients:
+                                        received_states.append(in_memory_weights[enc_id][c])
+                                    break
+                        time.sleep(1)
 
-                    # Passo 3a: Montar o dicionário {client_id: state_dict} dos transmissores
-                    tx_state_dicts = {}
-                    for i, c in enumerate(other_clients):
-                        tx_state_dicts[c] = received_states[i]
+                with in_memory_lock:
+                    received_bytes = sum(in_memory_bytes.get(enc_id, {}).values())
+                metrics["received_upload_bytes" if is_aggregator else "download_bytes"] = (
+                    received_bytes
+                )
 
-                    # Passo 3b: Calcular distâncias geográficas (SUMO) entre cada
-                    # transmissor e o aggregator (eu)
-                    transmitter_ids, distances = distances_from_positions(positions, aggregator_id)
-                    logger.info(f"Client {args.client_idx}: Distâncias aos transmissores: "
-                                f"{dict(zip(transmitter_ids, distances.tolist()))}")
+                # 3. Consolidação (No Aggregator) ou Atualização (Nos Transmissores)
+                if (is_aggregator and len(received_states) == len(other_clients)) or (
+                    not is_aggregator and len(received_states) == 1
+                ):
+                    # ── AGGREGATOR: Pipeline OTA (Over-the-Air) ──────────────────
+                    if is_aggregator:
+                        logger.info(
+                            f"Client {args.client_idx}: Todos os pesos recebidos! Iniciando agregação OTA..."
+                        )
 
-                    # Passo 3c: n_samples uniforme (FedAvg sem ponderação por dataset)
-                    n_tx = len(transmitter_ids)
-                    n_samples = np.ones(n_tx, dtype=np.float64)
+                        from v2v_fl.over_the_air.ota_channel import (
+                            distances_from_positions,
+                            build_channel_matrices,
+                            compute_noise_variance,
+                        )
+                        from v2v_fl.over_the_air.ota_aggregation import (
+                            compute_weight_variance,
+                            mmse_beamforming,
+                            apply_ota_channel,
+                        )
 
-                    # Passo 3d: Construir as matrizes de canal (Path Loss + Rayleigh Fading)
-                    # n_antennas = 8 é o padrão do paper de referência
-                    N_ANTENNAS = 8
-                    EPSILON = 0.1  # Erro de estimação do canal (10%)
-                    H_est, H_true, H_scaled, path_loss = build_channel_matrices(
-                        distances, N_ANTENNAS, n_samples, epsilon=EPSILON,
-                    )
+                        aggregation_started = time.monotonic()
+                        try:
+                            # Passo 3a: Montar o dicionário {client_id: state_dict} dos transmissores
+                            tx_state_dicts = {}
+                            for i, c in enumerate(other_clients):
+                                tx_state_dicts[c] = received_states[i]
 
-                    # Passo 3e: Calcular a variância dos pesos de cada transmissor
-                    # (usado para normalizar os pesos antes da transmissão)
-                    variances, model_size = compute_weight_variance(tx_state_dicts)
-                    weight_vars = np.array([variances[tid] for tid in transmitter_ids])
+                            # Passo 3b: Calcular distâncias geográficas (SUMO) entre cada
+                            # transmissor e o aggregator (eu)
+                            transmitter_ids, distances = distances_from_positions(
+                                positions, aggregator_id
+                            )
+                            logger.info(
+                                f"Client {args.client_idx}: Distâncias aos transmissores: "
+                                f"{dict(zip(transmitter_ids, distances.tolist(), strict=True))}"
+                            )
 
-                    # Passo 3f: Calcular o beamforming MMSE (vetor de recepção f' e
-                    # escalares de transmissão b_k)
-                    f_prime, transmit_scalars = mmse_beamforming(H_est, weight_vars, n_samples)
+                            # Passo 3c: n_samples uniforme (FedAvg sem ponderação por dataset)
+                            n_tx = len(transmitter_ids)
+                            n_samples = np.ones(n_tx, dtype=np.float64)
 
-                    # Passo 3g: Calcular a variância do ruído térmico do receptor
-                    noise_var = compute_noise_variance(bandwidth_hz=100e3)
+                            # Passo 3d: Construir as matrizes de canal (Path Loss + Rayleigh Fading)
+                            # n_antennas = 8 é o padrão do paper de referência
+                            N_ANTENNAS = 8
+                            EPSILON = 0.1  # Erro de estimação do canal (10%)
+                            H_est, H_true, H_scaled, path_loss = build_channel_matrices(
+                                distances,
+                                N_ANTENNAS,
+                                n_samples,
+                                epsilon=EPSILON,
+                            )
 
-                    # Passo 3h: Simular a transmissão Over-the-Air!
-                    # Esta função aplica: normalização → pré-codificação → canal → ruído
-                    # O resultado é a média ponderada degradada pelo canal de rádio
-                    ota_aggregated = apply_ota_channel(
-                        state_dicts=tx_state_dicts,
-                        transmitter_ids=transmitter_ids,
-                        n_samples=n_samples,
-                        H_true=H_true,
-                        transmit_scalars=transmit_scalars,
-                        f_prime=f_prime,
-                        noise_variance=noise_var,
-                        weight_variances=weight_vars,
-                    )
-                    logger.info(f"Client {args.client_idx}: Agregação OTA concluída com sucesso!")
+                            # Passo 3e: Calcular a variância dos pesos de cada transmissor
+                            # (usado para normalizar os pesos antes da transmissão)
+                            variances, model_size = compute_weight_variance(tx_state_dicts)
+                            weight_vars = np.array([variances[tid] for tid in transmitter_ids])
 
-                    # Passo 3i: FedAvg ponderado
-                    # n_tx já está definido no Passo 3c como len(transmitter_ids)
-                    for k in snapshot.keys():
-                        ota_val = ota_aggregated[k].float()
-                        local_val = snapshot[k].float()
-                        # Média ponderada: (1 parte local + n_tx partes do OTA) / total de nós
-                        snapshot[k] = ((local_val + (n_tx * ota_val)) / (n_tx + 1)).to(snapshot[k].dtype)
+                            # Passo 3f: Calcular o beamforming MMSE (vetor de recepção f' e
+                            # escalares de transmissão b_k)
+                            f_prime, transmit_scalars = mmse_beamforming(
+                                H_est, weight_vars, n_samples
+                            )
 
-                    # Carregar o modelo agregado no PyTorch
-                    if args.model in ['clip', 'slm']:
-                        if args.model == 'clip':
-                            from lora_clip.sora import set_trainable_state_dict
-                            set_trainable_state_dict(model, snapshot)
+                            # Passo 3g: Calcular a variância do ruído térmico do receptor
+                            noise_var = compute_noise_variance(bandwidth_hz=100e3)
+
+                            # Passo 3h: Simular a transmissão Over-the-Air!
+                            # Esta função aplica: normalização → pré-codificação → canal → ruído
+                            # O resultado é a média ponderada degradada pelo canal de rádio
+                            ota_aggregated = apply_ota_channel(
+                                state_dicts=tx_state_dicts,
+                                transmitter_ids=transmitter_ids,
+                                n_samples=n_samples,
+                                H_true=H_true,
+                                transmit_scalars=transmit_scalars,
+                                f_prime=f_prime,
+                                noise_variance=noise_var,
+                                weight_variances=weight_vars,
+                            )
+                            logger.info(
+                                f"Client {args.client_idx}: Agregação OTA concluída com sucesso!"
+                            )
+
+                            # Passo 3i: FedAvg ponderado
+                            # n_tx já está definido no Passo 3c como len(transmitter_ids)
+                            for k in snapshot:
+                                ota_val = ota_aggregated[k].float()
+                                local_val = snapshot[k].float()
+                                # Média ponderada: (1 parte local + n_tx partes do OTA) / total de nós
+                                snapshot[k] = ((local_val + (n_tx * ota_val)) / (n_tx + 1)).to(
+                                    snapshot[k].dtype
+                                )
+
+                        finally:
+                            metrics["aggregation_time"] = time.monotonic() - aggregation_started
+                        # Carregar o modelo agregado no PyTorch
+                        if args.model in ["clip", "slm"]:
+                            if args.model == "clip":
+                                from lora_clip.sora import set_trainable_state_dict
+
+                                set_trainable_state_dict(model, snapshot)
+                            else:
+                                from lora_slm.sora import (
+                                    set_trainable_state_dict as set_trainable_state_dict_slm,
+                                )
+
+                                set_trainable_state_dict_slm(model, snapshot)
                         else:
-                            from lora_slm.sora import set_trainable_state_dict as set_trainable_state_dict_slm
-                            set_trainable_state_dict_slm(model, snapshot)
+                            model.load_state_dict(snapshot)
+
+                    # ── TRANSMISSOR: Apenas carrega o modelo recebido do Aggregator ──
                     else:
-                        model.load_state_dict(snapshot)
+                        logger.info(
+                            f"Client {args.client_idx}: Pesos consolidados recebidos do Aggregator!"
+                        )
+                        # O Transmissor recebe o modelo já agregado (OTA + local do Aggregator)
+                        # e simplesmente o carrega como seu novo modelo local
+                        aggregated_state = received_states[0]
 
-                # ── TRANSMISSOR: Apenas carrega o modelo recebido do Aggregator ──
-                else:
-                    logger.info(f"Client {args.client_idx}: Pesos consolidados recebidos do Aggregator!")
-                    # O Transmissor recebe o modelo já agregado (OTA + local do Aggregator)
-                    # e simplesmente o carrega como seu novo modelo local
-                    aggregated_state = received_states[0]
+                        if args.model in ["clip", "slm"]:
+                            for k in snapshot:
+                                snapshot[k].copy_(aggregated_state[k].to(snapshot[k].dtype))
+                            if args.model == "clip":
+                                from lora_clip.sora import set_trainable_state_dict
 
-                    if args.model in ['clip', 'slm']:
-                        for k in snapshot.keys():
-                            snapshot[k].copy_(aggregated_state[k].to(snapshot[k].dtype))
-                        if args.model == 'clip':
-                            from lora_clip.sora import set_trainable_state_dict
-                            set_trainable_state_dict(model, snapshot)
+                                set_trainable_state_dict(model, snapshot)
+                            else:
+                                from lora_slm.sora import (
+                                    set_trainable_state_dict as set_trainable_state_dict_slm,
+                                )
+
+                                set_trainable_state_dict_slm(model, snapshot)
                         else:
-                            from lora_slm.sora import set_trainable_state_dict as set_trainable_state_dict_slm
-                            set_trainable_state_dict_slm(model, snapshot)
-                    else:
-                        for k in snapshot.keys():
-                            snapshot[k] = aggregated_state[k].to(snapshot[k].dtype)
-                        model.load_state_dict(snapshot)
+                            for k in snapshot:
+                                snapshot[k] = aggregated_state[k].to(snapshot[k].dtype)
+                            model.load_state_dict(snapshot)
 
-                # 4. Aggregator envia o resultado de volta para os transmissores
-                if is_aggregator:
-                    for c in other_clients:
-                        target_host = f"fl-client-v2v-{c}"
-                        sent = False
-                        for attempt in range(5): # Tentativas rápidas, eles já estão esperando
-                            try:
-                                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                                    s.settimeout(2.0)
-                                    s.connect((target_host, 9000))
-                                    import pickle
-                                    snapshot_bytes = len(pickle.dumps((args.client_idx, enc_id, snapshot)))
+                    metrics["applied"] = True
+                    # 4. Aggregator envia o resultado de volta para os transmissores
+                    if is_aggregator:
+                        for c in other_clients:
+                            target_host = f"fl-client-v2v-{c}"
+                            sent = False
+                            for retry in range(5):
+                                try:
+                                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                                        s.settimeout(2.0)
+                                        s.connect((target_host, 9000))
+                                        snapshot_bytes = send_data(s, (args.client_idx, enc_id, snapshot))
+                                    metrics["sent_download_bytes"] += snapshot_bytes
                                     rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
                                     rs_p2p_data_sent_enc_ids.append(enc_id)
-                                    send_data(s, (args.client_idx, enc_id, snapshot))
-                                logger.info(f"Client {args.client_idx}: Retornou pesos consolidados para {target_host}")
-                                sent = True
-                                break
-                            except (ConnectionRefusedError, socket.timeout):
-                                time.sleep(1)
-                        if not sent:
-                            logger.warning(f"Client {args.client_idx}: Falhou ao retornar pesos consolidados para {target_host}")
+                                    logger.info("Client %d: Retornou pesos consolidados para %s (%d bytes).",
+                                                args.client_idx, target_host, snapshot_bytes)
+                                    sent = True
+                                    break
+                                except (ConnectionRefusedError, socket.timeout):
+                                    time.sleep(1)
+                            if not sent:
+                                raise TimeoutError(f"Falha ao enviar pesos V2V para {target_host}.")
 
-                # Limpar RAM
+                    metrics.update(
+                        applied=True,
+                        status="applied",
+                        protocol_time=time.monotonic() - encounter_started,
+                    )
+                    write_json_atomic(
+                        metrics,
+                        encounters_dir / f".applied_enc_{enc_id}_client_{args.client_idx}.json",
+                    )
+                    # Limpar RAM
+                    with in_memory_lock:
+                        if enc_id in in_memory_weights:
+                            del in_memory_weights[enc_id]
+                        in_memory_bytes.pop(enc_id, None)
+
+                    # ── FASE 7: Avaliação Pós-Agregação ──────────────────────
+                    if not args.skip_post_eval:
+                        evaluation_started = time.monotonic()
+                        try:
+                            post_p2p_acc, _ = evaluate_model(model, test_loader)
+                        finally:
+                            metrics["evaluation_time"] = time.monotonic() - evaluation_started
+                        if not math.isfinite(post_p2p_acc):
+                            raise ValueError("A avaliação pós-V2V retornou uma acurácia inválida.")
+                        metrics["accuracy_after"] = float(post_p2p_acc)
+                        logger.info(
+                            f"Client {args.client_idx}: Post-D-PSGD Test Accuracy: {post_p2p_acc:.2f}%"
+                        )
+                        rs_post_p2p_acc.append(post_p2p_acc)
+                        rs_post_p2p_encounter_ids.append(enc_id)
+
+                    metrics["status"] = "completed"
+                    # Registrar métricas OTA deste encontro (dentro ou fora do skip_post_eval)
+                    rs_ota_encounter_epochs.append(epoch)
+                    rs_ota_mean_distances.append(enc_mean_distance)
+                    rs_ota_is_aggregator.append(1 if is_aggregator else 0)
+
+                    save_results(
+                        args,
+                        rs_global_acc,
+                        rs_global_loss,
+                        rs_ala_acc,
+                        rs_local_acc,
+                        rs_train_acc,
+                        idx=args.client_idx,
+                        argalgo=args.ala,
+                        rs_post_p2p_acc=rs_post_p2p_acc,
+                        rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
+                        rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
+                        rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
+                        rs_ota_encounter_epochs=rs_ota_encounter_epochs,
+                        rs_ota_mean_distances=rs_ota_mean_distances,
+                        rs_ota_is_aggregator=rs_ota_is_aggregator,
+                    )
+
+                    # Sinalizar ao SUMO que a troca terminou
+                    write_json_atomic(
+                        metrics, encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
+                    )
+                    logger.info(
+                        f"Client {args.client_idx}: Agregacao concluida. .done_enc enviado."
+                    )
+                else:
+                    raise TimeoutError(f"Pesos V2V incompletos: {len(received_states)} recebidos.")
+            except Exception as exc:
+                encounter_failure = str(exc) or type(exc).__name__
                 with in_memory_lock:
-                    if enc_id in in_memory_weights:
-                        del in_memory_weights[enc_id]
-
-                # ── FASE 7: Avaliação Pós-Agregação ──────────────────────
-                if not args.skip_post_eval:
-                    post_p2p_acc, _ = evaluate_model(model, test_loader)
-                    logger.info(f"Client {args.client_idx}: Post-D-PSGD Test Accuracy: {post_p2p_acc:.2f}%")
-                    rs_post_p2p_acc.append(post_p2p_acc)
-                    rs_post_p2p_encounter_ids.append(enc_id)
-                
-                # Registrar métricas OTA deste encontro (dentro ou fora do skip_post_eval)
-                rs_ota_encounter_epochs.append(epoch)
-                rs_ota_mean_distances.append(enc_mean_distance)
-                rs_ota_is_aggregator.append(1 if is_aggregator else 0)
-                
-                if not args.skip_post_eval:
-                    save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, 
-                                 idx=args.client_idx, argalgo=args.ala, 
-                                 rs_post_p2p_acc=rs_post_p2p_acc, 
-                                 rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
-                                 rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                                 rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
-                                 rs_ota_encounter_epochs=rs_ota_encounter_epochs,
-                                 rs_ota_mean_distances=rs_ota_mean_distances,
-                                 rs_ota_is_aggregator=rs_ota_is_aggregator)
-
-                # Sinalizar ao SUMO que a troca terminou
-                (encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}").touch()
-                logger.info(f"Client {args.client_idx}: Agregacao concluida. .done_enc enviado.")
-            else:
-                logger.warning(f"Client {args.client_idx}: Timeout ({poll_timeout}s) esperando pesos. Recebeu {len(received_states)}/{len(other_clients)}.")
-                (encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}").touch()
+                    received_bytes = sum(in_memory_bytes.get(enc_id, {}).values())
+                byte_key = (
+                    "received_upload_bytes" if metrics["is_aggregator"] else "download_bytes"
+                )
+                metrics[byte_key] = max(metrics[byte_key], received_bytes)
+                if metrics["status"] == "pending":
+                    metrics["protocol_time"] = time.monotonic() - encounter_started
+                metrics.update(status="failed", error=encounter_failure)
+                write_v2i_failure(
+                    encounters_dir, encounter_data, args.client_idx, encounter_failure, metrics
+                )
+                logger.error("Falha no encontro V2V %d: %s", enc_id, encounter_failure)
+                break
 
             last_processed_encounter = enc_id
             epoch += 1
 
         # Ao final do max_epochs ou simulation_done
         logger.info(f"Client {args.client_idx}: Loop descentralizado finalizado.")
-        save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, 
-                     idx=args.client_idx, argalgo=args.ala, 
-                     rs_post_p2p_acc=rs_post_p2p_acc, 
-                     rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
-                     rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                     rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
-                     rs_ota_encounter_epochs=rs_ota_encounter_epochs,
-                     rs_ota_mean_distances=rs_ota_mean_distances,
-                     rs_ota_is_aggregator=rs_ota_is_aggregator)
+        save_results(
+            args,
+            rs_global_acc,
+            rs_global_loss,
+            rs_ala_acc,
+            rs_local_acc,
+            rs_train_acc,
+            idx=args.client_idx,
+            argalgo=args.ala,
+            rs_post_p2p_acc=rs_post_p2p_acc,
+            rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
+            rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
+            rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
+            rs_ota_encounter_epochs=rs_ota_encounter_epochs,
+            rs_ota_mean_distances=rs_ota_mean_distances,
+            rs_ota_is_aggregator=rs_ota_is_aggregator,
+        )
+        if encounter_failure is not None:
+            raise RuntimeError(
+                f"Falha na execução descentralizada do cliente {args.client_idx}: "
+                f"{encounter_failure}"
+            )
         logger.info("\nTraining completed!")
+
 
 if __name__ == '__main__':
     main()
