@@ -15,11 +15,17 @@ usando as matrizes de canal geradas por ``ota_channel.py``.
 """
 
 import logging
+import math
 
 import numpy as np
 import torch
 
+from v2v_fl.over_the_air.ota_channel import build_channel_matrices, compute_noise_variance
+
 logger = logging.getLogger(__name__)
+
+DEFAULT_OTA_EPSILON = 0.1
+DEFAULT_OTA_BANDWIDTH_HZ = 100e3
 
 
 # ── Passo 1: Variância dos Pesos ─────────────────────────────────────────────
@@ -232,3 +238,54 @@ def apply_ota_channel(
     )
 
     return aggregated_state
+
+
+def ota_aggregate(
+    client_states: dict[int, dict],
+    positions: dict[int, tuple[float, float]],
+    rsu: dict,
+    *,
+    epsilon: float = DEFAULT_OTA_EPSILON,
+    bandwidth_hz: float = DEFAULT_OTA_BANDWIDTH_HZ,
+) -> dict:
+    """Agrega apenas os veículos deste encontro pelo canal OTA veículo → RSU.
+
+    Todos os veículos são transmissores com peso uniforme. A RSU é somente
+    receptora, sem pesos próprios ou memória de modelos de encontros anteriores.
+    Usa o mesmo pipeline de path loss, fading, beamforming e ruído do V2V.
+    """
+    if not client_states:
+        raise ValueError("Agregação V2I requer pelo menos um veículo transmissor.")
+    n_antennas = rsu.get("n_antennas", 16)
+    if not isinstance(n_antennas, int) or n_antennas < 1:
+        raise ValueError("A RSU deve ter um número inteiro positivo de antenas.")
+    if not 0 <= epsilon < 1:
+        raise ValueError("O erro de estimação OTA deve estar no intervalo [0, 1).")
+    if not math.isfinite(bandwidth_hz) or bandwidth_hz <= 0:
+        raise ValueError("A largura de banda OTA deve ser positiva e finita.")
+
+    transmitter_ids = sorted(client_states)
+    distances = np.array([
+        math.hypot(positions[c][0] - rsu["x"], positions[c][1] - rsu["y"])
+        for c in transmitter_ids
+    ])
+    # Mesma distância mínima do V2V para evitar singularidade no path loss.
+    distances = np.maximum(distances, 1.0)
+    n_samples = np.ones(len(transmitter_ids), dtype=np.float64)
+    H_est, H_true, _, _ = build_channel_matrices(
+        distances, n_antennas, n_samples, epsilon=epsilon,
+    )
+    variances, _ = compute_weight_variance(client_states)
+    weight_vars = np.maximum([variances[c] for c in transmitter_ids], 1e-12)
+    f_prime, transmit_scalars = mmse_beamforming(H_est, weight_vars, n_samples)
+
+    return apply_ota_channel(
+        state_dicts=client_states,
+        transmitter_ids=transmitter_ids,
+        n_samples=n_samples,
+        H_true=H_true,
+        transmit_scalars=transmit_scalars,
+        f_prime=f_prime,
+        noise_variance=compute_noise_variance(bandwidth_hz),
+        weight_variances=weight_vars,
+    )
