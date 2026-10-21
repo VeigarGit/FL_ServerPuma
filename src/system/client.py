@@ -68,6 +68,33 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------
 
 
+def send_p2p_model(host: str, payload: tuple, *, deadline: float, cancelled=None) -> int:
+    """Conecta com tentativas curtas e envia o modelo até o prazo do encontro.
+
+    O limite de conexão não limita o envio de todos os pesos. O transporte
+    compartilhado mantém o progresso no socket durante esperas/retransmissões.
+    """
+    while True:
+        if cancelled is not None and cancelled():
+            raise ConnectionAbortedError("Simulação encerrada durante o envio V2V.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Prazo de envio V2V para {host} esgotado.")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                connection.settimeout(min(2.0, remaining))
+                connection.connect((host, 9000))
+                return send_data(connection, payload, deadline=deadline, cancelled=cancelled)
+        except ConnectionAbortedError:
+            raise
+        except OSError as exc:
+            logger.warning("Envio V2V para %s: %s", host, exc)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Prazo de envio V2V para {host} esgotado: {exc}") from exc
+            time.sleep(min(0.2, remaining))
+
+
 def exchange_v2i_model(
     model, encounter: dict, client_id: int, *, cancelled=None, metrics=None
 ) -> dict:
@@ -907,6 +934,7 @@ def main():
         encounters_dir = args.encounters_dir or Path(__file__).resolve().parents[1] / "results" / "encounters"
         in_memory_weights = {}
         in_memory_bytes = {}
+        p2p_timeout = 600.0
         in_memory_lock = threading.Lock()
         def wait_for_round_signal(encounters_dir: Path, round_num: int) -> bool:
             while True:
@@ -948,18 +976,22 @@ def main():
             while True:
                 try:
                     conn, addr = server_socket.accept()
-                    data, _, received_bytes = recv_data(conn, return_bytes=True)
-                    if data is not None:
-                        sender_id, enc_id, state = data
-                        with in_memory_lock:
-                            if enc_id not in in_memory_weights:
-                                in_memory_weights[enc_id] = {}
-                            in_memory_weights[enc_id][sender_id] = state
-                            in_memory_bytes.setdefault(enc_id, {})[sender_id] = (
-                                in_memory_bytes.get(enc_id, {}).get(sender_id, 0) + received_bytes
-                            )
-                        logger.info(f"Client {args.client_idx}: Recebeu pesos do Cliente {sender_id} para encontro {enc_id}")
-                    conn.close()
+                    with conn:
+                        data, _, received_bytes = recv_data(
+                            conn, return_bytes=True,
+                            deadline=time.monotonic() + p2p_timeout,
+                            cancelled=lambda: (encounters_dir / ".simulation_done").exists(),
+                        )
+                        if data is not None:
+                            sender_id, enc_id, state = data
+                            with in_memory_lock:
+                                if enc_id not in in_memory_weights:
+                                    in_memory_weights[enc_id] = {}
+                                in_memory_weights[enc_id][sender_id] = state
+                                in_memory_bytes.setdefault(enc_id, {})[sender_id] = (
+                                    in_memory_bytes.get(enc_id, {}).get(sender_id, 0) + received_bytes
+                                )
+                            logger.info(f"Client {args.client_idx}: Recebeu pesos do Cliente {sender_id} para encontro {enc_id}")
                 except Exception as e:
                     logger.error(f"Erro no P2P Server: {e}")
         p2p_started = False
@@ -1195,6 +1227,16 @@ def main():
             # BRANCH V2V: Fluxo original com OTA e eleição de Aggregator
             # ══════════════════════════════════════════════════════════════════
             try:
+                p2p_timeout = encounter_data.get("exchange_timeout", poll_timeout)
+                if (
+                    isinstance(p2p_timeout, bool)
+                    or not isinstance(p2p_timeout, (int, float))
+                    or not math.isfinite(p2p_timeout)
+                    or p2p_timeout <= 0
+                ):
+                    raise ValueError("exchange_timeout V2V deve ser positivo e finito.")
+                exchange_deadline = encounter_started + p2p_timeout
+                cancelled = (encounters_dir / ".simulation_done").exists
                 if not p2p_started:
                     threading.Thread(target=p2p_server_thread, daemon=True).start()
                     p2p_started = True
@@ -1238,31 +1280,26 @@ def main():
                 # 1. Transmissores enviam seus pesos para o Aggregator
                 if not is_aggregator:
                     target_host = f"fl-client-v2v-{aggregator_id}"
-                    sent = False
-                    for retry in range(5):
-                        try:
-                            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                                s.settimeout(2.0)
-                                s.connect((target_host, 9000))
-                                snapshot_bytes = send_data(s, (args.client_idx, enc_id, snapshot))
-                            metrics["upload_bytes"] += snapshot_bytes
-                            rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
-                            rs_p2p_data_sent_enc_ids.append(enc_id)
-                            logger.info("Client %d: Enviou pesos para %s (%d bytes).",
-                                        args.client_idx, target_host, snapshot_bytes)
-                            sent = True
-                            break
-                        except (ConnectionRefusedError, socket.timeout):
-                            time.sleep(1)
-                    if not sent:
-                        raise TimeoutError(f"Falha ao enviar pesos V2V para {target_host}.")
+                    snapshot_bytes = send_p2p_model(
+                        target_host, (args.client_idx, enc_id, snapshot),
+                        deadline=exchange_deadline, cancelled=cancelled,
+                    )
+                    metrics["upload_bytes"] += snapshot_bytes
+                    rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
+                    rs_p2p_data_sent_enc_ids.append(enc_id)
+                    logger.info("Client %d: Enviou pesos para %s (%d bytes).",
+                                args.client_idx, target_host, snapshot_bytes)
 
                     # Aguardar resposta do Aggregator (pesos consolidados)
                     logger.info(
                         f"Client {args.client_idx}: Aguardando resposta do Aggregator {aggregator_id}..."
                     )
                     received_states = []
-                    for attempt in range(poll_timeout):
+                    while time.monotonic() < exchange_deadline:
+                        if cancelled():
+                            raise ConnectionAbortedError(
+                                "Simulação encerrada aguardando resultado V2V."
+                            )
                         with in_memory_lock:
                             if (
                                 enc_id in in_memory_weights
@@ -1278,7 +1315,11 @@ def main():
                         f"Client {args.client_idx}: Aguardando receber pesos dos transmissores {other_clients}..."
                     )
                     received_states = []
-                    for attempt in range(poll_timeout):
+                    while time.monotonic() < exchange_deadline:
+                        if cancelled():
+                            raise ConnectionAbortedError(
+                                "Simulação encerrada aguardando uploads V2V."
+                            )
                         with in_memory_lock:
                             if enc_id in in_memory_weights:
                                 missing = [
@@ -1439,24 +1480,17 @@ def main():
                     if is_aggregator:
                         for c in other_clients:
                             target_host = f"fl-client-v2v-{c}"
-                            sent = False
-                            for retry in range(5):
-                                try:
-                                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                                        s.settimeout(2.0)
-                                        s.connect((target_host, 9000))
-                                        snapshot_bytes = send_data(s, (args.client_idx, enc_id, snapshot))
-                                    metrics["sent_download_bytes"] += snapshot_bytes
-                                    rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
-                                    rs_p2p_data_sent_enc_ids.append(enc_id)
-                                    logger.info("Client %d: Retornou pesos consolidados para %s (%d bytes).",
-                                                args.client_idx, target_host, snapshot_bytes)
-                                    sent = True
-                                    break
-                                except (ConnectionRefusedError, socket.timeout):
-                                    time.sleep(1)
-                            if not sent:
-                                raise TimeoutError(f"Falha ao enviar pesos V2V para {target_host}.")
+                            snapshot_bytes = send_p2p_model(
+                                target_host, (args.client_idx, enc_id, snapshot),
+                                deadline=exchange_deadline, cancelled=cancelled,
+                            )
+                            metrics["sent_download_bytes"] += snapshot_bytes
+                            rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
+                            rs_p2p_data_sent_enc_ids.append(enc_id)
+                            logger.info(
+                                "Client %d: Retornou pesos consolidados para %s (%d bytes).",
+                                args.client_idx, target_host, snapshot_bytes,
+                            )
 
                     metrics.update(
                         applied=True,

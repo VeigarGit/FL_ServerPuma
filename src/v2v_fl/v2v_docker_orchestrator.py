@@ -718,6 +718,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         "encounter_id": encounter_count,
                         "run_id": run_id,
                         "type": "v2v",
+                        "exchange_timeout": args.exchange_timeout,
                         "clients": c_indices,
                         "timestamp": sim_time,
                         # O ETC permite que os clientes ajustem seu timeout
@@ -1005,6 +1006,8 @@ def main():
     parser.add_argument("--run-id", help="ID da execução; padrão: UUID")
     parser.add_argument("--exchange-timeout", type=float, default=600.0)
     args = parser.parse_args()
+    if not math.isfinite(args.exchange_timeout) or args.exchange_timeout <= 0:
+        parser.error("--exchange-timeout deve ser positivo e finito.")
     try:
         run_orchestrator(args)
     except (OSError, ValueError, RuntimeError) as exc:
