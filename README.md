@@ -282,9 +282,9 @@ tmux kill-server
 
 ---
 
-## 🚀 Method 3: V2V-Docker Execution
+## 🚀 Method 3: V2V-OTA Simulation
 
-This method simulates **Vehicular Federated Learning (V2V)** using [SUMO](https://eclipse.dev/sumo/) for urban vehicle mobility and Docker containers as decentralized FL clients. Vehicles train locally and exchange model weights via **D-PSGD (Decentralized Parallel SGD)** when they come within communication range; no central server is required.
+Using [SUMO](https://eclipse.dev/sumo/) for vehicle mobility and Docker clients, this method numerically simulates **V2V Over-the-Air (OTA) aggregation** with path loss, fading, beamforming and thermal noise. Vehicles train locally and exchange model weights over TCP within communication range, following D-PSGD without a central server.
 
 ### Prerequisites
 
@@ -359,8 +359,8 @@ sg docker -c "uv run python3 v2v_docker_orchestrator.py \
 |------|-------------|---------|
 | `--total-clients` | Total vehicle containers to create | `5` |
 | `--encounters` | Maximum viable encounters before stopping | `4` |
-| `--warmup` | Seconds to wait before signaling encounters (containers boot + first epoch) | `60` |
-| `--cooldown` | Seconds between consecutive encounters (prevents encounter spam) | `30` |
+| `--warmup` | Startup wait in seconds before the first training round | `60` |
+| `--cooldown` | SUMO seconds between consecutive encounters | `15` |
 
 **Training:**
 
@@ -373,22 +373,22 @@ sg docker -c "uv run python3 v2v_docker_orchestrator.py \
 
 ### Step 3: Monitor the Simulation
 
-The orchestrator prints real-time logs showing encounter formation, ETC values, and P2P exchange progress:
+The orchestrator prints real-time logs showing encounter formation, ETC values, and training synchronization:
 
 ```
-10:27:42 [INFO] Encontro 1/4! Veiculos ['veh_0', 'veh_3'] (Clientes [0, 1]) | ETC=120.0s
-10:27:42 [INFO] SUMO PAUSADO. Aguardando 2 clientes completarem troca P2P do encontro 1...
-10:27:57 [INFO]   ... 1/2 .pt recebidos (15s)
-10:28:20 [INFO] Todos os 2 .pt recebidos em 38s! Aguardando 5s para agregacao...
-10:28:25 [INFO] SUMO RETOMADO.
+10:27:42 [INFO] Encontro 1/4! Veiculos ['veh_0', 'veh_3'] (Clientes [0, 3]) | ETC=120.0s | (Vezes: 1)
+10:27:57 [INFO] SUMO RETOMADO.
+10:27:57 [INFO] --- Iniciando Treino (Rodada 1) ---
+10:27:57 [INFO] Aguardando todos os 5 clientes completarem a época da rodada 1...
+10:28:20 [INFO] Todos os clientes completaram a época!
 ```
 
 To inspect individual container logs during execution:
 ```bash
-sg docker -c "docker compose -f docker-compose.v2x.yml logs -f fl-client-v2v-0"
+sg docker -c "docker logs -f fl-client-v2v-0"
 ```
 
-## 🚀 Method 4: V2I-OTA with Stateless RSUs
+## 🚀 Method 4: V2I-OTA Simulation
 
 V2I uses fixed Road Side Units (RSUs) as OTA receivers. Vehicles train locally;
 the host simulates path loss, Rayleigh fading, reception beamforming, and thermal
@@ -492,54 +492,3 @@ After the simulation completes, performance metrics (Accuracy, Loss, Model Size 
 | First Docker build is very slow | Downloading all Python dependencies | Subsequent builds are cached; only rebuilds if `pyproject.toml` or `uv.lock` change |
 | Port conflict on `9000` | Another service using the port | Change `--port` in server args or stop the conflicting service |
 | Build context is huge (several GB) | `.dockerignore` not filtering `.venv`/data | Ensure `.dockerignore` excludes `.venv/`, `src/dataset/*/data/`, and other large directories |
-
----
-
-## 📚 Citation
-
-If you use this simulator or build upon the OPALA and PUMA approaches in your research, please cite the following papers:
-
-### OPALA
-
-[OPALA: Optimized Pruning Adaptive Learning Approach for Federated Learning Scenarios](https://ieeexplore.ieee.org/document/11325972/)
-
-```bibtex
-@inproceedings{veiga2025opala,
-  author    = {Veiga, Rafael and
-               Morais, Renan and
-               Bustincio, R{\'o}mulo and
-               Bastos, Lucas de Lima and
-               Ros{\'a}rio, Denis Lima and
-               Sargento, Susana and
-               Cerqueira, Eduardo},
-  title     = {{OPALA}: Optimized Pruning Adaptive Learning Approach
-               for Federated Learning Scenarios},
-  booktitle = {2025 IEEE Symposium on Computers and Communications (ISCC)},
-  year      = {2025},
-  publisher = {IEEE},
-  doi       = {10.1109/ISCC65549.2025.11325972},
-  url       = {https://ieeexplore.ieee.org/document/11325972/}
-}
-```
-
-### PUMA
-
-[PUMA: Client Resource-Aware Adaptive Pruning with Heterogeneous Sub-model Aggregation](https://www.researchgate.net/publication/410979250_PUMA_Client_Resource-Aware_Adaptive_Pruning_with_Heterogeneous_Sub-model_Aggregation)
-
-```bibtex
-@misc{veiga2026puma,
-  author = {Veiga, Rafael and
-            Sousa, John Lucas Rodrigues Portilho de and
-            Barreto, Bernardo and
-            Bastos, Lucas de Lima and
-            Ros{\'a}rio, Denis Lima and
-            Sargento, Susana and
-            Cerqueira, Eduardo},
-  title  = {{PUMA}: Client Resource-Aware Adaptive Pruning
-            with Heterogeneous Sub-model Aggregation},
-  year   = {2026},
-  month  = jul,
-  note   = {Preprint},
-  url    = {https://www.researchgate.net/publication/410979250_PUMA_Client_Resource-Aware_Adaptive_Pruning_with_Heterogeneous_Sub-model_Aggregation}
-}
-```
