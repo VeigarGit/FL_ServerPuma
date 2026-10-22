@@ -10,7 +10,8 @@ as posições e antenas das RSUs. Somente sinais e status usam arquivos.
 
 Cada cliente mantém uma conexão: UPLOAD → RESULT → APPLIED. As mensagens usam
 as funções V2I de utils.network_utils. PING → PONG verifica a prontidão. Há
-somente um encontro ativo; nenhum modelo é persistido ou passado ao seguinte.
+somente um encontro ativo, com pelo menos dois veículos distintos; nenhum modelo
+é persistido ou passado ao seguinte.
 O ciclo é espera de uploads → agregação → espera de APPLIED → encerramento.
 O cálculo OTA já iniciado termina em CPU, mas um resultado fora do prazo é
 descartado. As conexões e os tensores são liberados antes do próximo encontro.
@@ -158,11 +159,11 @@ class RSUServer(socketserver.ThreadingTCPServer):
         clients = data.get("clients")
         if (
             not isinstance(clients, list)
-            or not clients
+            or len(clients) < 2
             or any(type(c) is not int or c < 0 for c in clients)
             or len(set(clients)) != len(clients)
         ):
-            raise ValueError("clients deve conter índices únicos e não negativos.")
+            raise ValueError("clients deve conter pelo menos dois índices únicos e não negativos.")
         raw_positions = data.get("positions")
         if not isinstance(raw_positions, dict):
             raise ValueError("positions deve ser um dicionário.")

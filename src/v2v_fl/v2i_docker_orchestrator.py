@@ -10,7 +10,7 @@ Serve como BASELINE de comparação contra o modo V2V-OTA descentralizado.
 Diferenças em relação ao V2V (v2v_docker_orchestrator.py):
   - As RSUs são pontos fixos no mapa (definidos em rsu_config.json).
   - A detecção é veículo ↔ RSU (não veículo ↔ veículo).
-  - ≥1 veículo no raio da RSU é suficiente para agregar.
+  - São necessários ≥2 veículos no raio da RSU com ETC suficiente para agregar.
   - A agregação OTA é feita no serviço único rsu-service, em CPU.
   - As RSUs são stateless: só agregam os modelos do encontro atual.
   - O conhecimento permanece nos veículos, sem modelo global persistido na RSU.
@@ -22,7 +22,7 @@ Fluxo:
   4. A cada step do SUMO:
      a) Detecta veículos dentro do raio de cada RSU.
      b) Calcula o ETC de cada veículo com a RSU.
-     c) Se ETC suficiente: publica identificadores, endereço e posições em JSON.
+     c) Com ≥2 veículos elegíveis: publica identificadores, endereço e posições em JSON.
      d) O serviço recebe os pesos por TCP, agrega e aguarda APPLIED dos veículos.
      e) Espera o status terminal do servidor e a avaliação dos clientes.
   5. Encerra quando o número máximo de encontros é atingido.
@@ -479,6 +479,8 @@ def wait_for_client_evaluations(
 
 def run_orchestrator(args: argparse.Namespace) -> None:
     """Loop principal do orquestrador V2I."""
+    if args.total_clients < 2:
+        raise ValueError("--total-clients deve ser pelo menos 2 para encontros V2I.")
     exchange_timeout = getattr(args, "exchange_timeout", DEFAULT_EXCHANGE_TIMEOUT)
     evaluation_timeout = getattr(args, "evaluation_timeout", DEFAULT_EVALUATION_TIMEOUT)
 
@@ -636,6 +638,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     )
 
             if not vehicles:
+                prev_clients_per_rsu.clear()
                 continue
 
             # ── Detectar veículos no raio de cada RSU ─────────────────────
@@ -650,10 +653,6 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         del prev_clients_per_rsu[rsu_id]
                     continue
 
-                # ── Verificar cooldown desta RSU ──────────────────────────
-                if (sim_time - last_encounter_per_rsu[rsu_id]) < args.cooldown:
-                    continue
-
                 vehs_with_dist = vehicles_by_rsu[rsu_id]
 
                 # ── Filtrar veículos com ETC suficiente ───────────────────
@@ -666,12 +665,17 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     elif etc >= args.min_contact_time:
                         viable.append((v, dist, etc))
 
-                if not viable:
+                c_indices = sorted({veh_to_client_idx[v.veh_id] for v, _, _ in viable})
+                if len(c_indices) < 2:
                     rejected_count += 1
+                    prev_clients_per_rsu.pop(rsu_id, None)
+                    continue
+
+                # Observar saídas mesmo durante o cooldown para liberar um novo encontro.
+                if (sim_time - last_encounter_per_rsu[rsu_id]) < args.cooldown:
                     continue
 
                 # ── Verificar se é um NOVO grupo (não repetição) ──────────
-                c_indices = sorted(veh_to_client_idx[v.veh_id] for v, _, _ in viable)
                 current_clients_key = frozenset(c_indices)
 
                 if prev_clients_per_rsu.get(rsu_id) == current_clients_key:
@@ -863,7 +867,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         log.info("ESTATÍSTICAS DA SIMULAÇÃO V2I")
         log.info("=" * 60)
         log.info("  Encontros V2I viáveis  : %d", encounter_count)
-        log.info("  Encontros rejeitados   : %d (ETC insuficiente)", rejected_count)
+        log.info("  Encontros rejeitados   : %d (menos de 2 veículos elegíveis)", rejected_count)
         log.info("  Total de steps SUMO    : %d", step)
         for rsu in rsus:
             rsu_id = rsu["id"]
