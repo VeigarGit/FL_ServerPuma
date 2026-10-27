@@ -9,6 +9,7 @@ import logging
 import random
 import math
 import json
+import hashlib
 from pathlib import Path
 
 # Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
@@ -524,6 +525,10 @@ def save_results(
         hf.attrs["paca_used"] = paca_val
         hf.attrs["execution_id"] = getattr(args, "execution_id", "")
         hf.attrs["seed"] = getattr(args, "seed", 42)
+        if getattr(args, "initial_model_sha256", None) is not None:
+            hf.attrs["initial_model_sha256"] = args.initial_model_sha256
+            hf.attrs["initialization_seed"] = args.seed
+            hf.attrs["training_seed"] = args.training_seed
         records = getattr(args, "encounter_metrics", [])
         if records:
             group = hf.create_group("encounters")
@@ -639,9 +644,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    random.seed(args.seed + args.client_idx)
-    np.random.seed(args.seed + args.client_idx)
-    torch.manual_seed(args.seed + args.client_idx)
+    args.training_seed = args.seed + args.client_idx
+    random.seed(args.training_seed)
+    np.random.seed(args.training_seed)
+    torch.manual_seed(args.training_seed)
     args.encounter_metrics = []
     
     # Configuração inteligente de device: MPS > CUDA > CPU
@@ -692,17 +698,44 @@ def main():
     
     # Adoção de Structural Pattern Matching
     match args.model:
-        case 'cnn':
-            match args.dataset:
-                case 'MNIST':
-                    model = SimpleModel(in_features=1, num_classes=10, dim=1024)
-                case 'Cifar10':
-                    model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
-                case 'Cifar100':
-                    model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
-                case _:
-                    logger.error(f"Dataset inválido: {args.dataset}")
-                    sys.exit(1)
+        case "cnn":
+            # Isolar a inicialização comum preserva o RNG de treino de cada cliente.
+            # SimpleModel é construído em CPU; os geradores dos aceleradores não mudam.
+            with torch.random.fork_rng(devices=[], enabled=args.mode == "decentralized"):
+                if args.mode == "decentralized":
+                    torch.random.default_generator.manual_seed(args.seed)
+                match args.dataset:
+                    case "MNIST":
+                        model = SimpleModel(in_features=1, num_classes=10, dim=1024)
+                    case "Cifar10":
+                        model = SimpleModel(
+                            in_features=args.in_features, num_classes=10, dim=args.dim
+                        )
+                    case "Cifar100":
+                        model = SimpleModel(
+                            in_features=args.in_features,
+                            num_classes=args.num_classes,
+                            dim=args.dim,
+                        )
+                    case _:
+                        logger.error(f"Dataset inválido: {args.dataset}")
+                        sys.exit(1)
+            if args.mode == "decentralized":
+                initial_digest = hashlib.sha256()
+                for name, tensor in sorted(model.state_dict().items()):
+                    initial_digest.update(
+                        json.dumps([name, str(tensor.dtype), list(tensor.shape)]).encode("utf-8")
+                    )
+                    initial_tensor = tensor.detach().cpu().contiguous().reshape(-1)
+                    initial_digest.update(initial_tensor.view(torch.uint8).numpy().tobytes())
+                args.initial_model_sha256 = initial_digest.hexdigest()
+                logger.info(
+                    "Client %d: CNN inicial comum | seed=%d | treino=%d | SHA256=%s",
+                    args.client_idx,
+                    args.seed,
+                    args.training_seed,
+                    args.initial_model_sha256,
+                )
         case 'clip' | 'slm':
             if args.model == 'clip':
                 config = load_config(args.config)
@@ -928,7 +961,6 @@ def main():
         logger.info("\nTraining completed!")
 
     elif args.mode == 'decentralized':
-        import json
         import threading
         logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
         encounters_dir = args.encounters_dir or Path(__file__).resolve().parents[1] / "results" / "encounters"
