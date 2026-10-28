@@ -77,19 +77,21 @@ Opções disponíveis:
   --batch-size <n>           Tamanho do batch local (padrão: 2)
   --rounds <n>               Número de rodadas por simulação (padrão: 100)
   --prune-freq <n>           Frequência da poda iterativa SoRA (padrão: 3)
+  --delta-coding             Ativa LHDQ (Low Huffman-coded Delta Quantization)
   -did, --device-id <id>     ID da GPU a utilizar (padrão: 0)
   -d, --dataset <nome>       Executa apenas um dataset específico
   -h, --help                 Exibe esta mensagem de ajuda
 
 Exemplos:
   ./run_all_pumagt_plus_slm.sh
-  ./run_all_pumagt_plus_slm.sh -did 0 --simulations 10
+  ./run_all_pumagt_plus_slm.sh -did 0 --simulations 10 --delta-coding
   ./run_all_pumagt_plus_slm.sh -d OxfordPets --simulations 1 --rounds 5
 EOF
     exit 0
 }
 
 # Processamento de argumentos
+DELTA_CODING=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -s|--session)
@@ -119,6 +121,11 @@ while [[ $# -gt 0 ]]; do
         --prune-freq)
             PRUNE_FREQ="$2"
             shift 2
+            ;;
+        --delta-coding)
+            DELTA_CODING=1
+            EXTRA_ARGS+=("--delta-coding")
+            shift 1
             ;;
         -did|--device-id)
             DEVICE_ID="$2"
@@ -165,6 +172,9 @@ echo "  Modelo:             $MODEL (Qwen3-VL-2B-Instruct, PaCA=28)"
 echo "  Estratégia:         $STRATEGY (prune_freq=$PRUNE_FREQ)"
 echo "  PaCA Adaptativo:    ATIVADO (--adaptive-paca)"
 echo "  Rank Adaptativo:    ATIVADO (--adaptive-rank)"
+if [ "$DELTA_CODING" -eq 1 ]; then
+echo "  Delta Coding:       ATIVADO (LHDQ ~1.67 bits/param)"
+fi
 echo "  Simulações/dataset: $SIMULATIONS"
 echo "  Clientes:           $CLIENTS (GPU 96GB Otimizada)"
 echo "  Batch Size:         $BATCH_SIZE"
