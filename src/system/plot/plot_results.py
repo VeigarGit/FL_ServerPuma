@@ -127,6 +127,16 @@ def parse_experiment(exp_name, results_base=None):
             results_dir = p
             actual_name = cand
             break
+        p_leg = os.path.join(results_base, "legados", "resultados_legados_2", cand)
+        if os.path.isdir(p_leg):
+            results_dir = p_leg
+            actual_name = cand
+            break
+        p_leg_old = os.path.join(results_base, "resultados_legados_2", cand)
+        if os.path.isdir(p_leg_old):
+            results_dir = p_leg_old
+            actual_name = cand
+            break
 
     if results_dir is None:
         print(f"⚠️ Diretório não encontrado: {candidates[0]}")
@@ -184,14 +194,18 @@ def parse_experiment(exp_name, results_base=None):
         label = f"AdaLoRA{rank_str}"
     elif "naive" in exp_name.lower() or "ablacao" in exp_name.lower():
         label = f"PUMA-GT (Naive){rank_str}"
-    elif "plus" in exp_name.lower():
-        label = f"PUMA-GT Plus{rank_str}"
+    elif "onlypaca" in exp_name.lower() or "norank" in exp_name.lower():
+        label = f"PUMA-GT{rank_str}"
+    elif "slm" in exp_name.lower() and ("plus" in exp_name.lower() or "adaptpaca_adaptrank" in exp_name.lower()):
+        label = f"PUMA-GT Evolution{rank_str}"
+    elif "plus" in exp_name.lower() or "adaptpaca_adaptrank" in exp_name.lower():
+        label = f"PUMA-GT Evolution{rank_str}"
     elif "v2" in exp_name.lower():
         label = f"PUMA-GT (v2){rank_str}"
     elif "v1" in exp_name.lower() or "prunefreq3" in exp_name.lower() or "adaptpaca" in exp_name.lower():
         label = f"PUMA-GT (v1){rank_str}"
     elif "sora" in exp_name.lower():
-        label = f"SoRA{rank_str}"
+        label = f"SoRa{rank_str}"
     elif "lora" in exp_name.lower():
         label = f"LoRA{rank_str}"
     else:
@@ -1046,22 +1060,41 @@ def plot_13_acuracia_vs_tempo(experiments, output_dir):
     BANDWIDTH_MBPS = 100
     BANDWIDTH_MBs = BANDWIDTH_MBPS / 8  # MB/s
 
+    has_weighted_data = any(
+        e.get('client') is not None and e['client'].get('weighted_acc_mean') is not None
+        for e in experiments
+    )
+
     # --- Gráfico (a): Tempo real ---
     fig1, ax1 = plt.subplots(figsize=(12, 7))
     for i, exp in enumerate(experiments):
         s = STYLES[i % len(STYLES)]
         d = exp['server']
         accumulated_time = np.cumsum(d['time_mean'])
-        ax1.plot(accumulated_time, d['acc_mean'], color=s['color'], marker=s['marker'],
-                 markevery=_mark_every(len(d['acc_mean'])), linestyle=s['ls'],
-                 label=exp['label'])
-        ax1.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'],
-                          d['acc_mean'] + d['acc_std'], color=s['color'], alpha=0.1)
 
-    _set_title(ax1, "Accuracy vs Accumulated Real Time")
+        if has_weighted_data and exp.get('client') is not None and exp['client'].get('weighted_acc_mean') is not None:
+            w_acc = exp['client']['weighted_acc_mean']
+            min_len = min(len(accumulated_time), len(w_acc))
+            t_plot = accumulated_time[:min_len]
+            acc_plot = w_acc[:min_len]
+            ax1.plot(t_plot, acc_plot, color=s['color'], marker=s['marker'],
+                     markevery=_mark_every(len(acc_plot)), linestyle=s['ls'],
+                     linewidth=2.5, label=exp['label'])
+        else:
+            ax1.plot(accumulated_time, d['acc_mean'], color=s['color'], marker=s['marker'],
+                     markevery=_mark_every(len(d['acc_mean'])), linestyle=s['ls'],
+                     linewidth=2.5, label=exp['label'])
+            ax1.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'],
+                              d['acc_mean'] + d['acc_std'], color=s['color'], alpha=0.1)
+
+    _set_title(ax1, "Weighted Client Auxiliary Accuracy vs Accumulated Real Time" if has_weighted_data else "Accuracy vs Accumulated Real Time")
     ax1.set_xlabel("Accumulated Time (s)")
-    ax1.set_ylabel("Accuracy (%)")
-    ax1.legend()
+    ax1.set_ylabel("Weighted Client Accuracy (%)" if has_weighted_data else "Accuracy (%)")
+    if has_weighted_data:
+        ax1.set_ylim(bottom=0, top=100)
+        ax1.legend(loc='lower right')
+    else:
+        ax1.legend()
     ax1.grid(True, ls='--', alpha=0.4)
     fig1.tight_layout()
     _save_and_close(fig1, output_dir, "13a_acuracia_vs_tempo_real.pdf")
@@ -1088,16 +1121,29 @@ def plot_13_acuracia_vs_tempo(experiments, output_dir):
 
         accumulated_time = np.cumsum(estimated_round_time)
 
-        ax2.plot(accumulated_time, d['acc_mean'], color=s['color'], marker=s['marker'],
-                 markevery=_mark_every(len(d['acc_mean'])), linestyle=s['ls'],
-                 label=exp['label'])
-        ax2.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'],
-                          d['acc_mean'] + d['acc_std'], color=s['color'], alpha=0.1)
+        if has_weighted_data and exp.get('client') is not None and exp['client'].get('weighted_acc_mean') is not None:
+            w_acc = exp['client']['weighted_acc_mean']
+            min_len = min(len(accumulated_time), len(w_acc))
+            t_plot = accumulated_time[:min_len]
+            acc_plot = w_acc[:min_len]
+            ax2.plot(t_plot, acc_plot, color=s['color'], marker=s['marker'],
+                     markevery=_mark_every(len(acc_plot)), linestyle=s['ls'],
+                     linewidth=2.5, label=exp['label'])
+        else:
+            ax2.plot(accumulated_time, d['acc_mean'], color=s['color'], marker=s['marker'],
+                     markevery=_mark_every(len(d['acc_mean'])), linestyle=s['ls'],
+                     linewidth=2.5, label=exp['label'])
+            ax2.fill_between(accumulated_time, d['acc_mean'] - d['acc_std'],
+                              d['acc_mean'] + d['acc_std'], color=s['color'], alpha=0.1)
 
-    _set_title(ax2, f"Accuracy vs Estimated Time ({BANDWIDTH_MBPS} Mbps Network)")
+    _set_title(ax2, f"Weighted Client Auxiliary Accuracy vs Estimated Time ({BANDWIDTH_MBPS} Mbps Network)" if has_weighted_data else f"Accuracy vs Estimated Time ({BANDWIDTH_MBPS} Mbps Network)")
     ax2.set_xlabel(f"Accumulated Estimated Time (s)")
-    ax2.set_ylabel("Accuracy (%)")
-    ax2.legend()
+    ax2.set_ylabel("Weighted Client Accuracy (%)" if has_weighted_data else "Accuracy (%)")
+    if has_weighted_data:
+        ax2.set_ylim(bottom=0, top=100)
+        ax2.legend(loc='lower right')
+    else:
+        ax2.legend()
     ax2.grid(True, ls='--', alpha=0.4)
     fig2.tight_layout()
     _save_and_close(fig2, output_dir, "13b_acuracia_vs_tempo_simulado.pdf")
@@ -1197,7 +1243,15 @@ def plot_14_resumo_comparativo(experiments, output_dir):
     final_acc = [e['server']['acc_mean'][-1] for e in experiments]
     final_loss = [e['server']['loss_mean'][-1] for e in experiments]
     avg_time = [np.mean(e['server']['time_mean']) for e in experiments]
-    total_mb = [e['server']['mb_mean'][-1] for e in experiments]
+    total_mb = []
+    for e in experiments:
+        d = e['server']
+        res = _compute_mb_per_round(d)
+        if res is not None:
+            _, mb_acc, _ = res
+            total_mb.append(mb_acc[-1])
+        else:
+            total_mb.append(d['mb_mean'][-1])
 
     x = np.arange(len(labels))
     width = 0.6
@@ -1290,24 +1344,25 @@ def plot_15_mb_vs_tempo(experiments, output_dir):
 # ==============================================================================
 DATASET_EXPERIMENTS = {
     "OxfordPets": [
-        "OxfordPets__LoRA_Padrao_paca12",
-        "OxfordPets__SoRA_Estatico_paca12",
-        ("fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "OxfordPets__PUMA-GT_Plus_Cientifico_083", "OxfordPets__PUMA-GT_Plus_Cientifico"),
+        ("fl_lora_slm_OxfordPets_slm_lora_prune1_ala1_paca28", "OxfordPets__LoRA_Padrao_paca12"),
+        ("fl_sora_slm_OxfordPets_slm_sora_with_schedule_prune1_ala1_paca28", "OxfordPets__SoRA_Estatico_paca12"),
+        ("fl_pumagt_plus_slm_OxfordPets_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "OxfordPets__PUMA-GT_Plus_Cientifico_083"),
+        "fl_pumagt_plus_slm_OxfordPets_ONLYPACA_norank",
     ],
     "Flowers102": [
-        "Flowers102__LoRA_Padrao_paca12",
-        "Flowers102__SoRA_Estatico_paca12",
-        ("Flowers102__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
+        ("fl_lora_slm_Flowers102_slm_lora_prune1_ala1_paca28", "Flowers102__LoRA_Padrao_paca12"),
+        ("fl_sora_slm_Flowers102_slm_sora_with_schedule_prune1_ala1_paca28", "Flowers102__SoRA_Estatico_paca12"),
+        ("fl_pumagt_plus_slm_Flowers102_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "Flowers102__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
     ],
     "DTD": [
-        "DTD__LoRA_Padrao_paca12",
-        "DTD__SoRA_Estatico_paca12",
-        ("DTD__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
+        ("fl_lora_slm_DTD_slm_lora_prune1_ala1_paca28", "DTD__LoRA_Padrao_paca12"),
+        ("fl_sora_slm_DTD_slm_sora_with_schedule_prune1_ala1_paca28", "DTD__SoRA_Estatico_paca12"),
+        ("fl_pumagt_plus_slm_DTD_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "DTD__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
     ],
     "FGVCAircraft": [
-        "FGVCAircraft__LoRA_Padrao_paca12",
-        "FGVCAircraft__SoRA_Estatico_paca12",
-        ("FGVCAircraft__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
+        ("fl_lora_slm_FGVCAircraft_slm_lora_prune1_ala1_paca28", "FGVCAircraft__LoRA_Padrao_paca12"),
+        ("fl_sora_slm_FGVCAircraft_slm_sora_with_schedule_prune1_ala1_paca28", "FGVCAircraft__SoRA_Estatico_paca12"),
+        ("fl_pumagt_plus_slm_FGVCAircraft_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "FGVCAircraft__PUMA-GT_Plus_Desacoplado", "fl_pumagt_plus_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank"),
     ],
 }
 
@@ -1351,18 +1406,23 @@ def main():
         print("\n❌ Nenhum experimento válido encontrado.")
         sys.exit(1)
 
+    # Auto-detecta dataset_name a partir dos experimentos se não foi passado via CLI
+    if dataset_name is None and experiments:
+        dataset_name = experiments[0].get('dataset')
+
     # Diretórios de saída
+    is_legacy = any("resultados_legados" in e['results_dir'] or "results_legados" in e['results_dir'] for e in experiments)
+    if is_legacy:
+        graficos_base = os.path.join(DEFAULT_RESULTS_BASE, "legados", "resultados_legados_2")
+    else:
+        graficos_base = os.path.join(DEFAULT_RESULTS_BASE, "graficos")
+
     if len(experiments) == 1:
         output_dirs = [os.path.join(experiments[0]['results_dir'], "graficos")]
-    elif dataset_name == "OxfordPets":
-        output_dirs = [
-            os.path.join(DEFAULT_RESULTS_BASE, "graficos_comparativos_OxfordPets"),
-            os.path.join(DEFAULT_RESULTS_BASE, "graficos_comparativos"),
-        ]
     elif dataset_name:
-        output_dirs = [os.path.join(DEFAULT_RESULTS_BASE, f"graficos_comparativos_{dataset_name}")]
+        output_dirs = [os.path.join(graficos_base, dataset_name)]
     else:
-        output_dirs = [os.path.join(DEFAULT_RESULTS_BASE, "graficos_comparativos")]
+        output_dirs = [os.path.join(graficos_base, "comparativos")]
 
     for output_dir in output_dirs:
         os.makedirs(output_dir, exist_ok=True)
