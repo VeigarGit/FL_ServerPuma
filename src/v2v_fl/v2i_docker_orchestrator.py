@@ -485,6 +485,10 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     """Loop principal do orquestrador V2I."""
     if args.total_clients < 2:
         raise ValueError("--total-clients deve ser pelo menos 2 para encontros V2I.")
+    min_clients = getattr(args, "min_clients", 2)
+    if type(min_clients) is not int or not 2 <= min_clients <= args.total_clients:
+        raise ValueError("--min-clients deve ser um inteiro entre 2 e --total-clients.")
+    args.min_clients = min_clients
     exchange_timeout = getattr(args, "exchange_timeout", DEFAULT_EXCHANGE_TIMEOUT)
     evaluation_timeout = getattr(args, "evaluation_timeout", DEFAULT_EVALUATION_TIMEOUT)
 
@@ -532,6 +536,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     log.info("  Total Clientes    : %d", args.total_clients)
     log.info("  RSUs              : %d", len(rsus))
     log.info("  Max Encontros     : %d", args.encounters)
+    log.info("  Min Clientes/RSU  : %d", min_clients)
     log.info("  Min Tempo Contato : %.0f s (ETC)", args.min_contact_time)
     log.info("  Warmup            : %d s", args.warmup)
     log.info("  Cooldown (por RSU): %d s", args.cooldown)
@@ -671,7 +676,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         viable.append((v, dist, etc))
 
                 c_indices = sorted({veh_to_client_idx[v.veh_id] for v, _, _ in viable})
-                if len(c_indices) < 2:
+                if len(c_indices) < min_clients:
                     rejected_count += 1
                     prev_clients_per_rsu.pop(rsu_id, None)
                     continue
@@ -872,7 +877,11 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         log.info("ESTATÍSTICAS DA SIMULAÇÃO V2I")
         log.info("=" * 60)
         log.info("  Encontros V2I viáveis  : %d", encounter_count)
-        log.info("  Encontros rejeitados   : %d (menos de 2 veículos elegíveis)", rejected_count)
+        log.info(
+            "  Encontros rejeitados   : %d (menos de %d veículos elegíveis)",
+            rejected_count,
+            min_clients,
+        )
         log.info("  Total de steps SUMO    : %d", step)
         for rsu in rsus:
             rsu_id = rsu["id"]
@@ -932,6 +941,12 @@ def main():
         type=int,
         default=6,
         help="Número máximo de encontros V2I viáveis (default: 6)",
+    )
+    parser.add_argument(
+        "--min-clients",
+        type=int,
+        default=2,
+        help="Mínimo de veículos viáveis por encontro na mesma RSU (default: 2)",
     )
     parser.add_argument(
         "--min-contact-time",

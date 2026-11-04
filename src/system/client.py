@@ -558,6 +558,7 @@ def save_results(
                 "evaluation_time",
                 "accuracy_before",
                 "accuracy_after",
+                "majority_class_baseline",
                 "test_samples",
                 "epoch",
                 "mean_distance",
@@ -806,6 +807,11 @@ def main():
         is_slm_flag = (args.model == 'slm')
         train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None, dataset_dir=args.dataset_dir)
         test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None, dataset_dir=args.dataset_dir)
+        test_majority_baseline = None
+        if hasattr(test_loader.dataset, "tensors"):
+            labels = test_loader.dataset.tensors[1]
+            counts = torch.unique(labels, return_counts=True)[1]
+            test_majority_baseline = 100.0 * counts.max().item() / len(labels)
         logger.info(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
     except Exception as e:
         logger.exception("Error loading data")
@@ -1155,6 +1161,7 @@ def main():
                 if rs_local_acc and not args.skip_post_eval
                 else None,
                 "accuracy_after": None,
+                "majority_class_baseline": test_majority_baseline,
                 "test_samples": len(test_loader.dataset),
                 "train_samples": len(train_loader.dataset),
                 "evaluation_skipped": args.skip_post_eval,
