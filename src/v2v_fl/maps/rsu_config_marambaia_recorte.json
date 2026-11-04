@@ -1,0 +1,35 @@
+{
+  "map_file": "marambaia_recorte.net.xml",
+  "seed": 36,
+  "n_rsus": 4,
+  "rsus": [
+    {
+      "id": "rsu_0",
+      "x": 3236.11,
+      "y": 2242.02,
+      "radius": 300.0,
+      "n_antennas": 16
+    },
+    {
+      "id": "rsu_1",
+      "x": 3753.48,
+      "y": 2270.34,
+      "radius": 300.0,
+      "n_antennas": 16
+    },
+    {
+      "id": "rsu_2",
+      "x": 3249.03,
+      "y": 2794.58,
+      "radius": 300.0,
+      "n_antennas": 16
+    },
+    {
+      "id": "rsu_3",
+      "x": 3743.69,
+      "y": 2753.0,
+      "radius": 300.0,
+      "n_antennas": 16
+    }
+  ]
+}

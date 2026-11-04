@@ -64,3 +64,8 @@ docker-tc/
 !/src/v2v_fl/maps/marambaia.net.xml
 !/src/v2v_fl/maps/marambaia.rou.xml
 !/src/v2v_fl/maps/marambaia.sumocfg
+
+# Recorte da Marambaia para comparação alpha 0,1 / 1,0
+!/src/v2v_fl/maps/marambaia_recorte.net.xml
+!/src/v2v_fl/maps/marambaia_recorte.rou.xml
+!/src/v2v_fl/maps/marambaia_recorte.sumocfg
