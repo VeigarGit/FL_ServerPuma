@@ -50,10 +50,12 @@ from model import SimpleModel
 from utils.network_utils import (  # noqa: E402
     V2IProtocolError,
     make_v2i_message,
+    make_v2v_message,
     recv_data,
     recv_v2i_message,
     send_data,
     send_v2i_message,
+    validate_v2v_message,
 )
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
 from utils.fl_math import resize_model_to_pruned
@@ -69,7 +71,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------
 
 
-def send_p2p_model(host: str, payload: tuple, *, deadline: float, cancelled=None) -> int:
+def send_p2p_model(host: str, payload: dict, *, deadline: float, cancelled=None) -> int:
     """Conecta com tentativas curtas e envia o modelo até o prazo do encontro.
 
     O limite de conexão não limita o envio de todos os pesos. O transporte
@@ -97,7 +99,7 @@ def send_p2p_model(host: str, payload: tuple, *, deadline: float, cancelled=None
 
 
 def exchange_v2i_model(
-    model, encounter: dict, client_id: int, *, cancelled=None, metrics=None
+    model, encounter: dict, client_id: int, *, train_samples: int, cancelled=None, metrics=None
 ) -> dict:
     """Troca uma CNN por TCP e confirma APPLIED somente após carregar o resultado.
 
@@ -129,7 +131,9 @@ def exchange_v2i_model(
     metrics = metrics if metrics is not None else {}
     deadline = started + timeout
     snapshot = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
-    upload = make_v2i_message("UPLOAD", **context, weights=snapshot)
+    upload = make_v2i_message(
+        "UPLOAD", **context, weights=snapshot, train_samples=train_samples
+    )
     load_started = False
 
     def remaining() -> float:
@@ -1015,11 +1019,12 @@ def main():
                             cancelled=lambda: (encounters_dir / ".simulation_done").exists(),
                         )
                         if data is not None:
-                            sender_id, enc_id, state = data
+                            validate_v2v_message(data)
+                            sender_id, enc_id = data["client_id"], data["encounter_id"]
                             with in_memory_lock:
                                 if enc_id not in in_memory_weights:
                                     in_memory_weights[enc_id] = {}
-                                in_memory_weights[enc_id][sender_id] = state
+                                in_memory_weights[enc_id][sender_id] = data
                                 in_memory_bytes.setdefault(enc_id, {})[sender_id] = (
                                     in_memory_bytes.get(enc_id, {}).get(sender_id, 0) + received_bytes
                                 )
@@ -1148,6 +1153,7 @@ def main():
                 else None,
                 "accuracy_after": None,
                 "test_samples": len(test_loader.dataset),
+                "train_samples": len(train_loader.dataset),
                 "evaluation_skipped": args.skip_post_eval,
                 "error": None,
             }
@@ -1179,6 +1185,7 @@ def main():
                         model,
                         encounter_data,
                         args.client_idx,
+                        train_samples=len(train_loader.dataset),
                         cancelled=lambda: (encounters_dir / ".simulation_done").exists(),
                         metrics=metrics,
                     )
@@ -1313,7 +1320,12 @@ def main():
                 if not is_aggregator:
                     target_host = f"fl-client-v2v-{aggregator_id}"
                     snapshot_bytes = send_p2p_model(
-                        target_host, (args.client_idx, enc_id, snapshot),
+                        target_host,
+                        make_v2v_message(
+                            "UPLOAD", run_id=encounter_data["run_id"],
+                            client_id=args.client_idx, encounter_id=enc_id,
+                            weights=snapshot, train_samples=len(train_loader.dataset),
+                        ),
                         deadline=exchange_deadline, cancelled=cancelled,
                     )
                     metrics["upload_bytes"] += snapshot_bytes
@@ -1337,7 +1349,12 @@ def main():
                                 enc_id in in_memory_weights
                                 and aggregator_id in in_memory_weights[enc_id]
                             ):
-                                received_states.append(in_memory_weights[enc_id][aggregator_id])
+                                response = validate_v2v_message(
+                                    in_memory_weights[enc_id][aggregator_id], type="RESULT",
+                                    run_id=encounter_data["run_id"], encounter_id=enc_id,
+                                    client_id=aggregator_id,
+                                )
+                                received_states.append(response)
                                 break
                         time.sleep(1)
 
@@ -1359,7 +1376,12 @@ def main():
                                 ]
                                 if not missing:
                                     for c in other_clients:
-                                        received_states.append(in_memory_weights[enc_id][c])
+                                        upload = validate_v2v_message(
+                                            in_memory_weights[enc_id][c], type="UPLOAD",
+                                            run_id=encounter_data["run_id"], encounter_id=enc_id,
+                                            client_id=c,
+                                        )
+                                        received_states.append(upload)
                                     break
                         time.sleep(1)
 
@@ -1379,89 +1401,36 @@ def main():
                             f"Client {args.client_idx}: Todos os pesos recebidos! Iniciando agregação OTA..."
                         )
 
-                        from v2v_fl.over_the_air.ota_channel import (
-                            distances_from_positions,
-                            build_channel_matrices,
-                            compute_noise_variance,
-                        )
                         from v2v_fl.over_the_air.ota_aggregation import (
-                            compute_weight_variance,
-                            mmse_beamforming,
-                            apply_ota_channel,
+                            ota_aggregate,
                         )
 
                         aggregation_started = time.monotonic()
                         try:
-                            # Passo 3a: Montar o dicionário {client_id: state_dict} dos transmissores
-                            tx_state_dicts = {}
-                            for i, c in enumerate(other_clients):
-                                tx_state_dicts[c] = received_states[i]
-
-                            # Passo 3b: Calcular distâncias geográficas (SUMO) entre cada
-                            # transmissor e o aggregator (eu)
-                            transmitter_ids, distances = distances_from_positions(
-                                positions, aggregator_id
+                            participant_states = {
+                                upload["client_id"]: upload["weights"]
+                                for upload in received_states
+                            }
+                            participant_states[args.client_idx] = snapshot
+                            train_samples = {
+                                upload["client_id"]: upload["train_samples"]
+                                for upload in received_states
+                            }
+                            train_samples[args.client_idx] = len(train_loader.dataset)
+                            diagnostics = {}
+                            snapshot = ota_aggregate(
+                                participant_states,
+                                positions,
+                                {
+                                    "x": positions[aggregator_id][0],
+                                    "y": positions[aggregator_id][1],
+                                    "n_antennas": 8,
+                                },
+                                train_samples=train_samples,
+                                local_client_id=aggregator_id,
+                                diagnostics=diagnostics,
                             )
-                            logger.info(
-                                f"Client {args.client_idx}: Distâncias aos transmissores: "
-                                f"{dict(zip(transmitter_ids, distances.tolist(), strict=True))}"
-                            )
-
-                            # Passo 3c: n_samples uniforme (FedAvg sem ponderação por dataset)
-                            n_tx = len(transmitter_ids)
-                            n_samples = np.ones(n_tx, dtype=np.float64)
-
-                            # Passo 3d: Construir as matrizes de canal (Path Loss + Rayleigh Fading)
-                            # n_antennas = 8 é o padrão do paper de referência
-                            N_ANTENNAS = 8
-                            EPSILON = 0.1  # Erro de estimação do canal (10%)
-                            H_est, H_true, H_scaled, path_loss = build_channel_matrices(
-                                distances,
-                                N_ANTENNAS,
-                                n_samples,
-                                epsilon=EPSILON,
-                            )
-
-                            # Passo 3e: Calcular a variância dos pesos de cada transmissor
-                            # (usado para normalizar os pesos antes da transmissão)
-                            variances, model_size = compute_weight_variance(tx_state_dicts)
-                            weight_vars = np.array([variances[tid] for tid in transmitter_ids])
-
-                            # Passo 3f: Calcular o beamforming MMSE (vetor de recepção f' e
-                            # escalares de transmissão b_k)
-                            f_prime, transmit_scalars = mmse_beamforming(
-                                H_est, weight_vars, n_samples
-                            )
-
-                            # Passo 3g: Calcular a variância do ruído térmico do receptor
-                            noise_var = compute_noise_variance(bandwidth_hz=100e3)
-
-                            # Passo 3h: Simular a transmissão Over-the-Air!
-                            # Esta função aplica: normalização → pré-codificação → canal → ruído
-                            # O resultado é a média ponderada degradada pelo canal de rádio
-                            ota_aggregated = apply_ota_channel(
-                                state_dicts=tx_state_dicts,
-                                transmitter_ids=transmitter_ids,
-                                n_samples=n_samples,
-                                H_true=H_true,
-                                transmit_scalars=transmit_scalars,
-                                f_prime=f_prime,
-                                noise_variance=noise_var,
-                                weight_variances=weight_vars,
-                            )
-                            logger.info(
-                                f"Client {args.client_idx}: Agregação OTA concluída com sucesso!"
-                            )
-
-                            # Passo 3i: FedAvg ponderado
-                            # n_tx já está definido no Passo 3c como len(transmitter_ids)
-                            for k in snapshot:
-                                ota_val = ota_aggregated[k].float()
-                                local_val = snapshot[k].float()
-                                # Média ponderada: (1 parte local + n_tx partes do OTA) / total de nós
-                                snapshot[k] = ((local_val + (n_tx * ota_val)) / (n_tx + 1)).to(
-                                    snapshot[k].dtype
-                                )
+                            metrics["ota_diagnostics"] = diagnostics
 
                         finally:
                             metrics["aggregation_time"] = time.monotonic() - aggregation_started
@@ -1487,7 +1456,7 @@ def main():
                         )
                         # O Transmissor recebe o modelo já agregado (OTA + local do Aggregator)
                         # e simplesmente o carrega como seu novo modelo local
-                        aggregated_state = received_states[0]
+                        aggregated_state = received_states[0]["weights"]
 
                         if args.model in ["clip", "slm"]:
                             for k in snapshot:
@@ -1513,7 +1482,12 @@ def main():
                         for c in other_clients:
                             target_host = f"fl-client-v2v-{c}"
                             snapshot_bytes = send_p2p_model(
-                                target_host, (args.client_idx, enc_id, snapshot),
+                                target_host,
+                                make_v2v_message(
+                                    "RESULT", run_id=encounter_data["run_id"],
+                                    client_id=args.client_idx, encounter_id=enc_id,
+                                    weights=snapshot,
+                                ),
                                 deadline=exchange_deadline, cancelled=cancelled,
                             )
                             metrics["sent_download_bytes"] += snapshot_bytes

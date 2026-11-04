@@ -57,6 +57,16 @@ def prepare_run(project_root: Path, mode: str, args) -> tuple[str, Path, Path]:
                 "evaluation_time": "Maximum client elapsed seconds evaluating the applied model.",
                 "accuracy": "Percent accuracy on each client's test partition; mean and "
                 "sample-weighted mean cover only completed evaluations.",
+                "aggregation": "FedAvg weighted by len(train_loader.dataset), including the "
+                "local V2V coordinator. OTA uses q_i=M*n_i/sum(n) over all M participants; "
+                "final receiver noise std is sqrt(noise_variance)*norm(f)/M.",
+                "ota_diagnostics": "Coordinator/RSU compares the delivered OTA model with the "
+                "ideal weighted mean of the same inputs. relative_l2_error="
+                "norm(OTA-ideal)/norm(ideal), concatenating all state_dict tensors in float64; "
+                "null if norm(ideal)=0 (see error_l2_norm). Transmitter gains use H@conj(f); "
+                "effective_model_weight=Re(b*true_gain)/sqrt(weight_variance)/M. "
+                "noise_std describes the final delivered model, ota_noise_std the TX mean "
+                "before the local V2V contribution. Ideal weights are diagnostic only.",
             },
         },
         directory / "run.json",
@@ -149,6 +159,7 @@ def summarize_encounter_metrics(
         "aggregation_time": aggregation_time,
         "communication_wait_time": max(0.0, protocol_time - aggregation_time),
         "evaluation_time": max((r.get("evaluation_time", 0.0) for r in records), default=0.0),
+        "ota_diagnostics": source.get("ota_diagnostics"),
         "client_metrics": records,
     }
 

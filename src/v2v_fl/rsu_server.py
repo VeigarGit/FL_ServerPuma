@@ -96,6 +96,8 @@ class Encounter:
     bandwidth_hz: float
     started: float = field(default_factory=time.monotonic)
     weights: dict[int, dict] = field(default_factory=dict)
+    train_samples: dict[int, int] = field(default_factory=dict)
+    ota_diagnostics: dict | None = None
     received: set[int] = field(default_factory=set)
     applied: set[int] = field(default_factory=set)
     result: dict | None = None
@@ -273,6 +275,7 @@ class RSUServer(socketserver.ThreadingTCPServer):
             "control_upload_bytes": encounter.control_upload_bytes,
             "control_download_bytes": encounter.control_download_bytes,
             "aggregation_time": encounter.aggregation_time,
+            "ota_diagnostics": encounter.ota_diagnostics,
             "exchange_time": round(encounter.finished - encounter.started, 6),
         }
         self._write_status(encounter.encounter_id, data)
@@ -299,11 +302,14 @@ class RSUServer(socketserver.ThreadingTCPServer):
                 self._check_encounter(encounter)
                 encounter.phase = "aggregating"
             aggregation_started = time.monotonic()
+            diagnostics = {}
             try:
                 result = ota_aggregate(
                     encounter.weights,
                     encounter.positions,
                     self.rsus[encounter.rsu_id],
+                    train_samples=encounter.train_samples,
+                    diagnostics=diagnostics,
                     epsilon=encounter.epsilon,
                     bandwidth_hz=encounter.bandwidth_hz,
                 )
@@ -312,6 +318,7 @@ class RSUServer(socketserver.ThreadingTCPServer):
             with self.condition:
                 # O cálculo em CPU pode terminar após o prazo ou após stop().
                 self._check_encounter(encounter)
+                encounter.ota_diagnostics = diagnostics
                 encounter.weights.clear()
                 encounter.result = result
                 result = None
@@ -401,6 +408,7 @@ class RSUServer(socketserver.ThreadingTCPServer):
                 ):
                     raise V2IProtocolError("Pesos incompatíveis com os outros participantes.")
             encounter.weights[client_id] = state
+            encounter.train_samples[client_id] = message["train_samples"]
             encounter.connections[client_id] = connection
             encounter.received.add(client_id)
             encounter.upload_bytes += received_bytes
