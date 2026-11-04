@@ -1,4 +1,5 @@
 import json
+import hashlib
 import math
 import os
 import tempfile
@@ -24,11 +25,45 @@ def write_json_atomic(data: dict, path: Path) -> None:
             os.unlink(temporary)
 
 
+def dataset_manifest(project_root: Path, args) -> dict | None:
+    """Identifica as partições realmente selecionadas, antes de criar a execução."""
+    selected = getattr(args, "dataset_dir", None)
+    dataset = getattr(args, "dataset", None)
+    if selected is None and dataset is None:
+        return None
+    root = (project_root / "src/dataset").resolve()
+    directory = Path(selected) if selected is not None else root / dataset
+    if not directory.is_absolute():
+        directory = project_root / directory
+    directory = directory.resolve()
+    if selected is None and not (directory / "config.json").exists():
+        return None
+    relative = directory.relative_to(root)
+    config = json.loads((directory / "config.json").read_text())
+    if getattr(args, "total_clients", 0) > config["num_clients"]:
+        raise ValueError("Dataset possui menos partições que --total-clients.")
+    files = [directory / "config.json"] + [
+        directory / split / f"{client_id}.npz"
+        for split in ("train", "test")
+        for client_id in range(args.total_clients)
+    ]
+    hashes = {}
+    for path in files:
+        with path.open("rb") as stream:
+            hashes[path.relative_to(directory).as_posix()] = hashlib.file_digest(
+                stream, "sha256"
+            ).hexdigest()
+    if selected is not None:
+        args.dataset_dir = directory
+    return {"directory": f"src/dataset/{relative.as_posix()}", "config": config, "sha256": hashes}
+
+
 def prepare_run(project_root: Path, mode: str, args) -> tuple[str, Path, Path]:
     """Isola resultados e sinais por execução; um ID existente nunca é sobrescrito."""
     run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
     if not isinstance(run_id, str) or run_id in {".", ".."} or Path(run_id).name != run_id:
         raise ValueError("run_id deve ser um nome de diretório simples.")
+    dataset_info = dataset_manifest(project_root, args)
     directory = project_root / "src/results/runs" / mode / run_id
     directory.mkdir(parents=True, exist_ok=False)
     encounters_dir = directory / "encounters"
@@ -43,6 +78,7 @@ def prepare_run(project_root: Path, mode: str, args) -> tuple[str, Path, Path]:
             "run_id": run_id,
             "mode": mode,
             "parameters": {**parameters, "seed": getattr(args, "seed", 42)},
+            "dataset": dataset_info,
             "metric_definitions": {
                 "bytes": "Completed application frames including pickle envelope and "
                 "4-byte header; "

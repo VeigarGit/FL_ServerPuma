@@ -10,6 +10,7 @@ __pycache__/
 # Datasets e Dados Brutos
 # =========================
 src/dataset/Cifar10/
+src/dataset/Cifar10_alpha1/rawdata
 src/dataset/Cifar100/
 src/dataset/MNIST/
 src/dataset/OxfordPets/

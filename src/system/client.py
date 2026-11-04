@@ -381,8 +381,8 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
 import torchvision.transforms as T
 from PIL import Image
 
-def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip=False, is_slm=False, slm_config=None):
-    train_data = read_client_data(dataset, client_idx, is_train)
+def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip=False, is_slm=False, slm_config=None, dataset_dir=None):
+    train_data = read_client_data(dataset, client_idx, is_train, dataset_dir=dataset_dir)
     X, y = zip(*train_data)
     X = torch.stack(X)
     
@@ -529,6 +529,8 @@ def save_results(
         hf.attrs["paca_used"] = paca_val
         hf.attrs["execution_id"] = getattr(args, "execution_id", "")
         hf.attrs["seed"] = getattr(args, "seed", 42)
+        if getattr(args, "dataset_dir", None) is not None:
+            hf.attrs["dataset_dir"] = str(args.dataset_dir)
         if getattr(args, "initial_model_sha256", None) is not None:
             hf.attrs["initial_model_sha256"] = args.initial_model_sha256
             hf.attrs["initialization_seed"] = args.seed
@@ -602,6 +604,7 @@ def parse_args():
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar100')
+    parser.add_argument('--dataset-dir', type=Path, help='Diretório com config.json, train/ e test/; mantém o nome lógico do dataset')
     parser.add_argument('--client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
     parser.add_argument('--num-classes', type=int, default=100)
@@ -801,8 +804,8 @@ def main():
     try:
         is_clip_flag = (args.model == 'clip')
         is_slm_flag = (args.model == 'slm')
-        train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None)
-        test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None)
+        train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None, dataset_dir=args.dataset_dir)
+        test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None, dataset_dir=args.dataset_dir)
         logger.info(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
     except Exception as e:
         logger.exception("Error loading data")

@@ -543,6 +543,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         results_dir=run_dir / "clients",
         encounters_dir=encounters_dir,
         seed=getattr(args, "seed", 42),
+        dataset_dir=getattr(args, "dataset_dir", None),
     )
 
     # Contadores e estado da simulacao
@@ -1003,6 +1004,7 @@ def main():
     )
 
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataset-dir", type=Path, help="Diretório das partições dentro de src/dataset")
     parser.add_argument("--run-id", help="ID da execução; padrão: UUID")
     parser.add_argument("--exchange-timeout", type=float, default=600.0)
     args = parser.parse_args()

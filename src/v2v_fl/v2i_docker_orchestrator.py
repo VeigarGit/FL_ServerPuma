@@ -570,6 +570,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         results_dir=run_dir / "clients",
         encounters_dir=encounters_dir,
         seed=getattr(args, "seed", 42),
+        dataset_dir=getattr(args, "dataset_dir", None),
         run_id=run_id,
         rsu_config=rsu_config_path,
         exchange_timeout=exchange_timeout,
@@ -1042,6 +1043,7 @@ def main():
     parser.add_argument("--paca", type=int, default=12, help="Número de camadas upper para PaCA")
 
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataset-dir", type=Path, help="Diretório das partições dentro de src/dataset")
     args = parser.parse_args()
     if not 0 <= args.ota_epsilon < 1:
         parser.error("--ota-epsilon deve estar no intervalo [0, 1).")
