@@ -291,9 +291,13 @@ def wait_all_clients_epoch_done(
 
 def docker_compose_up(compose_file: Path, project_root: Path, build: bool = False) -> bool:
     """Inicia os veículos após o healthcheck TCP do rsu-service."""
-    cmd = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file), "up", "-d"]
+    prefix = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file)]
     if build:
-        cmd.insert(-1, "--build")
+        result = subprocess.run(prefix + ["build", "client-v2i-0"], cwd=str(project_root))
+        if result.returncode != 0:
+            log.error("Reconstrução da imagem compartilhada falhou (exit code %d)", result.returncode)
+            return False
+    cmd = prefix + ["up", "-d"] + (["--no-build"] if build else [])
     log.info("Iniciando containers Docker...")
 
     result = subprocess.run(cmd, cwd=str(project_root))

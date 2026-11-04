@@ -409,17 +409,19 @@ def docker_compose_up(compose_file: Path, project_root: Path, build: bool = Fals
     Args:
         compose_file: Caminho para o docker-compose.v2v.yml
         project_root: Raiz do projeto (FL_ServerPuma/)
-        build: Se True, forca o rebuild das imagens (adiciona --build)
+        build: Se True, reconstrói a imagem compartilhada pelo primeiro serviço.
 
     Returns:
         True se o comando foi bem sucedido, False caso contrario
     """
-    cmd = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file), "up", "-d"]
+    prefix = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file)]
     if build:
-        cmd.insert(-1, "--build")
-        log.info("Iniciando conteineres Docker...")
-    else:
-        log.info("Iniciando conteineres Docker...")
+        result = subprocess.run(prefix + ["build", "client-v2v-0"], cwd=str(project_root))
+        if result.returncode != 0:
+            log.error("Reconstrução da imagem compartilhada falhou (exit code %d)", result.returncode)
+            return False
+    cmd = prefix + ["up", "-d"] + (["--no-build"] if build else [])
+    log.info("Iniciando conteineres Docker...")
 
     result = subprocess.run(
         cmd,
