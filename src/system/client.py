@@ -30,7 +30,9 @@ from lora_clip.clip_setup import (
 
 from lora_clip.clip_setup import build_optimizer
 from lora_clip.sora import get_trainable_state_dict
-
+from lora_slm.qlora import (
+    is_qlora_enabled, enable_qlora_in_config, get_qlora_state_dict, set_qlora_state_dict
+)
 # --- HACK PERMITIDO: Inserindo a pasta 'src' no path do Python ---
 # Nota: Esta é uma mitigação aceita enquanto o projeto não for
 # completamente empacotado como biblioteca via pyproject.toml
@@ -269,6 +271,9 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
             personalized_acc, _ = evaluate_model(model, test_loader)
             logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
             del global_model
+        elif is_qlora_enabled(run_config):
+            # QLoRA: injeta apenas os adaptadores LoRA + head (set_peft_model_state_dict)
+            set_qlora_state_dict(model, state_dict)
         else:
             resize_model_to_pruned(model, state_dict)
         
@@ -363,6 +368,9 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
     
     # --- 2. SELEÇÃO DOS PESOS QUE SERÃO ENVIADOS PARA O SERVIDOR ---
     if model_type in ['clip', 'slm']:
+        if is_qlora_enabled(run_config):
+            # QLoRA: envia SOMENTE os adaptadores LoRA 16 bits + head (nunca o backbone 4-bit)
+            return get_qlora_state_dict(model), personalized_acc
         if model_type == 'clip':
             from lora_clip.sora import get_trainable_state_dict
         else:
@@ -635,6 +643,9 @@ def parse_args():
     parser.add_argument('--skip-post-eval', action='store_true', help='Pula todas as avaliações pós-treino no cliente (local_test_acc e train_acc) para máxima velocidade, mantendo apenas Global Model Test Acc')
     parser.add_argument('--skip-train-eval', action='store_true', help='Pula apenas a avaliação demorada no conjunto de treino pós-treino')
     
+    # --- QLoRA (backbone 4-bit NF4 + adaptadores LoRA 16 bits) ---
+    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA (apenas --model slm --strategy lora, modo centralizado)')
+    
     return parser.parse_args()
 
 def main():
@@ -719,6 +730,13 @@ def main():
             elif args.strategy == 'sora_no_schedule':
                 config["model"]["lora"]["mode"] = "with_sora_no_schedule"
 
+            if args.qlora:
+                if args.model != 'slm' or args.mode != 'centralized':
+                    logger.error("--qlora é suportado apenas com --model slm no modo centralizado.")
+                    sys.exit(1)
+                enable_qlora_in_config(config, args.strategy)
+                logger.info("QLoRA ATIVADO: backbone 4-bit NF4 + DoubleQuant, adaptadores LoRA 16 bits.")
+
                 
             if "paca" not in config["model"]:
                 config["model"]["paca"] = {}
@@ -745,7 +763,8 @@ def main():
                 run_config = build_run_config_slm(config, run_mode=run_mode)
                 model = build_model_slm(config=run_config, num_classes=args.num_classes, device=device)
             
-    model = model.to(device)
+    if not args.qlora:  # QLoRA: backbone 4-bit já alocado via device_map
+        model = model.to(device)
     loss = nn.CrossEntropyLoss()
     rs_global_acc = []
     rs_global_loss = []
@@ -842,7 +861,11 @@ def main():
                 if round_num + 1 >= 2:
                     if args.model in ['clip', 'slm']:
                         old_local_weights = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
-                    local = resize_model_to_pruned(model, global_state)
+                    if args.qlora:
+                        set_qlora_state_dict(model, global_state)
+                        local = model
+                    else:
+                        local = resize_model_to_pruned(model, global_state)
                     test_accuracy, test_loss = evaluate_model(local, test_loader)
                     if args.model in ['clip', 'slm']:
                         for n, p in model.named_parameters():
@@ -900,7 +923,7 @@ def main():
                 else:
                     if args.delta_coding:
                         previous_sent_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
-                    else:
+                    elif not args.qlora:  # QLoRA: adaptadores trafegam em 16 bits (sem int8)
                         updated_state = quantization(updated_state)
                 client_quant_time = time.time() - quant_start
                 client_eval_time = client_pre_eval_time + client_post_eval_time

@@ -42,7 +42,7 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
     #print(f"\n[DIAGNÓSTICO] Iniciando evaluate_model no device: {device}")
     
     with torch.no_grad():
-        model_dtype = next(model.parameters()).dtype
+        model_dtype = getattr(model, "compute_dtype", None) or next(model.parameters()).dtype
         for batch_idx, (x, y) in enumerate(data_loader):
             y = y.to(device)
             

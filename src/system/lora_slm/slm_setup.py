@@ -18,6 +18,11 @@ try:
 except ImportError:
     from lora_slm.sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
 
+try:
+    from qlora import is_qlora_enabled, load_quantized_backbone, apply_qlora, build_qlora_optimizer
+except ImportError:
+    from lora_slm.qlora import is_qlora_enabled, load_quantized_backbone, apply_qlora, build_qlora_optimizer
+
 DEFAULT_CONFIG_PATH = Path("train_config.yml")
 VALID_LORA_MODES = {
     "with_lora",
@@ -77,7 +82,8 @@ class SLMForClassification(nn.Module):
             pooled_output = last_hidden_state[:, -1, :]
             
         # Classificação Linear em cima do último token
-        logits = self.classifier(pooled_output)
+        # (cast no-op no fluxo bf16 padrão; necessário no QLoRA, onde a saída do backbone pode vir em fp32)
+        logits = self.classifier(pooled_output.to(self.classifier.weight.dtype))
 
         loss = None
         if labels is not None:
@@ -293,6 +299,9 @@ def update_paca_runtime(model, new_upper_k):
 def build_model(config, num_classes, device):
     model_config = config["model"]
     lora_config = model_config["lora"]
+
+    if is_qlora_enabled(config):
+        return _build_qlora_model(config, num_classes, device)
     
     model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     
@@ -331,7 +340,26 @@ def build_model(config, num_classes, device):
     return model
 
 
+def _build_qlora_model(config, num_classes, device):
+    """Backbone 4-bit NF4 congelado + adaptadores LoRA 16 bits (ver lora_slm/qlora.py)."""
+    model_config = config["model"]
+    qcfg = model_config["qlora"]
+    slm_base, compute_dtype = load_quantized_backbone(model_config["name"], qcfg, device)
+    model = SLMForClassification(slm_base, num_classes)
+    apply_qlora(model, model_config["lora"], qcfg, compute_dtype)
+
+    paca_config = model_config.get("paca", {})
+    upper_k = paca_config.get("upper_layers") if paca_config.get("enabled") else None
+    if upper_k is not None:
+        _apply_paca_gradient_boundary(model, upper_k)
+    # Sem model.to(device): o backbone 4-bit já foi alocado via device_map
+    return model
+
+
 def build_optimizer(model, config):
+    if is_qlora_enabled(config):
+        return build_qlora_optimizer(model, config), None
+
     optimizer_config = config["optimizer"]
     sora_config = config["model"].get("sora", {})
     mode = config["model"]["lora"]["mode"]
@@ -377,7 +405,7 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     total_sparse_loss = 0.0
     total_loss = 0.0
     device = next(model.parameters()).device
-    model_dtype = next(model.parameters()).dtype
+    model_dtype = getattr(model, "compute_dtype", None) or next(model.parameters()).dtype
 
     if sparse_optimizer is not None and hasattr(sparse_optimizer, 'step_lambda'):
         sparse_optimizer.step_lambda()
@@ -433,7 +461,7 @@ def evaluate(model, loader):
 
     with torch.no_grad():
         device = next(model.parameters()).device
-        model_dtype = next(model.parameters()).dtype
+        model_dtype = getattr(model, "compute_dtype", None) or next(model.parameters()).dtype
         
         for inputs_dict, labels in tqdm(loader, desc="eval", leave=False, disable=True):
             labels = labels.to(device=device, non_blocking=True)

@@ -45,6 +45,7 @@ dependencies = [
     "traci>=1.27.1",
     "sumolib>=1.27.1",
     "qwen-vl-utils[decord]>=0.0.14",
+    "bitsandbytes>=0.46",
 ]
 
 [tool.ruff]

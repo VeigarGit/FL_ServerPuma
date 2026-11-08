@@ -42,6 +42,7 @@ from lora_slm.slm_setup import (
     build_run_config as build_run_config_slm, build_model as build_model_slm
 )
 from lora_slm.sora import get_trainable_state_dict as get_trainable_state_dict_slm
+from lora_slm.qlora import enable_qlora_in_config, get_qlora_state_dict, set_qlora_state_dict
 
 
 # --- HACK PERMITIDO: Inserindo a pasta 'src' no path do Python ---
@@ -143,6 +144,12 @@ class FederatedLearningServer:
                 elif args.strategy == 'adalora':
                     print("Linha AdaLoRA =========================================")
                     config["model"]["lora"]["mode"] = "with_adalora"
+
+                if getattr(args, 'qlora', False):
+                    if args.model != 'slm':
+                        raise ValueError("--qlora é suportado apenas com --model slm")
+                    enable_qlora_in_config(config, args.strategy)
+                    logger.info("QLoRA ATIVADO: backbone 4-bit NF4 (não agregado), FedAvg só nos adaptadores LoRA 16 bits.")
                     
                 if "paca" not in config["model"]:
                     config["model"]["paca"] = {}
@@ -190,23 +197,31 @@ class FederatedLearningServer:
                         logger.warning(f"Não foi possível pré-carregar CustomCollator para SLM na inicialização: {e}")
                         
                         
+        self.qlora = getattr(args, 'qlora', False)
+
         if args.load_model:
             logger.info(f"Carregando pesos salvos de: {args.load_model}")
             state_dict = torch.load(args.load_model, map_location=args.device)
             
-            # 1. Redimensiona a arquitetura do modelo em memória para o tamanho podado
-            self.global_model = resize_model_to_pruned(self.global_model, state_dict)
-            
-            # 2. Agora os formatos coincidem, podemos carregar os pesos com segurança
-            self.global_model.load_state_dict(state_dict, strict=False)
-            self.global_state = self.global_model.state_dict()
+            if self.qlora:
+                # QLoRA: o checkpoint contém apenas adaptadores + head
+                set_qlora_state_dict(self.global_model, state_dict)
+            else:
+                # 1. Redimensiona a arquitetura do modelo em memória para o tamanho podado
+                self.global_model = resize_model_to_pruned(self.global_model, state_dict)
+                
+                # 2. Agora os formatos coincidem, podemos carregar os pesos com segurança
+                self.global_model.load_state_dict(state_dict, strict=False)
+                self.global_state = self.global_model.state_dict()
                 
 
-        self.global_model = self.global_model.to(args.device)
+        if not self.qlora:  # QLoRA: backbone 4-bit já alocado via device_map
+            self.global_model = self.global_model.to(args.device)
         self.rs_test_acc = []
         self.rs_test_loss = []
         self.rs_aux_simple_avg_acc = []  # Média simples das acurácias reportadas pelos clientes (usada pelo PaCA/Rank adaptativo)
-        self.global_state = self.global_model.state_dict()
+        # QLoRA: o estado agregável contém SOMENTE adaptadores LoRA + head (backbone 4-bit nunca é agregado)
+        self.global_state = get_qlora_state_dict(self.global_model, trainable_only=False) if self.qlora else self.global_model.state_dict()
         self.lock = threading.Lock()
         self.client_data = {}
         self.client_connections = []
@@ -277,6 +292,12 @@ class FederatedLearningServer:
         else:
             logger.warning("Could not load test data. Evaluation will be skipped.")
 
+    def _slm_trainable_state(self):
+        """Estado do SLM que trafega/é salvo. No QLoRA: apenas adaptadores LoRA 16 bits + head."""
+        if self.qlora:
+            return get_qlora_state_dict(self.global_model, trainable_only=False)
+        return get_trainable_state_dict_slm(self.global_model)
+
     def aggregate_models(self, model_list, global_model, client_weights=None):
         agg_state = global_model.copy()
         
@@ -311,13 +332,16 @@ class FederatedLearningServer:
                         weight = normalized_weights[idx]
                         
                         if weighted_sum is None:
-                            weighted_sum = torch.zeros_like(aligned_val)
+                            # Acumula em fp32 quando os tensores são 16 bits (ex.: adaptadores QLoRA bf16)
+                            out_dtype = aligned_val.dtype
+                            acc_dtype = torch.float32 if out_dtype in (torch.float16, torch.bfloat16) else out_dtype
+                            weighted_sum = torch.zeros_like(aligned_val, dtype=acc_dtype)
                         
-                        weighted_sum += aligned_val * weight
+                        weighted_sum += aligned_val.to(weighted_sum.dtype) * weight
                         total_weight_for_key += weight
             
             if weighted_sum is not None and total_weight_for_key > 0:
-                agg_state[key] = weighted_sum / total_weight_for_key
+                agg_state[key] = (weighted_sum / total_weight_for_key).to(out_dtype)
         
         return agg_state
     
@@ -885,7 +909,7 @@ class FederatedLearningServer:
                     if self.args.model == 'clip':
                         current_global_state = get_trainable_state_dict(self.global_model)
                     elif self.args.model == 'slm':
-                        current_global_state = get_trainable_state_dict_slm(self.global_model)
+                        current_global_state = self._slm_trainable_state()
                     else:
                         current_global_state = self.global_state.copy()
             
@@ -1015,7 +1039,7 @@ class FederatedLearningServer:
                 else:
                     if getattr(self.args, 'delta_coding', False):
                         self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in current_global_state.items()}
-                    if not getattr(self.args, 'delta_coding', False):
+                    if not getattr(self.args, 'delta_coding', False) and not self.qlora:  # QLoRA: envia em 16 bits
                         current_global_state = quantization(current_global_state)
                 server_quant_time = time.time() - server_quant_start
                 
@@ -1359,7 +1383,7 @@ class FederatedLearningServer:
                     if self.args.model == 'clip':
                         self.current_round_state = get_trainable_state_dict(self.global_model)
                     elif self.args.model == 'slm':
-                        self.current_round_state = get_trainable_state_dict_slm(self.global_model)
+                        self.current_round_state = self._slm_trainable_state()
                     else:
                         self.current_round_state = self.global_state.copy()
                 self.size_before_cache = {}
@@ -1442,7 +1466,10 @@ class FederatedLearningServer:
                     
                     with self.lock:
                         self.global_state = aggregated_state
-                        self.global_model.load_state_dict(self.global_state, strict=False)
+                        if self.qlora:
+                            set_qlora_state_dict(self.global_model, self.global_state)
+                        else:
+                            self.global_model.load_state_dict(self.global_state, strict=False)
                     
                     if self.test_loader is not None or self.client_idx:
                         try:
@@ -1564,7 +1591,7 @@ class FederatedLearningServer:
                 # Salva APENAS o LoRA/SoRA e a Head de classificação para economizar espaço
                 weights_to_save = get_trainable_state_dict(self.global_model)
             elif self.args.model == 'slm':
-                weights_to_save = get_trainable_state_dict_slm(self.global_model)
+                weights_to_save = self._slm_trainable_state()
             else:
                 weights_to_save = self.global_model.state_dict()
 
@@ -1619,6 +1646,7 @@ def parse_args():
     parser.add_argument('--gamma-delta', type=float, default=0.5, help='Expoente de sensibilidade da acurácia no índice de capacidade γ (default: 0.5)')
     parser.add_argument('--plateau-phi-min', type=float, default=0.45, help='Piso mínimo de capacidade no platô (default: 0.45)')
     parser.add_argument('--plateau-decay-rate', type=float, default=0.025, help='Taxa de decaimento por rodada no platô (default: 0.025)')
+    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA (apenas --model slm --strategy lora): backbone 4-bit NF4, agrega só adaptadores LoRA 16 bits')
     return parser.parse_args()
 
 def main():

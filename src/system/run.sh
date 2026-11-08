@@ -107,6 +107,9 @@ SKIP_TRAIN_EVAL=0
 # Delta Coding (LHDQ)
 DELTA_CODING=0
 
+# QLoRA (backbone 4-bit NF4 + adaptadores LoRA 16 bits)
+QLORA=0
+
 # ---- Função de Ajuda ----
 show_help() {
     cat << 'EOF'
@@ -178,6 +181,10 @@ Otimização de Avaliação:
 
 Compressão:
   --delta-coding              Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8
+
+QLoRA:
+  --qlora                     Backbone 4-bit NF4 + DoubleQuant, adaptadores LoRA 16 bits
+                              (requer --model slm --strategy lora; adaptadores trafegam em bf16)
 
 Outros:
   --help                      Exibir esta mensagem
@@ -275,6 +282,9 @@ while [ $# -gt 0 ]; do
         # Delta Coding (LHDQ)
         --delta-coding) DELTA_CODING=1; shift 1 ;;
 
+        # QLoRA
+        --qlora) QLORA=1; shift 1 ;;
+
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
 done
@@ -349,6 +359,11 @@ if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ]; then
     fi
 fi
 
+if [ "$QLORA" -eq 1 ] && { [ "$MODEL" != "slm" ] || [ "$STRATEGY" != "lora" ]; }; then
+    echo "❌ [ERRO] --qlora requer --model slm e --strategy lora (atual: model=$MODEL, strategy=$STRATEGY)"
+    exit 1
+fi
+
 # ---- Exibição da Configuração ----
 echo "===================================="
 echo "[INFO] Configuração do Treinamento FL:"
@@ -383,14 +398,15 @@ fi
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
-if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; else echo "  Compressão: INT8 padrão (8 bits/param)"; fi
+if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; elif [ "$QLORA" -eq 1 ]; then echo "  Compressão: nenhuma (adaptadores QLoRA em bf16)"; else echo "  Compressão: INT8 padrão (8 bits/param)"; fi
+if [ "$QLORA" -eq 1 ]; then echo "  QLoRA:              ATIVADO (NF4 + DoubleQuant, LoRA bf16, PagedAdamW8bit)"; fi
 echo "===================================="
 
 # ---- Preparação do Dataset ----
 # Busca o script no diretório dataset
 SCRIPT_PATH=$(find ../dataset -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
 if [ -n "$SCRIPT_PATH" ]; then
-    uv run "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
+    uv run --no-sync "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
 else
     echo "[ERRO] Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
     exit 1
@@ -422,6 +438,10 @@ else
     if [ "$DELTA_CODING" -eq 1 ]; then
         EXP_NAME="${EXP_NAME}_deltacoding"
     fi
+    # Sufixo QLoRA
+    if [ "$QLORA" -eq 1 ]; then
+        EXP_NAME="${EXP_NAME}_qlora"
+    fi
 fi
 echo "[INFO] Diretório de Resultados: ../results/$EXP_NAME"
 
@@ -446,7 +466,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
     mkdir -p "$LOG_DIR"
 
     # Comando do servidor
-    SERVER_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py \
+    SERVER_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run --no-sync server.py \
         --host $HOST \
         --port $PORT \
         --clients-per-round $CLIENT_COUNT \
@@ -496,6 +516,9 @@ for RUN in $(seq $START_RUN $END_RUN); do
     if [ "$DELTA_CODING" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --delta-coding"
     fi
+    if [ "$QLORA" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --qlora"
+    fi
     SERVER_CMD="$SERVER_CMD 2>&1 | tee $LOG_DIR/server.log"
 
     if [ "$AUTO_NEXT" -eq 1 ]; then
@@ -533,7 +556,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py \
+        CLIENT_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run --no-sync client.py \
             --client-idx $i \
             --host $HOST \
             --port $PORT \
@@ -555,6 +578,9 @@ for RUN in $(seq $START_RUN $END_RUN); do
             --timestamp $TIMESTAMP"
         if [ "$DELTA_CODING" -eq 1 ]; then
             CLIENT_CMD="$CLIENT_CMD --delta-coding"
+        fi
+        if [ "$QLORA" -eq 1 ]; then
+            CLIENT_CMD="$CLIENT_CMD --qlora"
         fi
         CLIENT_CMD="$CLIENT_CMD 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
