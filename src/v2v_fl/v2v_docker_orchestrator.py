@@ -409,17 +409,19 @@ def docker_compose_up(compose_file: Path, project_root: Path, build: bool = Fals
     Args:
         compose_file: Caminho para o docker-compose.v2v.yml
         project_root: Raiz do projeto (FL_ServerPuma/)
-        build: Se True, forca o rebuild das imagens (adiciona --build)
+        build: Se True, reconstrói a imagem compartilhada pelo primeiro serviço.
 
     Returns:
         True se o comando foi bem sucedido, False caso contrario
     """
-    cmd = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file), "up", "-d"]
+    prefix = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file)]
     if build:
-        cmd.insert(-1, "--build")
-        log.info("Iniciando conteineres Docker...")
-    else:
-        log.info("Iniciando conteineres Docker...")
+        result = subprocess.run(prefix + ["build", "client-v2v-0"], cwd=str(project_root))
+        if result.returncode != 0:
+            log.error("Reconstrução da imagem compartilhada falhou (exit code %d)", result.returncode)
+            return False
+    cmd = prefix + ["up", "-d"] + (["--no-build"] if build else [])
+    log.info("Iniciando conteineres Docker...")
 
     result = subprocess.run(
         cmd,
@@ -543,6 +545,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         results_dir=run_dir / "clients",
         encounters_dir=encounters_dir,
         seed=getattr(args, "seed", 42),
+        dataset_dir=getattr(args, "dataset_dir", None),
     )
 
     # Contadores e estado da simulacao
@@ -1003,6 +1006,7 @@ def main():
     )
 
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataset-dir", type=Path, help="Diretório das partições dentro de src/dataset")
     parser.add_argument("--run-id", help="ID da execução; padrão: UUID")
     parser.add_argument("--exchange-timeout", type=float, default=600.0)
     args = parser.parse_args()

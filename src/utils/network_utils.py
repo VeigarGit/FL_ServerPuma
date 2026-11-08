@@ -1,8 +1,9 @@
-"""Transporte compartilhado e mensagens V2I sobre o mesmo enquadramento do V2V.
+"""Transporte compartilhado e mensagens versionadas V2V/V2I.
 
 O protocolo V2I usa dicionários com versão e tipo. UPLOAD, RESULT e APPLIED
 identificam execução, RSU, encontro e cliente. UPLOAD e RESULT carregam pesos
 em CPU; ERROR informa falhas e PING/PONG verificam a prontidão do serviço.
+UPLOAD exige train_samples nos dois modos; V2I v2 rejeita envelopes v1 sem contagens.
 """
 
 import logging
@@ -15,12 +16,56 @@ from contextlib import suppress
 
 logger = logging.getLogger(__name__)
 
-V2I_PROTOCOL_VERSION = 1
+V2I_PROTOCOL_VERSION = 2
+V2V_PROTOCOL_VERSION = 1
 V2I_MESSAGE_TYPES = frozenset({"UPLOAD", "RESULT", "APPLIED", "ERROR", "PING", "PONG"})
 
 
 class V2IProtocolError(ValueError):
     """Mensagem V2I inválida ou associada a outro encontro."""
+
+
+def validate_train_samples(value: object) -> int:
+    """Exige uma contagem explícita de amostras, sem aceitar bool, float ou zero."""
+    if type(value) is not int or value <= 0:
+        raise ValueError("train_samples deve ser um inteiro positivo.")
+    return value
+
+
+def make_v2v_message(message_type: str, **fields) -> dict:
+    """Envelope V2V versionado; UPLOAD informa amostras, RESULT carrega a média."""
+    if {"version", "type"}.intersection(fields):
+        raise ValueError("type e version são definidos pelo construtor V2V.")
+    return validate_v2v_message(
+        {"version": V2V_PROTOCOL_VERSION, "type": message_type, **fields}
+    )
+
+
+def validate_v2v_message(message: object, **expected) -> dict:
+    """Rejeita uploads antigos e mensagens de outro encontro antes de usar seus pesos."""
+    if not isinstance(message, dict):
+        raise ValueError("Mensagem V2V deve ser um envelope versionado.")
+    if type(message.get("version")) is not int or message["version"] != V2V_PROTOCOL_VERSION:
+        raise ValueError("Versão V2V não suportada.")
+    kind = message.get("type")
+    if kind not in ("UPLOAD", "RESULT"):
+        raise ValueError("Tipo V2V deve ser UPLOAD ou RESULT.")
+    if not isinstance(message.get("run_id"), str) or not message["run_id"].strip():
+        raise ValueError("run_id V2V deve ser uma string não vazia.")
+    for field, minimum in (("client_id", 0), ("encounter_id", 1)):
+        if type(message.get(field)) is not int or message[field] < minimum:
+            raise ValueError(f"{field} V2V inválido.")
+    allowed = {"version", "type", "run_id", "client_id", "encounter_id", "weights"}
+    _validate_model_weights(message.get("weights"))
+    if kind == "UPLOAD":
+        allowed.add("train_samples")
+        validate_train_samples(message.get("train_samples"))
+    if set(message) - allowed:
+        raise ValueError("Campos V2V não suportados.")
+    for field, value in expected.items():
+        if message.get(field) != value:
+            raise ValueError(f"{field} V2V não corresponde ao encontro esperado.")
+    return message
 
 
 def _check_deadline(deadline: float | None, cancelled) -> float:
@@ -168,7 +213,7 @@ def _validate_v2i_context(message: dict) -> None:
             raise V2IProtocolError("client_id deve ser um inteiro não negativo.")
 
 
-def _validate_v2i_weights(weights: object) -> None:
+def _validate_model_weights(weights: object) -> None:
     # Manter o transporte genérico e o healthcheck independentes do PyTorch.
     import torch
 
@@ -213,12 +258,19 @@ def validate_v2i_message(message: object) -> dict:
 
     if message_type in {"UPLOAD", "RESULT"}:
         allowed.add("weights")
-        _validate_v2i_weights(message.get("weights"))
+        _validate_model_weights(message.get("weights"))
     elif message_type == "ERROR":
         allowed.add("error")
         error = message.get("error")
         if not isinstance(error, str) or not error.strip():
             raise V2IProtocolError("ERROR deve informar uma descrição não vazia em error.")
+
+    if message_type == "UPLOAD":
+        allowed.add("train_samples")
+        try:
+            validate_train_samples(message.get("train_samples"))
+        except ValueError as exc:
+            raise V2IProtocolError(str(exc)) from exc
 
     if message_type == "RESULT":
         allowed.add("aggregation_time")
@@ -241,7 +293,7 @@ def make_v2i_message(message_type: str, **fields) -> dict:
     """Monta uma mensagem V2I validada com a versão atual.
 
     Exemplo: make_v2i_message("UPLOAD", run_id="run-1", rsu_id="rsu_0",
-                             encounter_id=1, client_id=0, weights=state_dict)
+                             encounter_id=1, client_id=0, weights=state_dict, train_samples=100)
     """
     if {"version", "type"}.intersection(fields):
         raise V2IProtocolError("type e version são definidos pelo construtor V2I.")

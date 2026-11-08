@@ -9,6 +9,7 @@ import logging
 import random
 import math
 import json
+import hashlib
 from pathlib import Path
 
 # Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
@@ -51,10 +52,12 @@ from model import SimpleModel
 from utils.network_utils import (  # noqa: E402
     V2IProtocolError,
     make_v2i_message,
+    make_v2v_message,
     recv_data,
     recv_v2i_message,
     send_data,
     send_v2i_message,
+    validate_v2v_message,
 )
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
 from utils.fl_math import resize_model_to_pruned
@@ -70,7 +73,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------
 
 
-def send_p2p_model(host: str, payload: tuple, *, deadline: float, cancelled=None) -> int:
+def send_p2p_model(host: str, payload: dict, *, deadline: float, cancelled=None) -> int:
     """Conecta com tentativas curtas e envia o modelo até o prazo do encontro.
 
     O limite de conexão não limita o envio de todos os pesos. O transporte
@@ -98,7 +101,7 @@ def send_p2p_model(host: str, payload: tuple, *, deadline: float, cancelled=None
 
 
 def exchange_v2i_model(
-    model, encounter: dict, client_id: int, *, cancelled=None, metrics=None
+    model, encounter: dict, client_id: int, *, train_samples: int, cancelled=None, metrics=None
 ) -> dict:
     """Troca uma CNN por TCP e confirma APPLIED somente após carregar o resultado.
 
@@ -130,7 +133,9 @@ def exchange_v2i_model(
     metrics = metrics if metrics is not None else {}
     deadline = started + timeout
     snapshot = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
-    upload = make_v2i_message("UPLOAD", **context, weights=snapshot)
+    upload = make_v2i_message(
+        "UPLOAD", **context, weights=snapshot, train_samples=train_samples
+    )
     load_started = False
 
     def remaining() -> float:
@@ -384,8 +389,8 @@ def local_training(model, state_dict, prune, train_loader, test_loader, learning
 import torchvision.transforms as T
 from PIL import Image
 
-def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip=False, is_slm=False, slm_config=None):
-    train_data = read_client_data(dataset, client_idx, is_train)
+def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip=False, is_slm=False, slm_config=None, dataset_dir=None):
+    train_data = read_client_data(dataset, client_idx, is_train, dataset_dir=dataset_dir)
     X, y = zip(*train_data)
     X = torch.stack(X)
     
@@ -532,6 +537,12 @@ def save_results(
         hf.attrs["paca_used"] = paca_val
         hf.attrs["execution_id"] = getattr(args, "execution_id", "")
         hf.attrs["seed"] = getattr(args, "seed", 42)
+        if getattr(args, "dataset_dir", None) is not None:
+            hf.attrs["dataset_dir"] = str(args.dataset_dir)
+        if getattr(args, "initial_model_sha256", None) is not None:
+            hf.attrs["initial_model_sha256"] = args.initial_model_sha256
+            hf.attrs["initialization_seed"] = args.seed
+            hf.attrs["training_seed"] = args.training_seed
         records = getattr(args, "encounter_metrics", [])
         if records:
             group = hf.create_group("encounters")
@@ -555,6 +566,7 @@ def save_results(
                 "evaluation_time",
                 "accuracy_before",
                 "accuracy_after",
+                "majority_class_baseline",
                 "test_samples",
                 "epoch",
                 "mean_distance",
@@ -601,6 +613,7 @@ def parse_args():
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--rounds', type=int, default=5)
     parser.add_argument('--dataset', type=str, default='Cifar100')
+    parser.add_argument('--dataset-dir', type=Path, help='Diretório com config.json, train/ e test/; mantém o nome lógico do dataset')
     parser.add_argument('--client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
     parser.add_argument('--num-classes', type=int, default=100)
@@ -650,9 +663,10 @@ def parse_args():
 
 def main():
     args = parse_args()
-    random.seed(args.seed + args.client_idx)
-    np.random.seed(args.seed + args.client_idx)
-    torch.manual_seed(args.seed + args.client_idx)
+    args.training_seed = args.seed + args.client_idx
+    random.seed(args.training_seed)
+    np.random.seed(args.training_seed)
+    torch.manual_seed(args.training_seed)
     args.encounter_metrics = []
     
     # Configuração inteligente de device: MPS > CUDA > CPU
@@ -703,17 +717,44 @@ def main():
     
     # Adoção de Structural Pattern Matching
     match args.model:
-        case 'cnn':
-            match args.dataset:
-                case 'MNIST':
-                    model = SimpleModel(in_features=1, num_classes=10, dim=1024)
-                case 'Cifar10':
-                    model = SimpleModel(in_features=args.in_features, num_classes=10, dim=args.dim)
-                case 'Cifar100':
-                    model = SimpleModel(in_features=args.in_features, num_classes=args.num_classes, dim=args.dim)
-                case _:
-                    logger.error(f"Dataset inválido: {args.dataset}")
-                    sys.exit(1)
+        case "cnn":
+            # Isolar a inicialização comum preserva o RNG de treino de cada cliente.
+            # SimpleModel é construído em CPU; os geradores dos aceleradores não mudam.
+            with torch.random.fork_rng(devices=[], enabled=args.mode == "decentralized"):
+                if args.mode == "decentralized":
+                    torch.random.default_generator.manual_seed(args.seed)
+                match args.dataset:
+                    case "MNIST":
+                        model = SimpleModel(in_features=1, num_classes=10, dim=1024)
+                    case "Cifar10":
+                        model = SimpleModel(
+                            in_features=args.in_features, num_classes=10, dim=args.dim
+                        )
+                    case "Cifar100":
+                        model = SimpleModel(
+                            in_features=args.in_features,
+                            num_classes=args.num_classes,
+                            dim=args.dim,
+                        )
+                    case _:
+                        logger.error(f"Dataset inválido: {args.dataset}")
+                        sys.exit(1)
+            if args.mode == "decentralized":
+                initial_digest = hashlib.sha256()
+                for name, tensor in sorted(model.state_dict().items()):
+                    initial_digest.update(
+                        json.dumps([name, str(tensor.dtype), list(tensor.shape)]).encode("utf-8")
+                    )
+                    initial_tensor = tensor.detach().cpu().contiguous().reshape(-1)
+                    initial_digest.update(initial_tensor.view(torch.uint8).numpy().tobytes())
+                args.initial_model_sha256 = initial_digest.hexdigest()
+                logger.info(
+                    "Client %d: CNN inicial comum | seed=%d | treino=%d | SHA256=%s",
+                    args.client_idx,
+                    args.seed,
+                    args.training_seed,
+                    args.initial_model_sha256,
+                )
         case 'clip' | 'slm':
             if args.model == 'clip':
                 config = load_config(args.config)
@@ -783,8 +824,13 @@ def main():
     try:
         is_clip_flag = (args.model == 'clip')
         is_slm_flag = (args.model == 'slm')
-        train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None)
-        test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None)
+        train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None, dataset_dir=args.dataset_dir)
+        test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None, dataset_dir=args.dataset_dir)
+        test_majority_baseline = None
+        if hasattr(test_loader.dataset, "tensors"):
+            labels = test_loader.dataset.tensors[1]
+            counts = torch.unique(labels, return_counts=True)[1]
+            test_majority_baseline = 100.0 * counts.max().item() / len(labels)
         logger.info(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
     except Exception as e:
         logger.exception("Error loading data")
@@ -951,7 +997,6 @@ def main():
         logger.info("\nTraining completed!")
 
     elif args.mode == 'decentralized':
-        import json
         import threading
         logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
         encounters_dir = args.encounters_dir or Path(__file__).resolve().parents[1] / "results" / "encounters"
@@ -1006,11 +1051,12 @@ def main():
                             cancelled=lambda: (encounters_dir / ".simulation_done").exists(),
                         )
                         if data is not None:
-                            sender_id, enc_id, state = data
+                            validate_v2v_message(data)
+                            sender_id, enc_id = data["client_id"], data["encounter_id"]
                             with in_memory_lock:
                                 if enc_id not in in_memory_weights:
                                     in_memory_weights[enc_id] = {}
-                                in_memory_weights[enc_id][sender_id] = state
+                                in_memory_weights[enc_id][sender_id] = data
                                 in_memory_bytes.setdefault(enc_id, {})[sender_id] = (
                                     in_memory_bytes.get(enc_id, {}).get(sender_id, 0) + received_bytes
                                 )
@@ -1138,7 +1184,9 @@ def main():
                 if rs_local_acc and not args.skip_post_eval
                 else None,
                 "accuracy_after": None,
+                "majority_class_baseline": test_majority_baseline,
                 "test_samples": len(test_loader.dataset),
+                "train_samples": len(train_loader.dataset),
                 "evaluation_skipped": args.skip_post_eval,
                 "error": None,
             }
@@ -1170,6 +1218,7 @@ def main():
                         model,
                         encounter_data,
                         args.client_idx,
+                        train_samples=len(train_loader.dataset),
                         cancelled=lambda: (encounters_dir / ".simulation_done").exists(),
                         metrics=metrics,
                     )
@@ -1304,7 +1353,12 @@ def main():
                 if not is_aggregator:
                     target_host = f"fl-client-v2v-{aggregator_id}"
                     snapshot_bytes = send_p2p_model(
-                        target_host, (args.client_idx, enc_id, snapshot),
+                        target_host,
+                        make_v2v_message(
+                            "UPLOAD", run_id=encounter_data["run_id"],
+                            client_id=args.client_idx, encounter_id=enc_id,
+                            weights=snapshot, train_samples=len(train_loader.dataset),
+                        ),
                         deadline=exchange_deadline, cancelled=cancelled,
                     )
                     metrics["upload_bytes"] += snapshot_bytes
@@ -1328,7 +1382,12 @@ def main():
                                 enc_id in in_memory_weights
                                 and aggregator_id in in_memory_weights[enc_id]
                             ):
-                                received_states.append(in_memory_weights[enc_id][aggregator_id])
+                                response = validate_v2v_message(
+                                    in_memory_weights[enc_id][aggregator_id], type="RESULT",
+                                    run_id=encounter_data["run_id"], encounter_id=enc_id,
+                                    client_id=aggregator_id,
+                                )
+                                received_states.append(response)
                                 break
                         time.sleep(1)
 
@@ -1350,7 +1409,12 @@ def main():
                                 ]
                                 if not missing:
                                     for c in other_clients:
-                                        received_states.append(in_memory_weights[enc_id][c])
+                                        upload = validate_v2v_message(
+                                            in_memory_weights[enc_id][c], type="UPLOAD",
+                                            run_id=encounter_data["run_id"], encounter_id=enc_id,
+                                            client_id=c,
+                                        )
+                                        received_states.append(upload)
                                     break
                         time.sleep(1)
 
@@ -1370,89 +1434,36 @@ def main():
                             f"Client {args.client_idx}: Todos os pesos recebidos! Iniciando agregação OTA..."
                         )
 
-                        from v2v_fl.over_the_air.ota_channel import (
-                            distances_from_positions,
-                            build_channel_matrices,
-                            compute_noise_variance,
-                        )
                         from v2v_fl.over_the_air.ota_aggregation import (
-                            compute_weight_variance,
-                            mmse_beamforming,
-                            apply_ota_channel,
+                            ota_aggregate,
                         )
 
                         aggregation_started = time.monotonic()
                         try:
-                            # Passo 3a: Montar o dicionário {client_id: state_dict} dos transmissores
-                            tx_state_dicts = {}
-                            for i, c in enumerate(other_clients):
-                                tx_state_dicts[c] = received_states[i]
-
-                            # Passo 3b: Calcular distâncias geográficas (SUMO) entre cada
-                            # transmissor e o aggregator (eu)
-                            transmitter_ids, distances = distances_from_positions(
-                                positions, aggregator_id
+                            participant_states = {
+                                upload["client_id"]: upload["weights"]
+                                for upload in received_states
+                            }
+                            participant_states[args.client_idx] = snapshot
+                            train_samples = {
+                                upload["client_id"]: upload["train_samples"]
+                                for upload in received_states
+                            }
+                            train_samples[args.client_idx] = len(train_loader.dataset)
+                            diagnostics = {}
+                            snapshot = ota_aggregate(
+                                participant_states,
+                                positions,
+                                {
+                                    "x": positions[aggregator_id][0],
+                                    "y": positions[aggregator_id][1],
+                                    "n_antennas": 8,
+                                },
+                                train_samples=train_samples,
+                                local_client_id=aggregator_id,
+                                diagnostics=diagnostics,
                             )
-                            logger.info(
-                                f"Client {args.client_idx}: Distâncias aos transmissores: "
-                                f"{dict(zip(transmitter_ids, distances.tolist(), strict=True))}"
-                            )
-
-                            # Passo 3c: n_samples uniforme (FedAvg sem ponderação por dataset)
-                            n_tx = len(transmitter_ids)
-                            n_samples = np.ones(n_tx, dtype=np.float64)
-
-                            # Passo 3d: Construir as matrizes de canal (Path Loss + Rayleigh Fading)
-                            # n_antennas = 8 é o padrão do paper de referência
-                            N_ANTENNAS = 8
-                            EPSILON = 0.1  # Erro de estimação do canal (10%)
-                            H_est, H_true, H_scaled, path_loss = build_channel_matrices(
-                                distances,
-                                N_ANTENNAS,
-                                n_samples,
-                                epsilon=EPSILON,
-                            )
-
-                            # Passo 3e: Calcular a variância dos pesos de cada transmissor
-                            # (usado para normalizar os pesos antes da transmissão)
-                            variances, model_size = compute_weight_variance(tx_state_dicts)
-                            weight_vars = np.array([variances[tid] for tid in transmitter_ids])
-
-                            # Passo 3f: Calcular o beamforming MMSE (vetor de recepção f' e
-                            # escalares de transmissão b_k)
-                            f_prime, transmit_scalars = mmse_beamforming(
-                                H_est, weight_vars, n_samples
-                            )
-
-                            # Passo 3g: Calcular a variância do ruído térmico do receptor
-                            noise_var = compute_noise_variance(bandwidth_hz=100e3)
-
-                            # Passo 3h: Simular a transmissão Over-the-Air!
-                            # Esta função aplica: normalização → pré-codificação → canal → ruído
-                            # O resultado é a média ponderada degradada pelo canal de rádio
-                            ota_aggregated = apply_ota_channel(
-                                state_dicts=tx_state_dicts,
-                                transmitter_ids=transmitter_ids,
-                                n_samples=n_samples,
-                                H_true=H_true,
-                                transmit_scalars=transmit_scalars,
-                                f_prime=f_prime,
-                                noise_variance=noise_var,
-                                weight_variances=weight_vars,
-                            )
-                            logger.info(
-                                f"Client {args.client_idx}: Agregação OTA concluída com sucesso!"
-                            )
-
-                            # Passo 3i: FedAvg ponderado
-                            # n_tx já está definido no Passo 3c como len(transmitter_ids)
-                            for k in snapshot:
-                                ota_val = ota_aggregated[k].float()
-                                local_val = snapshot[k].float()
-                                # Média ponderada: (1 parte local + n_tx partes do OTA) / total de nós
-                                snapshot[k] = ((local_val + (n_tx * ota_val)) / (n_tx + 1)).to(
-                                    snapshot[k].dtype
-                                )
+                            metrics["ota_diagnostics"] = diagnostics
 
                         finally:
                             metrics["aggregation_time"] = time.monotonic() - aggregation_started
@@ -1478,7 +1489,7 @@ def main():
                         )
                         # O Transmissor recebe o modelo já agregado (OTA + local do Aggregator)
                         # e simplesmente o carrega como seu novo modelo local
-                        aggregated_state = received_states[0]
+                        aggregated_state = received_states[0]["weights"]
 
                         if args.model in ["clip", "slm"]:
                             for k in snapshot:
@@ -1504,7 +1515,12 @@ def main():
                         for c in other_clients:
                             target_host = f"fl-client-v2v-{c}"
                             snapshot_bytes = send_p2p_model(
-                                target_host, (args.client_idx, enc_id, snapshot),
+                                target_host,
+                                make_v2v_message(
+                                    "RESULT", run_id=encounter_data["run_id"],
+                                    client_id=args.client_idx, encounter_id=enc_id,
+                                    weights=snapshot,
+                                ),
                                 deadline=exchange_deadline, cancelled=cancelled,
                             )
                             metrics["sent_download_bytes"] += snapshot_bytes

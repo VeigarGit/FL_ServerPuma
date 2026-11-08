@@ -10,7 +10,7 @@ Serve como BASELINE de comparação contra o modo V2V-OTA descentralizado.
 Diferenças em relação ao V2V (v2v_docker_orchestrator.py):
   - As RSUs são pontos fixos no mapa (definidos em rsu_config.json).
   - A detecção é veículo ↔ RSU (não veículo ↔ veículo).
-  - ≥1 veículo no raio da RSU é suficiente para agregar.
+  - São necessários ≥2 veículos no raio da RSU com ETC suficiente para agregar.
   - A agregação OTA é feita no serviço único rsu-service, em CPU.
   - As RSUs são stateless: só agregam os modelos do encontro atual.
   - O conhecimento permanece nos veículos, sem modelo global persistido na RSU.
@@ -22,7 +22,7 @@ Fluxo:
   4. A cada step do SUMO:
      a) Detecta veículos dentro do raio de cada RSU.
      b) Calcula o ETC de cada veículo com a RSU.
-     c) Se ETC suficiente: publica identificadores, endereço e posições em JSON.
+     c) Com ≥2 veículos elegíveis: publica identificadores, endereço e posições em JSON.
      d) O serviço recebe os pesos por TCP, agrega e aguarda APPLIED dos veículos.
      e) Espera o status terminal do servidor e a avaliação dos clientes.
   5. Encerra quando o número máximo de encontros é atingido.
@@ -291,9 +291,13 @@ def wait_all_clients_epoch_done(
 
 def docker_compose_up(compose_file: Path, project_root: Path, build: bool = False) -> bool:
     """Inicia os veículos após o healthcheck TCP do rsu-service."""
-    cmd = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file), "up", "-d"]
+    prefix = ["docker", "compose", "--project-directory", ".", "-f", str(compose_file)]
     if build:
-        cmd.insert(-1, "--build")
+        result = subprocess.run(prefix + ["build", "client-v2i-0"], cwd=str(project_root))
+        if result.returncode != 0:
+            log.error("Reconstrução da imagem compartilhada falhou (exit code %d)", result.returncode)
+            return False
+    cmd = prefix + ["up", "-d"] + (["--no-build"] if build else [])
     log.info("Iniciando containers Docker...")
 
     result = subprocess.run(cmd, cwd=str(project_root))
@@ -479,6 +483,12 @@ def wait_for_client_evaluations(
 
 def run_orchestrator(args: argparse.Namespace) -> None:
     """Loop principal do orquestrador V2I."""
+    if args.total_clients < 2:
+        raise ValueError("--total-clients deve ser pelo menos 2 para encontros V2I.")
+    min_clients = getattr(args, "min_clients", 2)
+    if type(min_clients) is not int or not 2 <= min_clients <= args.total_clients:
+        raise ValueError("--min-clients deve ser um inteiro entre 2 e --total-clients.")
+    args.min_clients = min_clients
     exchange_timeout = getattr(args, "exchange_timeout", DEFAULT_EXCHANGE_TIMEOUT)
     evaluation_timeout = getattr(args, "evaluation_timeout", DEFAULT_EVALUATION_TIMEOUT)
 
@@ -526,6 +536,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
     log.info("  Total Clientes    : %d", args.total_clients)
     log.info("  RSUs              : %d", len(rsus))
     log.info("  Max Encontros     : %d", args.encounters)
+    log.info("  Min Clientes/RSU  : %d", min_clients)
     log.info("  Min Tempo Contato : %.0f s (ETC)", args.min_contact_time)
     log.info("  Warmup            : %d s", args.warmup)
     log.info("  Cooldown (por RSU): %d s", args.cooldown)
@@ -568,6 +579,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         results_dir=run_dir / "clients",
         encounters_dir=encounters_dir,
         seed=getattr(args, "seed", 42),
+        dataset_dir=getattr(args, "dataset_dir", None),
         run_id=run_id,
         rsu_config=rsu_config_path,
         exchange_timeout=exchange_timeout,
@@ -636,6 +648,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     )
 
             if not vehicles:
+                prev_clients_per_rsu.clear()
                 continue
 
             # ── Detectar veículos no raio de cada RSU ─────────────────────
@@ -650,10 +663,6 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                         del prev_clients_per_rsu[rsu_id]
                     continue
 
-                # ── Verificar cooldown desta RSU ──────────────────────────
-                if (sim_time - last_encounter_per_rsu[rsu_id]) < args.cooldown:
-                    continue
-
                 vehs_with_dist = vehicles_by_rsu[rsu_id]
 
                 # ── Filtrar veículos com ETC suficiente ───────────────────
@@ -666,12 +675,17 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                     elif etc >= args.min_contact_time:
                         viable.append((v, dist, etc))
 
-                if not viable:
+                c_indices = sorted({veh_to_client_idx[v.veh_id] for v, _, _ in viable})
+                if len(c_indices) < min_clients:
                     rejected_count += 1
+                    prev_clients_per_rsu.pop(rsu_id, None)
+                    continue
+
+                # Observar saídas mesmo durante o cooldown para liberar um novo encontro.
+                if (sim_time - last_encounter_per_rsu[rsu_id]) < args.cooldown:
                     continue
 
                 # ── Verificar se é um NOVO grupo (não repetição) ──────────
-                c_indices = sorted(veh_to_client_idx[v.veh_id] for v, _, _ in viable)
                 current_clients_key = frozenset(c_indices)
 
                 if prev_clients_per_rsu.get(rsu_id) == current_clients_key:
@@ -863,7 +877,11 @@ def run_orchestrator(args: argparse.Namespace) -> None:
         log.info("ESTATÍSTICAS DA SIMULAÇÃO V2I")
         log.info("=" * 60)
         log.info("  Encontros V2I viáveis  : %d", encounter_count)
-        log.info("  Encontros rejeitados   : %d (ETC insuficiente)", rejected_count)
+        log.info(
+            "  Encontros rejeitados   : %d (menos de %d veículos elegíveis)",
+            rejected_count,
+            min_clients,
+        )
         log.info("  Total de steps SUMO    : %d", step)
         for rsu in rsus:
             rsu_id = rsu["id"]
@@ -923,6 +941,12 @@ def main():
         type=int,
         default=6,
         help="Número máximo de encontros V2I viáveis (default: 6)",
+    )
+    parser.add_argument(
+        "--min-clients",
+        type=int,
+        default=2,
+        help="Mínimo de veículos viáveis por encontro na mesma RSU (default: 2)",
     )
     parser.add_argument(
         "--min-contact-time",
@@ -1038,6 +1062,7 @@ def main():
     parser.add_argument("--paca", type=int, default=12, help="Número de camadas upper para PaCA")
 
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataset-dir", type=Path, help="Diretório das partições dentro de src/dataset")
     args = parser.parse_args()
     if not 0 <= args.ota_epsilon < 1:
         parser.error("--ota-epsilon deve estar no intervalo [0, 1).")

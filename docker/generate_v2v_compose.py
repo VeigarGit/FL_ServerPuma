@@ -41,6 +41,7 @@ def generate(
     results_dir: Path | None = None,
     encounters_dir: Path | None = None,
     seed: int = 42,
+    dataset_dir: Path | None = None,
 ) -> str:
     """Grava o Compose do modo escolhido e retorna seu caminho absoluto.
 
@@ -70,6 +71,15 @@ def generate(
         container_path(encounters_dir) if encounters_dir else f"{CONTAINER_RESULTS}/encounters"
     )
     container_outputs = container_path(results_dir) if results_dir else None
+    container_dataset = None
+    if dataset_dir is not None:
+        selected = Path(dataset_dir)
+        if not selected.is_absolute():
+            selected = PROJECT_ROOT / selected
+        relative = selected.resolve().relative_to((PROJECT_ROOT / 'src/dataset').resolve())
+        if not selected.is_dir():
+            raise ValueError(f'Diretório do dataset não encontrado: {selected}')
+        container_dataset = f'/app/src/dataset/{relative.as_posix()}'
 
     build = {
         "context": ".",
@@ -78,6 +88,7 @@ def generate(
     }
     environment = {
         "PYTHONUNBUFFERED": "1",
+        "PYTHONHASHSEED": str(seed),
         "PYTHONPATH": "/app/src/system:/app/src",
     }
     labels = {
@@ -128,6 +139,8 @@ def generate(
         )
         if container_outputs:
             command.extend(["--results-dir", container_outputs])
+        if container_dataset:
+            command.extend(["--dataset-dir", container_dataset])
         if max_epochs > 0:
             command.extend(["--max-epochs", str(max_epochs)])
         service = {
@@ -243,6 +256,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=["v2v", "v2i", "both"], default="both")
     parser.add_argument("--clients", type=int, default=5)
     parser.add_argument("--dataset", default="Cifar10")
+    parser.add_argument("--dataset-dir", type=Path)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--prune", type=int, choices=[0, 1], default=1)
     parser.add_argument("--ala", type=int, choices=[0, 1], default=1)
@@ -268,6 +282,7 @@ def main() -> None:
             path = generate(
                 client_indices=list(range(args.clients)),
                 dataset=args.dataset,
+                dataset_dir=args.dataset_dir,
                 rounds=args.rounds,
                 prune=args.prune,
                 ala=args.ala,
