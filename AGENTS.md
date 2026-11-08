@@ -36,7 +36,10 @@ FL_ServerPuma/
 └── src/
     ├── system/                     # Motor principal de FL (Server, Client, Modelos, Scripts)
     │   ├── server.py               # Servidor centralizado (agregação, γ^c, poda SoRA, avaliação, HDF5)
-    │   ├── client.py               # Cliente unificado (modos: centralized, decentralized V2V/V2I)
+    │   ├── client.py               # Ponto de entrada unificado, CLI e loop centralizado do cliente FL
+    │   ├── client_data.py          # ClientHistory, load_data (CNN/CLIP/SLM) e save_results (.h5)
+    │   ├── client_training.py      # Construção de modelos, FedALA e loop de treino local (local_training)
+    │   ├── client_v2x.py           # Motor descentralizado D-PSGD V2V/V2I (P2PWeightStore, encontros OTA)
     │   ├── run.sh                  # Orquestrador local via tmux (gerencia dataset, GPUs, server e clientes)
     │   ├── run_all_*.sh            # Suites de benchmark automatizado (PUMA-GT Plus, LoRA/SLM)
     │   ├── model.py                # SimpleModel (CNN 2xConv + 2xFC para MNIST/CIFAR10/CIFAR100)
