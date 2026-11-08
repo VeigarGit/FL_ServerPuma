@@ -74,10 +74,14 @@ FL_ServerPuma/
         ├── v2v_docker_orchestrator.py # Orquestrador SUMO + Docker para V2V D-PSGD (eleição por Medoid)
         ├── v2i_docker_orchestrator.py # Orquestrador SUMO + Docker para V2I (handover entre RSUs fixas)
         ├── rsu_server.py           # Servidor TCP multi-RSU stateless em CPU (protocolo V2I v1)
+        ├── run_simulations.sh      # Suite automatizada de experimentos comparativos V2V vs V2I
+        ├── experiment_report.py    # Consolidador de métricas e relatórios de experimentos V2X
+        ├── validate_mobility.py    # Validador de conectividade e mobilidade da malha SUMO
         ├── over_the_air/
         │   ├── ota_channel.py      # Canal físico (COST-231 Hata, Rayleigh, CSI imperfeito, MMSE/MRC SVD)
-        │   └── ota_aggregation.py  # Simulação de transmissão OTA por tensor e agregação com peso local
-        └── maps/                   # Topologia SUMO de Marambaia e rsu_config_marambaia.json
+        │   └── ota_aggregation.py  # Simulação OTA ponderada por amostras de treino + diagnóstico L2
+        ├── plot/                   # Scripts de visualização V2X (plot_v2v_accuracy.py, plot_exchange_time_.py)
+        └── maps/                   # Topologias SUMO (marambaia e marambaia_recorte) e configs de RSUs
 ```
 
 ---
@@ -187,22 +191,25 @@ Definido em `src/utils/network_utils.py`. Toda mensagem usa um cabeçalho de **4
 
 ### 4.2 Fluxo Descentralizado V2V-OTA (`v2v_docker_orchestrator.py`)
 1. **Sincronização por Arquivos Atômicos** em `src/results/runs/v2v/<run_id>/encounters/`:
+   - Na inicialização, os clientes sincronizam o mesmo modelo inicial de referência (`models/initial_global_model.pt`) para garantir ponto de partida idêntico em CNNs.
    - O orquestrador cria `.start_round_<r>`.
    - Clientes executam treino local, salvam `models/client_<id>_local.pt` atomicamente e criam `.epoch_done_client_<id>`.
    - O orquestrador avança o SUMO (`traci.simulationStep()`), detecta cliques de veículos dentro de `--radius` cujo **Tempo de Contato Estimado** (`estimate_contact_time` via cinemática quadrática 2D) seja $\ge$ `--min-contact-time` (padrão 6.0s), e elege o veículo **Medoid** (`find_medoid`) como agregador.
    - O orquestrador grava `encounter_<id>.json` (`type: "v2v"`).
-2. **Comunicação P2P + Canal OTA**:
-   - Veículos transmissores conectam via TCP em `fl-client-v2v-<aggregator_id>:9000` e enviam `(client_idx, enc_id, snapshot)`.
+2. **Comunicação P2P + Canal OTA Ponderado por Amostras**:
+   - Veículos transmissores conectam via TCP em `fl-client-v2v-<aggregator_id>:9000` e enviam payload validado contendo `(client_idx, enc_id, train_samples, snapshot)`.
    - O agregador aplica o canal sem fio (`src/v2v_fl/over_the_air/ota_aggregation.py` + `ota_channel.py`): path loss COST-231 Hata (2 GHz), fading Rayleigh com erro de CSI ($\epsilon=0.1$), beamforming MIMO receptor MMSE/MRC via SVD ($N=8$ antenas) e ruído térmico AWGN (100 kHz).
-   - Combinação com pesos iguais ao FedAvg: $\mathbf{w}_{\text{agg}} = \frac{\mathbf{w}_{\text{local}} + K_{\text{tx}} \cdot \hat{\mathbf{w}}_{\text{OTA}}}{K_{\text{tx}} + 1}$.
+   - **Ponderação proporcional a `train_samples`**: Com $M$ participantes e pesos normalizados $q_k = M \cdot \frac{n_k}{\sum_{j} n_j}$, o agregador combina seu modelo local com o sinal OTA recebido:
+     $$\mathbf{w}_{\text{agg}} = \frac{q_{\text{local}}}{M}\mathbf{w}_{\text{local}} + \left(\frac{\sum_{k \in \text{tx}} q_k}{M}\right)\hat{\mathbf{w}}_{\text{OTA}}$$
+     Além disso, registra diagnóstico detalhado de distorção (`relative_l2_error`, `noise_std`, `effective_model_weight`).
    - O agregador devolve $\mathbf{w}_{\text{agg}}$ via socket aos transmissores; todos gravam `.applied_enc_<id>_client_<c>.json` e `.done_enc_<id>_client_<c>`.
 
 ### 4.3 Fluxo Descentralizado V2I-OTA (`v2i_docker_orchestrator.py` + `rsu_server.py`)
-- As **RSUs** (*Roadside Units*, definidas em `src/v2v_fl/maps/rsu_config_marambaia.json`) rodam em um único contêiner CPU `fl-rsu-service` (`python -m v2v_fl.rsu_server` na porta 9000).
-- **RSU Stateless**: A RSU **não mantém estado de modelo entre encontros**. A cada encontro V2I (`type: "v2i"`), $K \ge 2$ veículos sob cobertura da mesma antena fazem upload de seus `state_dict`, a RSU aplica `aggregate_ota_pure` ($N=16$ antenas por padrão), devolve o modelo agregado e descarta os tensores da memória.
+- As **RSUs** (*Roadside Units*, definidas em `src/v2v_fl/maps/rsu_config_marambaia.json` ou `rsu_config_marambaia_recorte.json`) rodam em um único contêiner CPU `fl-rsu-service` (`python -m v2v_fl.rsu_server` na porta 9000).
+- **RSU Stateless**: A RSU **não mantém estado de modelo entre encontros**. A cada encontro V2I (`type: "v2i"`), obrigatoriamente com $K \ge 2$ veículos sob cobertura da mesma antena, os veículos fazem upload de seus `state_dict` e `train_samples`, a RSU aplica `aggregate_ota_pure` ($N=16$ antenas por padrão, ponderado por `train_samples`), devolve o modelo agregado e descarta os tensores da memória.
 - **Protocolo Validado V2I (`V2I_PROTOCOL_VERSION = 1` em `src/utils/network_utils.py`)**:
   - Healthcheck: `{"protocol_version": 1, "msg_type": "PING"}` $\rightarrow$ `PONG`.
-  - Encontro: Cliente envia `UPLOAD` (validado contra `run_id`, `rsu_id`, `encounter_id`, `client_id` e tensores densos finitos em CPU) $\rightarrow$ RSU responde `RESULT` (ou `ERROR`) $\rightarrow$ Cliente confirma aplicação local enviando `APPLIED` $\rightarrow$ RSU publica `rsu_status_enc_<id>.json` (`status: " COMPLETED"`).
+  - Encontro: Cliente envia `UPLOAD` (validado contra `run_id`, `rsu_id`, `encounter_id`, `client_id`, `train_samples` e tensores densos finitos em CPU) $\rightarrow$ RSU responde `RESULT` (ou `ERROR`) $\rightarrow$ Cliente confirma aplicação local enviando `APPLIED` $\rightarrow$ RSU publica `rsu_status_enc_<id>.json` (`status: "COMPLETED"`).
   - **Restrição atual**: O modo V2I suporta exclusivamente `--model cnn` (`client.py` valida e aborta caso contrário).
 
 ---
@@ -292,10 +299,10 @@ Em **todo o projeto** (`server.py`, `client.py`, `run.sh`, `generate_compose.py`
 - No código real de treinamento (`client.py:local_training` e `server.py`), a poda estrutural de CNN é executada quando **`prune == 1`** (`if round_num >= 2 and prune == 1:`).
 - Contudo, as strings `help=` de `argparse` em `client.py`, `v2v_docker_orchestrator.py` e `v2i_docker_orchestrator.py` dizem erroneamente `"0=sim, 1=não"`, enquanto `server.py` e `run.sh` documentam e usam corretamente **`1` = Poda Ativada** e **`0` = Poda Desativada**. Ao acionar poda estrutural de CNN, passe sempre `--prune 1`.
 
-### ⚠️ 3. Dependência de Diretório de Trabalho (`CWD = src/system/`)
-- `src/utils/data_utils.py` (`read_client_data` e `read_server_Test_data`) carrega dados usando o caminho relativo fixo **`../dataset/<dataset>/train/<idx>.npz`**.
-- Portanto, `server.py`, `client.py` (em modo centralizado) e `run.sh` **devem ser executados com diretório de trabalho em `src/system/`** (como configurado em `run.sh` e no `WORKDIR /app/src/system` dos Dockerfiles).
-- Já os orquestradores `src/v2v_fl/v2v_docker_orchestrator.py`, `src/v2v_fl/v2i_docker_orchestrator.py` e `rsu_server.py` devem ser executados a partir da **raiz do repositório** com `PYTHONPATH=src`.
+### ⚠️ 3. Dependência de Diretório de Trabalho (`CWD = src/system/`) e `--dataset-dir`
+- Por padrão (quando `--dataset-dir` não é informado), `src/utils/data_utils.py` (`read_client_data` e `read_server_Test_data`) carrega dados usando o caminho relativo **`../dataset/<dataset>/train/<idx>.npz`**.
+- Portanto, `server.py`, `client.py` (em modo centralizado sem `--dataset-dir`) e `run.sh` **devem ser executados com diretório de trabalho em `src/system/`** (como configurado em `run.sh` e no `WORKDIR /app/src/system` dos Dockerfiles).
+- Nos cenários V2V/V2I, é possível selecionar diretórios customizados de partição via `--dataset-dir` (ex.: `Cifar10_alpha1`). Já os orquestradores `src/v2v_fl/v2v_docker_orchestrator.py`, `src/v2v_fl/v2i_docker_orchestrator.py` e `rsu_server.py` devem ser executados a partir da **raiz do repositório** com `PYTHONPATH=src`.
 
 ### ⚠️ 4. Desnormalização de Imagens entre Dataset `.npz`, `CLIP` e `SLM`
 - O gerador `src/dataset/generate_OxfordPets.py` salva os tensores `.npz` **já normalizados com a média e desvio padrão do CLIP** (gerando valores negativos até $\approx -1.8$), enquanto outros geradores (`MNIST`, `Cifar10`) salvam em `[-1, 1]` ou `[0, 1]`.
