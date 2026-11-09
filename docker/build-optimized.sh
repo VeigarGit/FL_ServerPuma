@@ -1,4 +1,7 @@
 #!/bin/bash
+# Responsabilidade: Limpa contêineres e imagens Docker, reconstrói as imagens, gera o Compose
+# centralizado e inicia os serviços do experimento.
+
 set -e
 
 echo "🔄 Cleanup completo..."
@@ -8,6 +11,6 @@ docker system prune -a -f
 echo "🏗️ Build otimizado..."
 docker compose --project-directory .. -f docker-compose.generated.yml build --no-cache --parallel
 
-python generate_compose.py
+uv run python -m fl_serverpuma.simulation.docker.compose
 
 docker compose --project-directory .. -f docker-compose.generated.yml up

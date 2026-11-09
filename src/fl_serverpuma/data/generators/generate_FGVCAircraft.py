@@ -1,0 +1,82 @@
+# Responsabilidade: Prepara imagens de aeronaves FGVC-Aircraft e gera partições por cliente
+# conforme as opções e regras já existentes no gerador.
+#
+# Principais funções: generate_dataset.
+
+from fl_serverpuma.paths import SOURCE_ROOT
+import numpy as np
+import os
+import sys
+import random
+import torch
+import torchvision
+import torchvision.transforms as transforms
+from fl_serverpuma.data.partitioning import check, separate_data, split_data, save_file
+from pathlib import Path
+
+
+random.seed(1)
+np.random.seed(1)
+num_clients = 25
+dir_path = SOURCE_ROOT / "dataset" / "FGVCAircraft"
+
+
+# Allocate data to users
+def generate_dataset(dir_path: Path, num_clients, niid, balance, partition):
+    dir_path.mkdir(parents=True, exist_ok=True)
+        
+    # Setup directory for train/test data
+    config_path = dir_path / "config.json"
+    train_path = dir_path / "train"
+    test_path = dir_path / "test"
+
+    if check(config_path, train_path, test_path, num_clients, niid, balance, partition):
+        return
+
+    dataset_image = []
+    dataset_label = []
+        
+    # Get FGVCAircraft data
+    transform = transforms.Compose(
+        [transforms.Resize((64, 64)), 
+        transforms.ToTensor(), 
+        transforms.Normalize((0.5), (0.5))]
+    )
+
+    def load_data(split="train"):
+        trainset = torchvision.datasets.FGVCAircraft(
+            root=str(dir_path / "rawdata"), split=split, download=True, transform=transform)
+        
+        total = len(trainset)
+        for i in range(total):
+            img, label = trainset[i]
+            dataset_image.append(img.numpy())
+            dataset_label.append(label)
+            if (i + 1) % 500 == 0 or (i + 1) == total:
+                print(f"  [{split}] Processando: {i + 1}/{total}")
+
+    load_data("train")
+    load_data("val")
+    load_data("test")
+
+    dataset_image = np.array(dataset_image)
+    dataset_label = np.array(dataset_label)
+
+    num_classes = len(set(dataset_label))
+    print(f'Number of classes: {num_classes}')
+
+    X, y, statistic = separate_data((dataset_image, dataset_label), num_clients, num_classes, 
+                                    niid, balance, partition, class_per_client=10)
+    train_data, test_data = split_data(X, y)
+    save_file(config_path, train_path, test_path, train_data, test_data, num_clients, num_classes, 
+        statistic, niid, balance, partition)
+
+
+if __name__ == "__main__":
+    niid = True if len(sys.argv) > 1 and sys.argv[1] == "noniid" else False
+    balance = True if len(sys.argv) > 2 and sys.argv[2] == "balance" else False
+    partition = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] != "-" else None
+    if len(sys.argv) > 4 and sys.argv[4].isdigit():
+        num_clients = int(sys.argv[4])
+
+    generate_dataset(dir_path, num_clients, niid, balance, partition)

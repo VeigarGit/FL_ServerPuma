@@ -1,3 +1,6 @@
+# Responsabilidade: Configura dataset, modelo SLM, adaptadores LoRA/SoRA, PaCA e parâmetros de
+# treinamento do experimento.
+
 dataset:
   name: enterprise-explorers/oxford-pets
 

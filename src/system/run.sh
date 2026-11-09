@@ -1,4 +1,7 @@
 #!/bin/bash
+# Responsabilidade: Coordena a execução dos experimentos: interpreta opções, prepara dados e
+# inicia servidor e clientes em sessões tmux, organizando logs e repetições.
+
 
 # =============================================================================
 # run.sh — Script principal para execução de simulações de Federated Learning
@@ -365,10 +368,11 @@ if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67
 echo "===================================="
 
 # ---- Preparação do Dataset ----
-# Busca o script no diretório dataset
-SCRIPT_PATH=$(find ../dataset -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
+# Localiza o gerador no pacote principal
+SCRIPT_PATH=$(find ../fl_serverpuma/data/generators -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
 if [ -n "$SCRIPT_PATH" ]; then
-    uv run "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
+    GENERATOR_MODULE="fl_serverpuma.data.generators.$(basename "$SCRIPT_PATH" .py)"
+    uv run python -m "$GENERATOR_MODULE" noniid - dir "$CLIENT_COUNT"
 else
     echo "[ERRO] Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
     exit 1
@@ -420,7 +424,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
     mkdir -p "$LOG_DIR"
 
     # Comando do servidor
-    SERVER_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py \
+    SERVER_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run python -m fl_serverpuma.execution.server \
         --host $HOST \
         --port $PORT \
         --clients-per-round $CLIENT_COUNT \
@@ -500,7 +504,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py \
+        CLIENT_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run python -m fl_serverpuma.execution.client \
             --client-idx $i \
             --host $HOST \
             --port $PORT \

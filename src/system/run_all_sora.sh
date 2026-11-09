@@ -1,4 +1,7 @@
 #!/bin/bash
+# Responsabilidade: Executa uma sequência de experimentos PUMA-GT/SoRA em OxfordPets, DTD,
+# FGVCAircraft e Flowers102, repassando as opções ao script run.sh.
+
 
 # =============================================================================
 # run_all_sora.sh — Executa a sequência de simulações PUMA-GT nos 4 datasets

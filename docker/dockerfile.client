@@ -1,3 +1,6 @@
+# Responsabilidade: Constrói a imagem do cliente federado em duas etapas, instala as
+# dependências com uv e prepara código, bibliotecas e ambiente de execução.
+
 # ==========================================
 # ESTÁGIO 1: BUILDER
 # ==========================================
@@ -28,6 +31,7 @@ ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.11/site-packages/torch/lib:$LD_LIBRAR
 
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONPATH=/app/src
 
 WORKDIR /app
 ARG NO_CACHE=1
@@ -36,4 +40,4 @@ COPY . .
 RUN mkdir -p /app/src/system/dados_compartilhados
 
 WORKDIR /app/src/system
-CMD ["python", "client.py"]
+CMD ["python", "-m", "fl_serverpuma.execution.client"]

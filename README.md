@@ -1,5 +1,14 @@
 # FL_ServerPuma: Adaptive Federated Learning Simulator
 
+## Source organization
+
+The Python implementations live in `src/fl_serverpuma`, grouped into algorithms,
+models, execution, communication, data, experiment analysis and simulation.
+Execute Python entrypoints with `uv run python -m fl_serverpuma.<module>`.
+Legacy Python forwarding files have been removed. Working directories,
+configuration files, datasets and result locations are preserved. See [AGENTS.md](AGENTS.md) for development rules, architecture, file responsibilities and scope.
+The [Dependency outline](docs/sumario-dependencias.md) shows internal imports as numbered chapters with nested dependencies and references to functions and methods.
+
 ## 📋 Overview
 
 **FL_ServerPuma** is a research-focused Federated Learning simulator designed to evaluate the performance of distributed training under constrained network and hardware conditions. 
@@ -48,13 +57,13 @@ Regardless of the execution method, the environment must be synced and the parti
 2. **Generate the Non-IID Dataset:**
    ```bash
    # Example with MNIST (lightest, recommended for initial testing)
-   uv run python src/dataset/generate_MNIST.py noniid - dir
+   uv run python -m fl_serverpuma.data.generators.generate_MNIST noniid - dir
 
    # Example with Cifar100
-   uv run python src/dataset/generate_Cifar100.py noniid - dir
+   uv run python -m fl_serverpuma.data.generators.generate_Cifar100 noniid - dir
 
    # Example with Flowers102
-   uv run python src/dataset/generate_Flowers102.py noniid - dir
+   uv run python -m fl_serverpuma.data.generators.generate_Flowers102 noniid - dir
    ```
 
 > **⚠️ Important:** The number of data partitions is defined by the `num_clients` variable **inside each dataset generator script** (e.g., `generate_MNIST.py`). Make sure this value matches or exceeds the `--clients` count you plan to use in Docker Compose. Otherwise, some clients will have no data and the experiment will fail.
@@ -66,10 +75,10 @@ Regardless of the execution method, the environment must be synced and the parti
 This method containerizes the server and clients using highly optimized Multi-stage builds, automatically applying network constraints and mounting local volumes to save results persistently.
 
 **1. Generate the Docker Compose file dynamically:**
-Use `generate_compose.py` to set up your experiment parameters.
+Use `fl_serverpuma.simulation.docker.compose` to set up your experiment parameters.
 ```bash
 cd docker/
-uv run python generate_compose.py --clients 5 --dataset Cifar100 --rounds 5 --prune 1 --ala 0
+uv run python -m fl_serverpuma.simulation.docker.compose --clients 5 --dataset Cifar100 --rounds 5 --prune 1 --ala 0
 ```
 *Parameters:*
 * `--clients`: Number of clients to simulate.
@@ -102,7 +111,7 @@ docker compose --project-directory .. -f docker-compose.generated.yml down
 
 ### 🔄 Standard Workflow to Change Parameters
 To run a new experiment with different parameters, simply repeat the cycle:
-1. Run `generate_compose.py` with the new flags.
+1. Run `fl_serverpuma.simulation.docker.compose` with the new flags.
 2. Run `docker compose ... up --build -d`.
 3. Run `docker compose ... logs -f`.
 4. Run `docker compose ... down` when finished.
@@ -302,7 +311,7 @@ sumo --version
 ### Step 1: Generate the Non-IID Dataset
 
 ```bash
-uv run python src/dataset/generate_MNIST.py noniid - dir
+uv run python -m fl_serverpuma.data.generators.generate_MNIST noniid - dir
 ```
 
 ### Step 2: Run the V2X Simulation
@@ -313,16 +322,16 @@ Navigate to the `sumo_adapter` directory and execute the orchestrator:
 cd src/sumo_adapter/
 
 # First run or after code changes
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+sg docker -c "uv run python3 -m fl_serverpuma.simulation.sumo.orchestrator \
     --sumo-cfg maps/grid.sumocfg \
     --build --gui"
 
 # Default run (headless, 5 vehicles, MNIST, max 4 encounters)
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+sg docker -c "uv run python3 -m fl_serverpuma.simulation.sumo.orchestrator \
     --sumo-cfg maps/grid.sumocfg"
 
 # With SUMO GUI + custom parameters
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
+sg docker -c "uv run python3 -m fl_serverpuma.simulation.sumo.orchestrator \
     --sumo-cfg maps/grid.sumocfg \
     --gui \
     --total-clients 5 \
@@ -395,19 +404,19 @@ To isolate logs and debug specific client-server interactions, open multiple ter
 **Terminal 1 (Server):**
 ```bash
 cd src/system/
-uv run server.py --dataset Cifar100 --clients-per-round 3 --rounds 5 --prune 1
+uv run python -m fl_serverpuma.execution.server --dataset Cifar100 --clients-per-round 3 --rounds 5 --prune 1
 ```
 
 **Terminal 2 (Client 0):**
 ```bash
 cd src/system/
-uv run client.py --client-idx 0 --dataset Cifar100 --rounds 5 --ala 0
+uv run python -m fl_serverpuma.execution.client --client-idx 0 --dataset Cifar100 --rounds 5 --ala 0
 ```
 
 **Terminal 3 (Client 1):**
 ```bash
 cd src/system/
-uv run client.py --client-idx 1 --dataset Cifar100 --rounds 5 --ala 0
+uv run python -m fl_serverpuma.execution.client --client-idx 1 --dataset Cifar100 --rounds 5 --ala 0
 ```
 *(Repeat for as many clients as specified in `--clients-per-round`)*
 
@@ -427,7 +436,7 @@ After the simulation completes, performance metrics (Accuracy, Loss, Model Size 
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| `CUDA not available` inside containers | NVIDIA Container Toolkit not installed | Install `nvidia-container-toolkit`, or remove the `deploy.resources` GPU block from `generate_compose.py` to run on CPU |
+| `CUDA not available` inside containers | NVIDIA Container Toolkit not installed | Install `nvidia-container-toolkit`, or remove the `deploy.resources` GPU block from `fl_serverpuma.simulation.docker.compose` to run on CPU |
 | Clients exit immediately with data errors | Dataset not generated, or fewer partitions than clients | Ensure `num_clients` in the generator script ≥ `--clients` in compose, then regenerate the dataset |
 | `docker-tc` rules not applying | Daemon not running | Check with `docker ps | grep docker-tc`; restart if needed |
 | First Docker build is very slow | Downloading all Python dependencies | Subsequent builds are cached; only rebuilds if `pyproject.toml` or `uv.lock` change |

@@ -1,3 +1,6 @@
+# Responsabilidade: Configura dataset, modelo CLIP, adaptadores LoRA/SoRA/ADALoRA, PaCA e
+# parâmetros de treinamento do experimento.
+
 dataset:
   name: enterprise-explorers/oxford-pets
 

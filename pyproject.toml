@@ -72,4 +72,4 @@ torchaudio = [
   { index = "pytorch", marker = "sys_platform == 'linux'" }
 ]
 [tool.hatch.build.targets.wheel]
-packages = ["src/system", "src/dataset", "src/utils"]
+packages = ["src/fl_serverpuma"]
