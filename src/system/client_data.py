@@ -101,10 +101,47 @@ def load_data(
     is_clip=False,
     is_slm=False,
     slm_config=None,
+    is_lfm=False,
+    lfm_config=None,
     dataset_dir=None,
 ):
-    """Carrega a partição local .npz e prepara o DataLoader para CNN, CLIP ou SLM."""
+    """Carrega a partição local .npz e prepara o DataLoader para CNN, CLIP, SLM ou LFM."""
     train_data = read_client_data(dataset, client_idx, is_train, dataset_dir=dataset_dir)
+
+    if is_lfm:
+        from lora_lfm.lfm_setup import LFMCollator, LFMDecisionDataset
+        from transformers import AutoTokenizer
+
+        model_cfg = lfm_config.get("model", {}) if lfm_config else {}
+        model_name = model_cfg.get("name", "LiquidAI/LFM3-VL-2B")
+        revision = model_cfg.get("revision", "f83d2b0a2296aaa277f394990a9b8b949ddf9691")
+        max_length = model_cfg.get("max_length", 2048)
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, revision=revision, trust_remote_code=True
+        )
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        classes_path = (
+            Path(__file__).resolve().parent.parent / "dataset" / dataset / "classes.json"
+        )
+        if not classes_path.exists():
+            classes_path = Path("src/dataset") / dataset / "classes.json"
+        with classes_path.open("r", encoding="utf-8") as f:
+            options = json.load(f)
+
+        lfm_dataset = LFMDecisionDataset(train_data, tokenizer, options, max_length=max_length)
+        collate_fn = LFMCollator(tokenizer.pad_token_id)
+        pin_mem = hasattr(device, "type") and device.type == "cuda"
+        return DataLoader(
+            lfm_dataset,
+            batch_size=batch_size,
+            shuffle=is_train,
+            collate_fn=collate_fn,
+            pin_memory=pin_mem,
+        )
+
     X, y = zip(*train_data, strict=False)
     X = torch.stack(X)
 
@@ -160,7 +197,9 @@ def build_client_dataloaders(
     try:
         is_clip_flag = args.model == "clip"
         is_slm_flag = args.model == "slm"
+        is_lfm_flag = args.model == "lfm"
         slm_cfg = run_config if is_slm_flag else None
+        lfm_cfg = run_config if is_lfm_flag else None
         train_loader = load_data(
             args.dataset,
             args.client_idx,
@@ -170,6 +209,8 @@ def build_client_dataloaders(
             is_clip=is_clip_flag,
             is_slm=is_slm_flag,
             slm_config=slm_cfg,
+            is_lfm=is_lfm_flag,
+            lfm_config=lfm_cfg,
             dataset_dir=args.dataset_dir,
         )
         test_loader = load_data(
@@ -181,6 +222,8 @@ def build_client_dataloaders(
             is_clip=is_clip_flag,
             is_slm=is_slm_flag,
             slm_config=slm_cfg,
+            is_lfm=is_lfm_flag,
+            lfm_config=lfm_cfg,
             dataset_dir=args.dataset_dir,
         )
         test_majority_baseline = None

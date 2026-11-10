@@ -225,6 +225,7 @@ Definido em `src/utils/network_utils.py`. Toda mensagem usa um cabeçalho de **4
 | `cnn` | `SimpleModel` (`src/system/model.py`) | 2x `Conv2d` + ReLU + MaxPool $\rightarrow$ 2x `Linear` | `float32` | N/A (usa poda OPALA/NISP/SNIP) |
 | `clip` | `CLIPForClassification` (`src/system/lora_clip/clip_setup.py`) | `openai/clip-vit-base-patch32` (`vision_model` + `classifier`) | `float32` (`sdpa`) | 12 camadas (`encoder.layers`) |
 | `slm` | `SLMForClassification` (`src/system/lora_slm/slm_setup.py`) | `Qwen/Qwen3-VL-2B-Instruct` (`language_model` + `classifier` no último token não-pad) | `bfloat16` (`sdpa`) | 28 camadas (`language_model.layers`) |
+| `lfm` | `DecisionLFM` (`src/system/lora_lfm/lfm_setup.py`) | `LiquidAI/LFM3-VL-2B` (`language_model` + `DecisionHead` cosseno em 1 passagem) | `bfloat16` / `4-bit NF4` | 24 camadas (`language_model.layers`) |
 
 ### 5.2 Equação do Índice de Capacidade ($\gamma^c$) no Servidor
 Calculado em `calculate_capacity_index` (`src/system/server.py`) a cada rodada para guiar a poda CNN, o **PaCA Adaptativo** (`--adaptive-paca`) e o **Rank Adaptativo** (`--adaptive-rank`):

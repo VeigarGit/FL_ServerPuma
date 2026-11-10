@@ -44,6 +44,7 @@ CLIENT_COUNT=2
 ROUNDS=5
 DATASET="MNIST"
 BATCH_SIZE=32
+CUSTOM_BATCH_SIZE=0
 MAX_CLIENTS=25
 SIMULATIONS=1
 START_RUN=1
@@ -209,7 +210,7 @@ while [ $# -gt 0 ]; do
         -c|--clients) CLIENT_COUNT="$2"; shift 2 ;;
         -r|--rounds) ROUNDS="$2"; shift 2 ;;
         -d|--dataset) DATASET="$2"; shift 2 ;;
-        --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+        --batch-size) BATCH_SIZE="$2"; CUSTOM_BATCH_SIZE=1; shift 2 ;;
         --max-clients) MAX_CLIENTS="$2"; shift 2 ;;
         --simulations) SIMULATIONS="$2"; shift 2 ;;
         --start-run) START_RUN="$2"; shift 2 ;;
@@ -222,8 +223,16 @@ while [ $# -gt 0 ]; do
         --config) CONFIG_FILE="$2"; shift 2 ;;
 
         # Dispositivo
-        --device) DEVICE="$2"; shift 2 ;;
-        -did|--device-id) DEVICE_ID="$2"; CUSTOM_DID=1; shift 2 ;;
+        --device)
+            DEVICE="$2"
+            if [[ "$DEVICE" =~ ^cuda:([0-9]+)$ ]]; then
+                DEVICE_ID="${BASH_REMATCH[1]}"
+                CUSTOM_DID=1
+                DEVICE="cuda"
+            fi
+            shift 2
+            ;;
+        -did|--device-id|-g|--gpu) DEVICE_ID="$2"; CUSTOM_DID=1; shift 2 ;;
         --cpu) USE_CPU=1; shift 1 ;;
 
         # Pruning
@@ -292,6 +301,7 @@ done
 # ---- Auto-inferência de NUM_CLASSES por Dataset ----
 if [ "$CUSTOM_NUM_CLASSES" -eq 0 ]; then
     case "$DATASET" in
+        Banking77)    NUM_CLASSES=77 ;;
         OxfordPets)   NUM_CLASSES=37 ;;
         DTD)          NUM_CLASSES=47 ;;
         FGVCAircraft) NUM_CLASSES=100 ;;
@@ -333,34 +343,47 @@ else
 fi
 
 # ---- Validação ----
-if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ]; then
+if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ]; then
     if [ -z "$CONFIG_FILE" ]; then
-        if [ "$MODEL" = "slm" ]; then
+        if [ "$MODEL" = "lfm" ]; then
+            CONFIG_FILE="lora_lfm/train_config.yml"
+        elif [ "$MODEL" = "slm" ]; then
             CONFIG_FILE="lora_slm/train_config.yml"
         elif [ "$MODEL" = "clip" ]; then
             CONFIG_FILE="lora_clip/train_config.yml"
         fi
     fi
     
-    # Auto-ajuste de PaCA conforme o modelo (SLM=28 camadas, CLIP=12 camadas)
+    # Auto-ajuste de PaCA conforme o modelo (SLM=28 camadas, LFM=24 camadas, CLIP=12 camadas)
     if [ "$CUSTOM_PACA" -eq 0 ]; then
-        if [ "$MODEL" = "slm" ]; then
+        if [ "$MODEL" = "lfm" ]; then
+            PACA=24
+        elif [ "$MODEL" = "slm" ]; then
             PACA=28
         elif [ "$MODEL" = "clip" ]; then
             PACA=12
         fi
     fi
     if [ "$CUSTOM_PACA_MAX" -eq 0 ]; then
-        if [ "$MODEL" = "slm" ]; then
+        if [ "$MODEL" = "lfm" ]; then
+            PACA_MAX=24
+        elif [ "$MODEL" = "slm" ]; then
             PACA_MAX=28
         elif [ "$MODEL" = "clip" ]; then
             PACA_MAX=12
         fi
     fi
+
+    # Batch size padrão reduzido para Foundation Models (SLM/LFM) se não especificado pelo usuário
+    if [ "$CUSTOM_BATCH_SIZE" -eq 0 ]; then
+        if [ "$MODEL" = "lfm" ] || [ "$MODEL" = "slm" ]; then
+            BATCH_SIZE=4
+        fi
+    fi
 fi
 
-if [ "$QLORA" -eq 1 ] && { [ "$MODEL" != "slm" ] || [ "$STRATEGY" != "lora" ]; }; then
-    echo "❌ [ERRO] --qlora requer --model slm e --strategy lora (atual: model=$MODEL, strategy=$STRATEGY)"
+if [ "$QLORA" -eq 1 ] && { { [ "$MODEL" != "slm" ] && [ "$MODEL" != "lfm" ]; } || [ "$STRATEGY" != "lora" ]; }; then
+    echo "❌ [ERRO] --qlora requer --model slm|lfm e --strategy lora (atual: model=$MODEL, strategy=$STRATEGY)"
     exit 1
 fi
 
@@ -375,10 +398,16 @@ if [ "$MODEL" = "clip" ]; then
     echo "  Modelo: CLIP | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 elif [ "$MODEL" = "slm" ]; then
     echo "  Modelo: SLM (Qwen-VL) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
+elif [ "$MODEL" = "lfm" ]; then
+    echo "  Modelo: LFM (DecisionLFM LiquidAI) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 else
     echo "  Modelo: CNN Simples Padrão"
 fi
-echo "  Device: $DEVICE ($DEVICE_ID) | Sessão TMUX: $SESSION_NAME"
+if [ "$CUSTOM_DID" -eq 1 ]; then
+    echo "  Device: $DEVICE (GPU $DEVICE_ID EXCLUSIVA para Servidor e todos os Clientes) | Sessão TMUX: $SESSION_NAME"
+else
+    echo "  Device: $DEVICE (Round-Robin entre $NUM_GPUS GPUs detectadas) | Sessão TMUX: $SESSION_NAME"
+fi
 
 if [ "$RANDOM_PACA" -eq 1 ]; then
     echo "  PaCA Heterogêneo: ATIVADO (aleatório entre $PACA_MIN e $PACA_MAX)"
@@ -521,6 +550,12 @@ for RUN in $(seq $START_RUN $END_RUN); do
     fi
     SERVER_CMD="$SERVER_CMD 2>&1 | tee $LOG_DIR/server.log"
 
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        echo "[AVISO] Sessão tmux '$SESSION_NAME' anterior encontrada. Encerrando sessão antiga antes de iniciar..."
+        tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        sleep 1
+    fi
+
     if [ "$AUTO_NEXT" -eq 1 ]; then
         tmux new-session -d -s "$SESSION_NAME" "$SERVER_CMD"
     else
@@ -562,6 +597,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
             --port $PORT \
             --dataset $DATASET \
             --rounds $ROUNDS \
+            --batch-size $BATCH_SIZE \
             --ala $ALA \
             --device $DEVICE \
             --device_id $CLIENT_DEVICE_ID \

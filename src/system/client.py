@@ -112,7 +112,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"])
     parser.add_argument("-did", "--device_id", type=str, default="0")
     parser.add_argument("--ala", type=int, default=0)
-    parser.add_argument("--model", type=str, default="cnn")
+    parser.add_argument("--model", type=str, default="cnn", choices=["cnn", "clip", "slm", "lfm"])
     parser.add_argument("--config", type=str, default="lora_clip/train_config.yml")
     parser.add_argument("--experiments", type=int, default=1)
     parser.add_argument("--run-id", type=int, default=1)
@@ -271,11 +271,16 @@ def _evaluate_global_before_training(
     eval_start = time.time()
     if round_num + 1 >= 2:
         old_local_weights = None
-        if model_type in ["clip", "slm"]:
+        if model_type in ["clip", "slm", "lfm"]:
             old_local_weights = {
                 n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad
             }
-        if qlora:
+        if model_type == "lfm":
+            from lora_lfm.lfm_setup import set_lfm_state_dict
+
+            set_lfm_state_dict(model, global_state)
+            local = model
+        elif qlora:
             set_qlora_state_dict(model, global_state)
             local = model
         else:
@@ -360,7 +365,7 @@ def run_centralized_client(
 
         for round_num in range(args.rounds):
             logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
-            if args.model in ["clip", "slm"]:
+            if args.model in ["clip", "slm", "lfm"]:
                 server_paca, _ = recv_data(s)
                 if server_paca is None or server_paca == "end":
                     break
@@ -422,7 +427,7 @@ def run_centralized_client(
                 alaarg=args.ala,
                 ala=ala,
                 model_type=args.model,
-                run_config=run_config if args.model in ["clip", "slm"] else None,
+                run_config=run_config if args.model in ["clip", "slm", "lfm"] else None,
             )
             client_training_time = time.time() - train_start
             history.ala_acc.append(
@@ -453,7 +458,7 @@ def run_centralized_client(
                 send_data(s, test_loss)
                 send_data(s, client_processing_overhead)
                 logger.info("Client update sent.")
-                if args.model == "slm":
+                if args.model in ["slm", "lfm"]:
                     round_ack, _ = recv_data(s)
                     if round_ack is None:
                         break

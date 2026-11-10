@@ -189,6 +189,36 @@ def build_client_model(
                 model = build_model_slm(
                     config=run_config, num_classes=args.num_classes, device=device
                 )
+        case "lfm":
+            import yaml
+            from lora_lfm.lfm_setup import setup_lfm_model
+
+            config_path = (
+                Path(args.config) if args.config else Path("src/system/lora_lfm/train_config.yml")
+            )
+            if not config_path.exists():
+                config_path = Path("lora_lfm/train_config.yml")
+            with config_path.open("r", encoding="utf-8") as f:
+                run_config = yaml.safe_load(f)
+
+            if args.rank:
+                run_config["model"]["lora"]["r"] = args.rank
+                run_config["model"]["lora"]["alpha"] = 2 * args.rank
+
+            if args.paca is not None and args.paca > 0:
+                run_config["model"]["paca"]["enabled"] = True
+                run_config["model"]["paca"]["upper_layers"] = args.paca
+            else:
+                run_config["model"]["paca"]["enabled"] = False
+                run_config["model"]["paca"]["upper_layers"] = None
+
+            run_config["is_qlora"] = bool(args.qlora)
+            if args.qlora:
+                logger.info(
+                    "QLoRA ATIVADO para LFM: backbone 4-bit NF4 + DoubleQuant, LoRA 16 bits."
+                )
+
+            model, _ = setup_lfm_model(run_config, device, is_qlora=bool(args.qlora))
         case _:
             logger.error(f"Modelo inválido: {args.model}")
             sys.exit(1)
@@ -221,6 +251,10 @@ def extract_trainable_model_state(
     model: nn.Module, model_type: str, run_config: dict | None = None
 ) -> dict:
     """Extrai o dicionário de pesos treináveis de acordo com a arquitetura e modo QLoRA."""
+    if model_type == "lfm":
+        from lora_lfm.lfm_setup import get_lfm_state_dict
+
+        return get_lfm_state_dict(model, trainable_only=True)
     if model_type in ("clip", "slm"):
         if run_config is not None and is_qlora_enabled(run_config):
             return get_qlora_state_dict(model)
@@ -235,8 +269,12 @@ def extract_trainable_model_state(
 
 
 def load_trainable_model_state(model: nn.Module, state_dict: dict, model_type: str) -> None:
-    """Carrega pesos agregados no modelo local (suporta CNN, CLIP e SLM)."""
-    if model_type == "clip":
+    """Carrega pesos agregados no modelo local (suporta CNN, CLIP, SLM e LFM)."""
+    if model_type == "lfm":
+        from lora_lfm.lfm_setup import set_lfm_state_dict
+
+        set_lfm_state_dict(model, state_dict)
+    elif model_type == "clip":
         from lora_clip.sora import set_trainable_state_dict
 
         set_trainable_state_dict(model, state_dict)
@@ -281,6 +319,45 @@ def local_training(
 
     if round_num >= 2 and prune == 1 and model_type == "cnn":
         state_dict = map_sequential_to_simplemodel(state_dict)
+
+    device = next(model.parameters()).device
+
+    if model_type == "lfm":
+        from lora_lfm.lfm_setup import set_lfm_state_dict, update_paca_runtime
+        from lora_lfm.qlora import build_lfm_optimizer
+        from lora_lfm.trainer import train_epoch_lfm
+
+        if state_dict:
+            set_lfm_state_dict(model, state_dict)
+
+        paca_cfg = run_config["model"].get("paca", {}) if run_config else {}
+        if paca_cfg.get("enabled"):
+            update_paca_runtime(model, paca_cfg.get("upper_layers"))
+
+        _log_trainable_param_count(model)
+
+        brier_weight = (
+            run_config.get("training", {}).get("brier_weight", 1.0) if run_config else 1.0
+        )
+        grad_accum = (
+            run_config.get("training", {}).get("gradient_accumulation_steps", 1)
+            if run_config
+            else 1
+        )
+        is_qlora = bool(run_config.get("is_qlora", False)) if run_config else False
+        optimizer = build_lfm_optimizer(model, run_config or {}, is_qlora=is_qlora)
+
+        loss, acc = train_epoch_lfm(
+            model,
+            train_loader,
+            optimizer,
+            None,
+            device,
+            brier_weight=brier_weight,
+            grad_accum_steps=grad_accum,
+        )
+        logger.info(f"LFM Treino Local - Loss (CE+Brier): {loss:.4f} | Acc: {acc:.2f}%")
+        return extract_trainable_model_state(model, model_type, run_config), personalized_acc
 
     # === SINCRONIZAÇÃO DE PESOS GLOBAIS E FEDALA ===
     if model_type in ["clip", "slm"]:

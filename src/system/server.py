@@ -9,6 +9,7 @@ import sys
 import os
 import logging
 import math
+import json
 from pathlib import Path
 
 # Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
@@ -195,6 +196,37 @@ class FederatedLearningServer:
                         self.slm_collator = CustomCollator(processor, label_to_idx)
                     except Exception as e:
                         logger.warning(f"Não foi possível pré-carregar CustomCollator para SLM na inicialização: {e}")
+            case 'lfm':
+                import yaml
+                from lora_lfm.lfm_setup import LFMCollator, setup_lfm_model
+
+                config_path = (
+                    Path(args.config) if args.config else Path("src/system/lora_lfm/train_config.yml")
+                )
+                if not config_path.exists():
+                    config_path = Path("lora_lfm/train_config.yml")
+                with config_path.open("r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+                self.config = config
+
+                if args.rank:
+                    config["model"]["lora"]["r"] = args.rank
+                    config["model"]["lora"]["alpha"] = 2 * args.rank
+
+                if args.paca is not None and args.paca > 0:
+                    config["model"]["paca"]["enabled"] = True
+                    config["model"]["paca"]["upper_layers"] = args.paca
+                else:
+                    config["model"]["paca"]["enabled"] = False
+                    config["model"]["paca"]["upper_layers"] = None
+
+                config["is_qlora"] = bool(getattr(args, "qlora", False))
+                self.global_model, tokenizer = setup_lfm_model(
+                    config, args.device, is_qlora=bool(getattr(args, "qlora", False))
+                )
+                self.input_size = None
+                self.lfm_collator = LFMCollator(tokenizer.pad_token_id)
+                self.lfm_tokenizer = tokenizer
                         
                         
         self.qlora = getattr(args, 'qlora', False)
@@ -203,7 +235,10 @@ class FederatedLearningServer:
             logger.info(f"Carregando pesos salvos de: {args.load_model}")
             state_dict = torch.load(args.load_model, map_location=args.device)
             
-            if self.qlora:
+            if self.args.model == 'lfm':
+                from lora_lfm.lfm_setup import set_lfm_state_dict
+                set_lfm_state_dict(self.global_model, state_dict)
+            elif self.qlora:
                 # QLoRA: o checkpoint contém apenas adaptadores + head
                 set_qlora_state_dict(self.global_model, state_dict)
             else:
@@ -220,8 +255,13 @@ class FederatedLearningServer:
         self.rs_test_acc = []
         self.rs_test_loss = []
         self.rs_aux_simple_avg_acc = []  # Média simples das acurácias reportadas pelos clientes (usada pelo PaCA/Rank adaptativo)
-        # QLoRA: o estado agregável contém SOMENTE adaptadores LoRA + head (backbone 4-bit nunca é agregado)
-        self.global_state = get_qlora_state_dict(self.global_model, trainable_only=False) if self.qlora else self.global_model.state_dict()
+        # QLoRA / PEFT: o estado agregável contém SOMENTE adaptadores LoRA + head (backbone nunca é agregado)
+        if self.args.model == 'lfm':
+            self.global_state = self._lfm_trainable_state(trainable_only=False)
+        elif self.qlora:
+            self.global_state = get_qlora_state_dict(self.global_model, trainable_only=False)
+        else:
+            self.global_state = self.global_model.state_dict()
         self.lock = threading.Lock()
         self.client_data = {}
         self.client_connections = []
@@ -257,9 +297,9 @@ class FederatedLearningServer:
         self.previous_sent_state = {}   # client_id → state_dict enviado na rodada anterior
         self.previous_recv_state = {}   # client_id → state_dict recebido na rodada anterior
         
-        if self.args.model == 'slm':
+        if self.args.model in ['slm', 'lfm']:
             alpha_list, beta_list = [0], [0]
-            logger.info("Cálculo de complexidade ignorado para SLM (forward multimodal complexo).")
+            logger.info("Cálculo de complexidade ignorado para SLM/LFM.")
         else:
             calculator = LayerComplexityCalculator(self.global_model, self.input_size)
             alpha_list, beta_list = calculator.calculate_alpha_beta()
@@ -279,6 +319,10 @@ class FederatedLearningServer:
             from lora_slm.slm_setup import _get_encoder_layers
             layers = _get_encoder_layers(self.global_model)
             self.total_encoder_layers = len(layers) if layers else self.args.paca
+        elif self.args.model == 'lfm':
+            from lora_lfm.lfm_setup import _get_encoder_layers
+            layers = _get_encoder_layers(self.global_model)
+            self.total_encoder_layers = len(layers) if layers else (self.args.paca or 24)
         else:
             self.total_encoder_layers = self.args.paca  # fallback
         logger.info(f"Total encoder layers detectado: {self.total_encoder_layers}")
@@ -286,17 +330,26 @@ class FederatedLearningServer:
         # Dicionário para armazenar máscaras por cliente
         self.client_masks = {}
         
-        self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
-        if self.test_loader is not None:
-            self.test_loaders_cache[args.test_client_idx if args.test_client_idx is not None else 0] = self.test_loader
+        if args.model in ['slm', 'lfm']:
+            self.test_loader = None
+            logger.info(f"Modelo {args.model}: Avaliação global configurada via agregação federada ponderada dos clientes (Zero Data Leakage).")
         else:
-            logger.warning("Could not load test data. Evaluation will be skipped.")
+            self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
+            if self.test_loader is not None:
+                self.test_loaders_cache[args.test_client_idx if args.test_client_idx is not None else 0] = self.test_loader
+            else:
+                logger.warning("Could not load test data. Evaluation will be skipped.")
 
     def _slm_trainable_state(self):
         """Estado do SLM que trafega/é salvo. No QLoRA: apenas adaptadores LoRA 16 bits + head."""
         if self.qlora:
             return get_qlora_state_dict(self.global_model, trainable_only=False)
         return get_trainable_state_dict_slm(self.global_model)
+
+    def _lfm_trainable_state(self, trainable_only: bool = False):
+        """Estado do LFM que trafega/é salvo (apenas adaptadores LoRA + DecisionHead)."""
+        from lora_lfm.lfm_setup import get_lfm_state_dict
+        return get_lfm_state_dict(self.global_model, trainable_only=trainable_only)
 
     def aggregate_models(self, model_list, global_model, client_weights=None):
         agg_state = global_model.copy()
@@ -488,7 +541,7 @@ class FederatedLearningServer:
         self.target_latency = mean_time * 1.15
         
         # Pisos de segurança por tipo de modelo para evitar colapso de timeout em rodadas pontualmente rápidas
-        if self.args.model == 'slm':
+        if self.args.model in ['slm', 'lfm']:
             min_floor = 1200.0
             multiplier = 2.5
         elif self.args.model == 'clip':
@@ -910,11 +963,13 @@ class FederatedLearningServer:
                         current_global_state = get_trainable_state_dict(self.global_model)
                     elif self.args.model == 'slm':
                         current_global_state = self._slm_trainable_state()
+                    elif self.args.model == 'lfm':
+                        current_global_state = self._lfm_trainable_state()
                     else:
                         current_global_state = self.global_state.copy()
             
-            # --- PaCA DINÂMICO (para CLIP e SLM, a partir do round 2, se ativado) ---
-            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            # --- PaCA DINÂMICO (para CLIP, SLM e LFM, a partir do round 2, se ativado) ---
+            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
                 ideal_paca = self.calculate_adaptive_paca(client_id)
                 self.clients_info[client_id]['current_paca'] = ideal_paca
                 
@@ -931,8 +986,8 @@ class FederatedLearningServer:
                         logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
                                     f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
 
-            # --- RANK ADAPTATIVO (para CLIP e SLM, a partir do round 2, se ativado) ---
-            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
+            # --- RANK ADAPTATIVO (para CLIP, SLM e LFM, a partir do round 2, se ativado) ---
+            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
                 ideal_rank = self.calculate_adaptive_rank(client_id)
                 self.clients_info[client_id]['current_rank'] = ideal_rank
                 
@@ -948,7 +1003,7 @@ class FederatedLearningServer:
 
             
             # --- Problema #4: Envia PaCA dinâmico para que o cliente treine apenas as camadas necessárias ---
-            if self.args.model in ['clip', 'slm']:
+            if self.args.model in ['clip', 'slm', 'lfm']:
                 client_paca = self.clients_info[client_id].get('current_paca', self.args.paca) if getattr(self.args, 'adaptive_paca', False) else self.args.paca
                 send_data(conn, client_paca)
 
@@ -1115,7 +1170,7 @@ class FederatedLearningServer:
             self.clients_info[client_id]['data'] = self.client_data[client_id]
             
             # --- PaCA DINÂMICO: Remove chaves devolvidas que o cliente NÃO treinou ---
-            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
                 ideal_paca = self.clients_info[client_id].get('current_paca', self.args.paca)
                 min_layer = self.total_encoder_layers - ideal_paca
                 if min_layer > 0 and updated_state is not None:
@@ -1224,6 +1279,33 @@ class FederatedLearningServer:
     def load_test_data(self, dataset, client_idx=0, batch_size=32):
         try:
             test_data = read_client_data(dataset, client_idx if client_idx is not None else 0, is_train=False)
+
+            if getattr(self.args, 'model', 'cnn') == 'lfm':
+                from lora_lfm.lfm_setup import LFMDecisionDataset
+                classes_path = Path("src/dataset") / dataset / "classes.json"
+                if not classes_path.exists():
+                    classes_path = Path(__file__).resolve().parent.parent / "dataset" / dataset / "classes.json"
+                with classes_path.open("r", encoding="utf-8") as f:
+                    options = json.load(f)
+                max_len = (
+                    self.config.get("model", {}).get("max_length", 2048)
+                    if hasattr(self, 'config') and self.config
+                    else 2048
+                )
+                lfm_ds = LFMDecisionDataset(test_data, self.lfm_tokenizer, options, max_length=max_len)
+                pin_mem = (
+                    True
+                    if hasattr(self.args, 'device') and torch.device(self.args.device).type == 'cuda'
+                    else False
+                )
+                return DataLoader(
+                    lfm_ds,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    collate_fn=self.lfm_collator,
+                    pin_memory=pin_mem,
+                )
+
             X, y = zip(*test_data)
             X = torch.stack(X)
             y = torch.tensor(y)
@@ -1313,7 +1395,7 @@ class FederatedLearningServer:
         logger.info(f"Total rounds: {self.args.rounds}")
         logger.info("=======================================")
         
-        if self.args.model == 'slm':
+        if self.args.model in ['slm', 'lfm']:
             self.time_threshold = 1800.0
         elif self.args.model == 'clip':
             self.time_threshold = 600.0
@@ -1384,6 +1466,8 @@ class FederatedLearningServer:
                         self.current_round_state = get_trainable_state_dict(self.global_model)
                     elif self.args.model == 'slm':
                         self.current_round_state = self._slm_trainable_state()
+                    elif self.args.model == 'lfm':
+                        self.current_round_state = self._lfm_trainable_state()
                     else:
                         self.current_round_state = self.global_state.copy()
                 self.size_before_cache = {}
@@ -1466,12 +1550,29 @@ class FederatedLearningServer:
                     
                     with self.lock:
                         self.global_state = aggregated_state
-                        if self.qlora:
+                        if self.args.model == 'lfm':
+                            from lora_lfm.lfm_setup import set_lfm_state_dict
+                            set_lfm_state_dict(self.global_model, self.global_state)
+                        elif self.qlora:
                             set_qlora_state_dict(self.global_model, self.global_state)
                         else:
                             self.global_model.load_state_dict(self.global_state, strict=False)
                     
-                    if self.test_loader is not None or self.client_idx:
+                    if self.args.model in ['slm', 'lfm']:
+                        # Avaliação Federada Canônica: Média ponderada reportada pelos clientes
+                        if client_accuracies and safe_client_weights and len(client_accuracies) == len(safe_client_weights):
+                            tot_weight = sum(safe_client_weights)
+                            final_accuracy = sum(w * a for w, a in zip(safe_client_weights, client_accuracies)) / tot_weight if tot_weight > 0 else 0.0
+                            final_loss = sum(w * l for w, l in zip(safe_client_weights, client_losses)) / tot_weight if tot_weight > 0 else 0.0
+                        elif client_accuracies:
+                            final_accuracy = sum(client_accuracies) / len(client_accuracies)
+                            final_loss = sum(client_losses) / len(client_losses) if client_losses else 0.0
+                        else:
+                            final_accuracy, final_loss = 0.0, 0.0
+                        self.rs_test_acc.append(final_accuracy)
+                        self.rs_test_loss.append(final_loss)
+                        logger.info(f"Round {round_num + 1}: Federated Weighted Test Acc (from clients): {final_accuracy:.2f}% | Loss: {final_loss:.4f}")
+                    elif self.test_loader is not None or self.client_idx:
                         try:
                             total_correct_weight = 0.0
                             total_loss_weight = 0.0
@@ -1560,7 +1661,7 @@ class FederatedLearningServer:
                     successful_notifications = 0
                     for conn in self.client_connections:
                         try:
-                            if self.args.model == 'slm':
+                            if self.args.model in ['slm', 'lfm']:
                                 send_data(conn, "end")
                             else:
                                 conn.send('end'.encode('utf-8'))
@@ -1592,6 +1693,8 @@ class FederatedLearningServer:
                 weights_to_save = get_trainable_state_dict(self.global_model)
             elif self.args.model == 'slm':
                 weights_to_save = self._slm_trainable_state()
+            elif self.args.model == 'lfm':
+                weights_to_save = self._lfm_trainable_state()
             else:
                 weights_to_save = self.global_model.state_dict()
 
@@ -1618,7 +1721,7 @@ def parse_args():
     parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('--experiments', type=int, default=1)
-    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip", "slm"])
+    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip", "slm", "lfm"])
     parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
     parser.add_argument('--prune-freq', type=int, default=0)
     
@@ -1646,7 +1749,7 @@ def parse_args():
     parser.add_argument('--gamma-delta', type=float, default=0.5, help='Expoente de sensibilidade da acurácia no índice de capacidade γ (default: 0.5)')
     parser.add_argument('--plateau-phi-min', type=float, default=0.45, help='Piso mínimo de capacidade no platô (default: 0.45)')
     parser.add_argument('--plateau-decay-rate', type=float, default=0.025, help='Taxa de decaimento por rodada no platô (default: 0.025)')
-    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA (apenas --model slm --strategy lora): backbone 4-bit NF4, agrega só adaptadores LoRA 16 bits')
+    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA (suportado para --model slm e --model lfm): backbone 4-bit NF4, agrega só adaptadores LoRA 16 bits')
     return parser.parse_args()
 
 def main():

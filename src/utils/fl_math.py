@@ -43,32 +43,37 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
     
     with torch.no_grad():
         model_dtype = getattr(model, "compute_dtype", None) or next(model.parameters()).dtype
-        for batch_idx, (x, y) in enumerate(data_loader):
+        for batch_idx, batch_data in enumerate(data_loader):
+            if isinstance(batch_data, dict):
+                x = batch_data
+                y = batch_data.get("targets", batch_data.get("labels", None))
+            else:
+                x, y = batch_data
+
             y = y.to(device)
-            
+
             if isinstance(x, torch.Tensor):
                 if x.is_floating_point():
                     x = x.to(device, dtype=model_dtype)
                 else:
                     x = x.to(device)
-            else:
-                # É um dicionário ou BatchFeature (SLM)
+            elif isinstance(x, dict):
+                # É um dicionário ou BatchFeature (SLM / LFM)
                 for k in list(x.keys()):
-                    if getattr(x[k], "is_floating_point", lambda: False)():
-                        x[k] = x[k].to(device, dtype=model_dtype)
-                    else:
-                        x[k] = x[k].to(device)
-            
-            # TESTE A: Verificando os Tipos de Dados (A Teoria do Conflito de Tipos)
-            #print(f"[Teste A] Tipo da imagem (x): {x.dtype} | Shape: {x.shape}")
-            #print(f"[Teste A] Tipo do parâmetro do modelo: {next(model.parameters()).dtype}")
-            
-            # TESTE B: Isolando o Forward Pass
-            # Alinha o autocast ao dtype real do modelo (bfloat16 para SLM, float16 para CLIP, etc.)
-            autocast_dtype = model_dtype if model_dtype in (torch.float16, torch.bfloat16) else (torch.float16 if device.type == 'cuda' else torch.bfloat16)
+                    if isinstance(x[k], torch.Tensor):
+                        if getattr(x[k], "is_floating_point", lambda: False)():
+                            x[k] = x[k].to(device, dtype=model_dtype)
+                        else:
+                            x[k] = x[k].to(device)
+
+            autocast_dtype = (
+                model_dtype
+                if model_dtype in (torch.float16, torch.bfloat16)
+                else (torch.float16 if device.type == "cuda" else torch.bfloat16)
+            )
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
-                if not isinstance(x, torch.Tensor):
-                    output = model(**x)
+                if isinstance(x, dict):
+                    output = model(x) if hasattr(model, "head") else model(**x)
                 else:
                     output = model(x)
             
