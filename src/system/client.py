@@ -10,6 +10,9 @@ import random
 import math
 import json
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 from pathlib import Path
 
 # Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
@@ -49,12 +52,14 @@ from ALA_LoRA import ALA_LoRA
 from model import SimpleModel
 from utils.network_utils import (  # noqa: E402
     V2IProtocolError,
-    make_v2i_message,
-    make_v2v_message,
+    prepare_frame,
+    prepare_v2i_frame,
+    prepare_v2v_frame,
+    record_elapsed,
     recv_data,
     recv_v2i_message,
     send_data,
-    send_v2i_message,
+    send_frame,
     validate_v2v_message,
 )
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
@@ -71,12 +76,27 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------
 
 
-def send_p2p_model(host: str, payload: dict, *, deadline: float, cancelled=None) -> int:
+def send_p2p_model(
+    host: str,
+    payload: dict | bytes,
+    *,
+    deadline: float,
+    cancelled=None,
+    timings: dict | None = None,
+    port: int = 9000,
+) -> int:
     """Conecta com tentativas curtas e envia o modelo até o prazo do encontro.
 
     O limite de conexão não limita o envio de todos os pesos. O transporte
     compartilhado mantém o progresso no socket durante esperas/retransmissões.
     """
+    if isinstance(payload, bytes):
+        frame = payload
+    else:
+        started = time.monotonic()
+        validate_v2v_message(payload)
+        record_elapsed(timings, "validation_time", started)
+        frame = prepare_frame(payload, timings=timings)
     while True:
         if cancelled is not None and cancelled():
             raise ConnectionAbortedError("Simulação encerrada durante o envio V2V.")
@@ -86,8 +106,14 @@ def send_p2p_model(host: str, payload: dict, *, deadline: float, cancelled=None)
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
                 connection.settimeout(min(2.0, remaining))
-                connection.connect((host, 9000))
-                return send_data(connection, payload, deadline=deadline, cancelled=cancelled)
+                started = time.monotonic()
+                try:
+                    connection.connect((host, port))
+                finally:
+                    record_elapsed(timings, "connection_time", started)
+                return send_frame(
+                    connection, frame, deadline=deadline, cancelled=cancelled, timings=timings
+                )
         except ConnectionAbortedError:
             raise
         except OSError as exc:
@@ -96,6 +122,159 @@ def send_p2p_model(host: str, payload: dict, *, deadline: float, cancelled=None)
             if remaining <= 0:
                 raise TimeoutError(f"Prazo de envio V2V para {host} esgotado: {exc}") from exc
             time.sleep(min(0.2, remaining))
+
+
+class V2VReceiver:
+    """Recebe somente os remetentes esperados de um encontro, em paralelo.
+
+    As threads manipulam envelopes CPU; aplicação e OTA continuam na thread
+    principal. close() encerra listener, sockets e workers antes de soltar pesos.
+    """
+
+    def __init__(
+        self,
+        encounter: dict,
+        senders: list[int],
+        message_type: str,
+        *,
+        deadline: float,
+        cancelled=None,
+        address=("0.0.0.0", 9000),
+    ):
+        self.context = {
+            "run_id": encounter["run_id"],
+            "encounter_id": encounter["encounter_id"],
+            "type": message_type,
+        }
+        self.senders = sorted(senders)
+        self.deadline = deadline
+        self.cancelled = cancelled or (lambda: False)
+        self.condition = threading.Condition()
+        self.stopped = threading.Event()
+        self.messages = {}
+        self.byte_counts = {}
+        self.timings = {}
+        self.connections = set()
+        self.pool = ThreadPoolExecutor(max_workers=max(1, len(senders)))
+        # Limitar também a fila: uma conexão incompleta não bloqueia accept().
+        self.slots = threading.BoundedSemaphore(max(2, 2 * len(senders)))
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.thread = None
+        try:
+            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.listener.bind(address)
+            self.listener.listen(50)
+            self.listener.settimeout(0.05)
+            self.address = self.listener.getsockname()
+            self.thread = threading.Thread(target=self._accept, daemon=True)
+            self.thread.start()
+        except BaseException:
+            self.close()
+            raise
+
+    def _cancelled(self):
+        return self.stopped.is_set() or self.cancelled()
+
+    def _accept(self):
+        while not self._cancelled() and time.monotonic() < self.deadline:
+            try:
+                connection, _ = self.listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            if not self.slots.acquire(blocking=False):
+                connection.close()
+                continue
+            with self.condition:
+                self.connections.add(connection)
+            self.pool.submit(self._receive, connection)
+
+    def _receive(self, connection):
+        timings = {}
+        try:
+            with connection:
+                message, _, count = recv_data(
+                    connection,
+                    return_bytes=True,
+                    deadline=self.deadline,
+                    cancelled=self._cancelled,
+                    timings=timings,
+                )
+                started = time.monotonic()
+                validate_v2v_message(message, **self.context)
+                record_elapsed(timings, "validation_time", started)
+                sender = message["client_id"]
+                with self.condition:
+                    if self._cancelled() or time.monotonic() >= self.deadline:
+                        raise ConnectionAbortedError("Receptor V2V encerrado.")
+                    if sender not in self.senders or sender in self.messages:
+                        raise ValueError("Remetente V2V inesperado ou duplicado.")
+                    self.messages[sender] = message
+                    self.byte_counts[sender] = count
+                    self.timings[str(sender)] = timings
+                    self.condition.notify_all()
+        except Exception as exc:
+            # Rejeitados e frames parciais não contam; uma tentativa válida pode
+            # chegar depois. Ausências continuam sujeitas ao prazo do encontro.
+            logger.warning("Recepção V2V rejeitada: %s", exc)
+        finally:
+            with self.condition:
+                self.connections.discard(connection)
+                self.condition.notify_all()
+            self.slots.release()
+
+    def wait(self):
+        with self.condition:
+            while True:
+                if self._cancelled():
+                    raise ConnectionAbortedError("Simulação encerrada aguardando pesos V2V.")
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Pesos V2V incompletos ao final do prazo do encontro.")
+                if len(self.messages) == len(self.senders):
+                    return [self.messages[sender] for sender in self.senders]
+                self.condition.wait(timeout=min(remaining, 0.1))
+
+    def close(self):
+        self.stopped.set()
+        self.listener.close()
+        if self.thread is not None:
+            self.thread.join()
+        with self.condition:
+            for connection in self.connections:
+                with suppress(OSError):
+                    connection.shutdown(socket.SHUT_RDWR)
+            self.condition.notify_all()
+        self.pool.shutdown(wait=True)
+        self.messages.clear()
+
+
+def send_v2v_results(frame, clients, *, deadline, cancelled, timings, completed):
+    """Fan-out limitado; resultados e contadores são recolhidos na thread principal."""
+    stopping = threading.Event()
+
+    def send(client_id):
+        transfer = timings.setdefault(str(client_id), {})
+        return send_p2p_model(
+            f"fl-client-v2v-{client_id}",
+            frame,
+            deadline=deadline,
+            cancelled=lambda: stopping.is_set() or cancelled(),
+            timings=transfer,
+        )
+
+    error = None
+    with ThreadPoolExecutor(max_workers=len(clients)) as pool:
+        futures = {pool.submit(send, client_id): client_id for client_id in clients}
+        for future in as_completed(futures):
+            try:
+                completed(futures[future], future.result())
+            except Exception as exc:
+                error = error or exc
+                stopping.set()
+    if error is not None:
+        raise error
 
 
 def exchange_v2i_model(
@@ -129,10 +308,14 @@ def exchange_v2i_model(
     context["client_id"] = client_id
     started = time.monotonic()
     metrics = metrics if metrics is not None else {}
+    timings = metrics.setdefault("timings", {})
     deadline = started + timeout
+    preparation_started = time.monotonic()
     snapshot = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
-    upload = make_v2i_message(
-        "UPLOAD", **context, weights=snapshot, train_samples=train_samples
+    record_elapsed(timings, "snapshot_time", preparation_started)
+    upload_timings = timings.setdefault("upload", {})
+    upload = prepare_v2i_frame(
+        "UPLOAD", **context, weights=snapshot, train_samples=train_samples, timings=upload_timings
     )
     load_started = False
 
@@ -145,8 +328,15 @@ def exchange_v2i_model(
         return value
 
     try:
-        with socket.create_connection((host, port), timeout=remaining()) as connection:
-            sent = send_v2i_message(connection, upload, deadline=deadline, cancelled=cancelled)
+        connection_started = time.monotonic()
+        try:
+            connection = socket.create_connection((host, port), timeout=remaining())
+        finally:
+            record_elapsed(timings, "connection_time", connection_started)
+        with connection:
+            sent = send_frame(
+                connection, upload, deadline=deadline, cancelled=cancelled, timings=upload_timings
+            )
             metrics["upload_bytes"] = sent
             del upload
             response, _, received = recv_v2i_message(
@@ -154,6 +344,7 @@ def exchange_v2i_model(
                 **context,
                 deadline=deadline,
                 cancelled=cancelled,
+                timings=timings.setdefault("result", {}),
             )
             if response["type"] == "ERROR":
                 metrics["control_download_bytes"] = received
@@ -170,13 +361,19 @@ def exchange_v2i_model(
                 raise V2IProtocolError("O resultado da RSU é incompatível com a CNN local.")
             remaining()
             load_started = True
-            model.load_state_dict(state, strict=True)
+            application_started = time.monotonic()
+            try:
+                model.load_state_dict(state, strict=True)
+            finally:
+                record_elapsed(timings, "application_time", application_started)
             remaining()
-            control = send_v2i_message(
+            control_timings = timings.setdefault("applied", {})
+            control = send_frame(
                 connection,
-                make_v2i_message("APPLIED", **context),
+                prepare_v2i_frame("APPLIED", **context, timings=control_timings),
                 deadline=deadline,
                 cancelled=cancelled,
+                timings=control_timings,
             )
         metrics.update(applied=True, control_upload_bytes=control)
         return {
@@ -974,13 +1171,8 @@ def main():
         logger.info("\nTraining completed!")
 
     elif args.mode == 'decentralized':
-        import threading
         logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
         encounters_dir = args.encounters_dir or Path(__file__).resolve().parents[1] / "results" / "encounters"
-        in_memory_weights = {}
-        in_memory_bytes = {}
-        p2p_timeout = 600.0
-        in_memory_lock = threading.Lock()
         def wait_for_round_signal(encounters_dir: Path, round_num: int) -> bool:
             while True:
                 if (encounters_dir / ".simulation_done").exists():
@@ -1011,36 +1203,7 @@ def main():
                                 return data
                         except Exception:
                             pass
-                time.sleep(1)
-        def p2p_server_thread():
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(('0.0.0.0', 9000))
-            server_socket.listen(50)
-            logger.info(f"Client {args.client_idx}: P2P Server listening on port 9000")
-            while True:
-                try:
-                    conn, addr = server_socket.accept()
-                    with conn:
-                        data, _, received_bytes = recv_data(
-                            conn, return_bytes=True,
-                            deadline=time.monotonic() + p2p_timeout,
-                            cancelled=lambda: (encounters_dir / ".simulation_done").exists(),
-                        )
-                        if data is not None:
-                            validate_v2v_message(data)
-                            sender_id, enc_id = data["client_id"], data["encounter_id"]
-                            with in_memory_lock:
-                                if enc_id not in in_memory_weights:
-                                    in_memory_weights[enc_id] = {}
-                                in_memory_weights[enc_id][sender_id] = data
-                                in_memory_bytes.setdefault(enc_id, {})[sender_id] = (
-                                    in_memory_bytes.get(enc_id, {}).get(sender_id, 0) + received_bytes
-                                )
-                            logger.info(f"Client {args.client_idx}: Recebeu pesos do Cliente {sender_id} para encontro {enc_id}")
-                except Exception as e:
-                    logger.error(f"Erro no P2P Server: {e}")
-        p2p_started = False
+                time.sleep(0.05)
         encounter_failure = None
         epoch = 1
         last_processed_encounter = 0
@@ -1154,6 +1317,11 @@ def main():
                 "control_download_bytes": 0,
                 "received_upload_bytes": 0,
                 "sent_download_bytes": 0,
+                "timings": {},
+                "signal_detection_time": (
+                    max(0.0, encounter_started - encounter_data["published_monotonic"])
+                    if "published_monotonic" in encounter_data else None
+                ),
                 "protocol_time": 0.0,
                 "aggregation_time": 0.0,
                 "evaluation_time": 0.0,
@@ -1273,8 +1441,9 @@ def main():
                 continue
 
             # ══════════════════════════════════════════════════════════════════
-            # BRANCH V2V: Fluxo original com OTA e eleição de Aggregator
+            # BRANCH V2V: Recepção/fan-out concorrentes; OTA na thread principal
             # ══════════════════════════════════════════════════════════════════
+            receiver = None
             try:
                 p2p_timeout = encounter_data.get("exchange_timeout", poll_timeout)
                 if (
@@ -1286,9 +1455,6 @@ def main():
                     raise ValueError("exchange_timeout V2V deve ser positivo e finito.")
                 exchange_deadline = encounter_started + p2p_timeout
                 cancelled = (encounters_dir / ".simulation_done").exists
-                if not p2p_started:
-                    threading.Thread(target=p2p_server_thread, daemon=True).start()
-                    p2p_started = True
                 # Eleição do Aggregator via Medoid
                 from v2v_fl.over_the_air.ota_channel import find_medoid
 
@@ -1311,6 +1477,14 @@ def main():
                     float(np.mean(enc_distances)) if len(enc_distances) > 0 else 0.0
                 )
 
+                timings = metrics["timings"]
+                other_clients = sorted(c for c in clients_in_encounter if c != args.client_idx)
+                receiver = V2VReceiver(
+                    encounter_data, other_clients if is_aggregator else [aggregator_id],
+                    "UPLOAD" if is_aggregator else "RESULT",
+                    deadline=exchange_deadline, cancelled=cancelled,
+                )
+                preparation_started = time.monotonic()
                 # ── FASE 6: Troca P2P e Agregação (D-PSGD Assimétrico) ──────────────
                 if args.model == "clip":
                     from lora_clip.sora import get_trainable_state_dict
@@ -1323,83 +1497,35 @@ def main():
                         for key, value in model.state_dict().items()
                     }
 
+                record_elapsed(timings, "snapshot_time", preparation_started)
                 metrics["mean_distance"] = enc_mean_distance
-                other_clients = [c for c in clients_in_encounter if c != args.client_idx]
 
-                # 1. Transmissores enviam seus pesos para o Aggregator
+                # Os remetentes usam um frame validado/serializado uma única vez.
                 if not is_aggregator:
-                    target_host = f"fl-client-v2v-{aggregator_id}"
+                    upload_timings = timings.setdefault("upload", {})
                     snapshot_bytes = send_p2p_model(
-                        target_host,
-                        make_v2v_message(
+                        f"fl-client-v2v-{aggregator_id}",
+                        prepare_v2v_frame(
                             "UPLOAD", run_id=encounter_data["run_id"],
                             client_id=args.client_idx, encounter_id=enc_id,
                             weights=snapshot, train_samples=len(train_loader.dataset),
+                            timings=upload_timings,
                         ),
-                        deadline=exchange_deadline, cancelled=cancelled,
+                        deadline=exchange_deadline, cancelled=cancelled, timings=upload_timings,
                     )
                     metrics["upload_bytes"] += snapshot_bytes
                     rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
                     rs_p2p_data_sent_enc_ids.append(enc_id)
-                    logger.info("Client %d: Enviou pesos para %s (%d bytes).",
-                                args.client_idx, target_host, snapshot_bytes)
 
-                    # Aguardar resposta do Aggregator (pesos consolidados)
-                    logger.info(
-                        f"Client {args.client_idx}: Aguardando resposta do Aggregator {aggregator_id}..."
-                    )
-                    received_states = []
-                    while time.monotonic() < exchange_deadline:
-                        if cancelled():
-                            raise ConnectionAbortedError(
-                                "Simulação encerrada aguardando resultado V2V."
-                            )
-                        with in_memory_lock:
-                            if (
-                                enc_id in in_memory_weights
-                                and aggregator_id in in_memory_weights[enc_id]
-                            ):
-                                response = validate_v2v_message(
-                                    in_memory_weights[enc_id][aggregator_id], type="RESULT",
-                                    run_id=encounter_data["run_id"], encounter_id=enc_id,
-                                    client_id=aggregator_id,
-                                )
-                                received_states.append(response)
-                                break
-                        time.sleep(1)
-
-                # 2. Aggregator recebe de todos os transmissores e consolida
-                if is_aggregator:
-                    logger.info(
-                        f"Client {args.client_idx}: Aguardando receber pesos dos transmissores {other_clients}..."
-                    )
-                    received_states = []
-                    while time.monotonic() < exchange_deadline:
-                        if cancelled():
-                            raise ConnectionAbortedError(
-                                "Simulação encerrada aguardando uploads V2V."
-                            )
-                        with in_memory_lock:
-                            if enc_id in in_memory_weights:
-                                missing = [
-                                    c for c in other_clients if c not in in_memory_weights[enc_id]
-                                ]
-                                if not missing:
-                                    for c in other_clients:
-                                        upload = validate_v2v_message(
-                                            in_memory_weights[enc_id][c], type="UPLOAD",
-                                            run_id=encounter_data["run_id"], encounter_id=enc_id,
-                                            client_id=c,
-                                        )
-                                        received_states.append(upload)
-                                    break
-                        time.sleep(1)
-
-                with in_memory_lock:
-                    received_bytes = sum(in_memory_bytes.get(enc_id, {}).values())
+                wait_started = time.monotonic()
+                try:
+                    received_states = receiver.wait()
+                finally:
+                    record_elapsed(timings, "model_wait_time", wait_started)
                 metrics["received_upload_bytes" if is_aggregator else "download_bytes"] = (
-                    received_bytes
+                    sum(receiver.byte_counts.values())
                 )
+                timings["received_transfers"] = receiver.timings
 
                 # 3. Consolidação (No Aggregator) ou Atualização (Nos Transmissores)
                 if (is_aggregator and len(received_states) == len(other_clients)) or (
@@ -1445,6 +1571,7 @@ def main():
                         finally:
                             metrics["aggregation_time"] = time.monotonic() - aggregation_started
                         # Carregar o modelo agregado no PyTorch
+                        application_started = time.monotonic()
                         if args.model in ["clip", "slm"]:
                             if args.model == "clip":
                                 from lora_clip.sora import set_trainable_state_dict
@@ -1467,6 +1594,7 @@ def main():
                         # O Transmissor recebe o modelo já agregado (OTA + local do Aggregator)
                         # e simplesmente o carrega como seu novo modelo local
                         aggregated_state = received_states[0]["weights"]
+                        application_started = time.monotonic()
 
                         if args.model in ["clip", "slm"]:
                             for k in snapshot:
@@ -1486,27 +1614,40 @@ def main():
                                 snapshot[k] = aggregated_state[k].to(snapshot[k].dtype)
                             model.load_state_dict(snapshot)
 
+                    record_elapsed(timings, "application_time", application_started)
                     metrics["applied"] = True
-                    # 4. Aggregator envia o resultado de volta para os transmissores
                     if is_aggregator:
-                        for c in other_clients:
-                            target_host = f"fl-client-v2v-{c}"
-                            snapshot_bytes = send_p2p_model(
-                                target_host,
-                                make_v2v_message(
-                                    "RESULT", run_id=encounter_data["run_id"],
-                                    client_id=args.client_idx, encounter_id=enc_id,
-                                    weights=snapshot,
-                                ),
-                                deadline=exchange_deadline, cancelled=cancelled,
-                            )
-                            metrics["sent_download_bytes"] += snapshot_bytes
-                            rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
+                        preparation_timings = timings.setdefault("result_preparation", {})
+                        result_frame = prepare_v2v_frame(
+                            "RESULT", run_id=encounter_data["run_id"],
+                            client_id=args.client_idx, encounter_id=enc_id, weights=snapshot,
+                            timings=preparation_timings,
+                        )
+
+                        def result_sent(client_id, count, metrics=metrics, enc_id=enc_id):
+                            metrics["sent_download_bytes"] += count
+                            rs_p2p_data_sent_mb.append(count / (1024 * 1024))
                             rs_p2p_data_sent_enc_ids.append(enc_id)
-                            logger.info(
-                                "Client %d: Retornou pesos consolidados para %s (%d bytes).",
-                                args.client_idx, target_host, snapshot_bytes,
+
+                        fanout_started = time.monotonic()
+                        try:
+                            send_v2v_results(
+                                result_frame, other_clients, deadline=exchange_deadline,
+                                cancelled=cancelled,
+                                timings=timings.setdefault("sent_transfers", {}),
+                                completed=result_sent,
                             )
+                        finally:
+                            record_elapsed(timings, "result_fanout_time", fanout_started)
+                        del result_frame
+                    # Nenhuma thread pode manter pesos ou alterar métricas após a aplicação.
+                    receiver.close()
+                    received_states.clear()
+                    if is_aggregator:
+                        participant_states.clear()
+                    else:
+                        aggregated_state.clear()
+                    snapshot.clear()
 
                     metrics.update(
                         applied=True,
@@ -1517,12 +1658,6 @@ def main():
                         metrics,
                         encounters_dir / f".applied_enc_{enc_id}_client_{args.client_idx}.json",
                     )
-                    # Limpar RAM
-                    with in_memory_lock:
-                        if enc_id in in_memory_weights:
-                            del in_memory_weights[enc_id]
-                        in_memory_bytes.pop(enc_id, None)
-
                     # ── FASE 7: Avaliação Pós-Agregação ──────────────────────
                     if not args.skip_post_eval:
                         evaluation_started = time.monotonic()
@@ -1574,12 +1709,13 @@ def main():
                     raise TimeoutError(f"Pesos V2V incompletos: {len(received_states)} recebidos.")
             except Exception as exc:
                 encounter_failure = str(exc) or type(exc).__name__
-                with in_memory_lock:
-                    received_bytes = sum(in_memory_bytes.get(enc_id, {}).values())
-                byte_key = (
-                    "received_upload_bytes" if metrics["is_aggregator"] else "download_bytes"
-                )
-                metrics[byte_key] = max(metrics[byte_key], received_bytes)
+                if receiver is not None:
+                    receiver.close()
+                    byte_key = (
+                        "received_upload_bytes" if metrics["is_aggregator"] else "download_bytes"
+                    )
+                    metrics[byte_key] = sum(receiver.byte_counts.values())
+                    metrics["timings"]["received_transfers"] = receiver.timings
                 if metrics["status"] == "pending":
                     metrics["protocol_time"] = time.monotonic() - encounter_started
                 metrics.update(status="failed", error=encounter_failure)
@@ -1588,6 +1724,9 @@ def main():
                 )
                 logger.error("Falha no encontro V2V %d: %s", enc_id, encounter_failure)
                 break
+            finally:
+                if receiver is not None:
+                    receiver.close()
 
             last_processed_encounter = enc_id
             epoch += 1
