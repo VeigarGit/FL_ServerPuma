@@ -39,10 +39,20 @@ Depending on your chosen execution method, ensure the following tools are instal
 ## 🛠️ Step 0: Environment Setup & Dataset Generation
 
 Regardless of the execution method, the environment must be synced and the partitioned dataset generated first. You **do not** need to manually activate environments; `uv` handles isolation automatically.
+Install [CUDA](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html).
+
 
 1. **Sync the hermetic environment (installs Python and all dependencies from `uv.lock`):**
    ```bash
    uv sync
+   ```
+   **OR use anaconda with:**
+   Install [conda latest](https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh) and activate conda.
+
+   For additional configurations, refer to the `prepare.sh` script.
+
+   ```bash
+   conda env create -f env_cuda_latest.yaml  # Downgrade torch via pip if needed to match the CUDA version
    ```
 
 2. **Generate the Non-IID Dataset:**

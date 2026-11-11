@@ -1,0 +1,37 @@
+name: puma
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy<2
+  - pip>=25.2
+  - pandas
+  - scikit-learn
+  - scipy
+  - h5py
+  - matplotlib
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu129
+      - numpy<2
+      - torch==2.13.0+cu129
+      - torchvision==0.28.0+cu129
+      - torchaudio==2.11.0+cu129
+      - torchtext==0.18.0  # Geradores de texto legados exigem PyTorch 2.3.
+      - ujson
+      - seaborn
+      - click
+      - calmsize
+      - memory-profiler
+      - portalocker
+      - cvxpy==1.7.5
+      - higher
+      - diffusers
+      - accelerate==1.14.0
+      - transformers==5.15.1
+      - datasets==5.0.1
+      - peft==0.20.0
+      - pyyaml==6.0.3
+      - pyarrow==25.0.1
