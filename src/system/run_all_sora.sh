@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # =============================================================================
-# run_all_sora.sh — Executa a sequência de simulações PUMA-GT nos 4 datasets
+# run_all_sora.sh — Executa a sequência de simulações SoRA nos 4 datasets
 #
-# Configuração PUMA-GT:
+# Configuração SoRA (Estático):
 #   - Estratégia: sora_with_schedule
-#   - Frequência de Pruning: 3 (--prune-freq 3)
-#   - PaCA Adaptativo / APL: Ativado (--adaptive-paca)
+#   - Frequência de Pruning: 1 (--prune-freq 1)
+#   - PaCA: Fixo (12 para CLIP, sem --adaptive-paca)
 #   - Modelo: CLIP
 #   - Rodadas: 150
 #   - Clientes: 25
@@ -19,9 +19,9 @@
 #   4. Flowers102   (102 classes)
 #
 # Uso recomendado dentro de uma sessão tmux:
-#   tmux new -s orquestrador
+#   tmux new -s orquestrador_sora
 #   cd /home/rafael.teixeira.silva/David/FL_ServerPuma/src/system
-#   ./run_all_sora.sh [opções adicionais como -did 1, --simulations 5, etc.]
+#   ./run_all_sora.sh [opções adicionais como -did 0, --simulations 10, etc.]
 # =============================================================================
 
 set -e
@@ -36,18 +36,18 @@ if [ -n "$TMUX" ]; then
         echo "❌ [ERRO] Sua sessão tmux atual se chama 'fl_puma'!"
         echo "O script run.sh cria internamente uma sessão chamada 'fl_puma' para o servidor e clientes."
         echo "Por favor, renomeie sua sessão externa ou crie outra:"
-        echo "  tmux rename-session -t fl_puma orquestrador"
-        echo "ou inicie uma nova com: tmux new -s orquestrador"
+        echo "  tmux rename-session -t fl_puma orquestrador_sora"
+        echo "ou inicie uma nova com: tmux new -s orquestrador_sora"
         exit 1
     fi
 fi
 
-# Parâmetros padrão do PUMA-GT
+# Parâmetros padrão do SoRA
 SIMULATIONS=10
 CLIENTS=25
 ROUNDS=150
 STRATEGY="sora_with_schedule"
-PRUNE_FREQ=3
+PRUNE_FREQ=1
 MODEL="clip"
 DEVICE_ID="0"
 EXTRA_ARGS=()
@@ -57,8 +57,8 @@ show_help() {
     cat << 'EOF'
 Uso: ./run_all_sora.sh [opções]
 
-Executa automaticamente as 10 simulações de PUMA-GT
-(SoRA com schedule, prune-freq 3 e adaptive-paca ativo)
+Executa automaticamente as 10 simulações de SoRA (Estático)
+(SoRA com schedule, prune-freq 1 e PaCA fixo)
 para os 4 datasets na ordem:
   1. OxfordPets   (37 classes)
   2. DTD          (47 classes)
@@ -69,7 +69,7 @@ Opções:
   --simulations <n>           Número de simulações por dataset (padrão: 10)
   -c, --clients <n>           Número de clientes (padrão: 25)
   -r, --rounds <n>            Número de rodadas (padrão: 150)
-  --prune-freq <n>            Frequência de pruning (padrão: 3)
+  --prune-freq <n>            Frequência de pruning (padrão: 1)
   -did, --device-id <id>      ID da GPU (padrão: 0)
   -h, --help                  Exibir esta ajuda
 EOF
@@ -99,10 +99,10 @@ DATASETS=(
 TOTAL_DATASETS=${#DATASETS[@]}
 
 echo "================================================================="
-echo "        ORQUESTRADOR DE EXPERIMENTOS PUMA-GT (CLIP)"
+echo "        ORQUESTRADOR DE EXPERIMENTOS SoRA (CLIP)"
 echo "================================================================="
 echo "  Estratégia:         $STRATEGY (prune_freq=$PRUNE_FREQ)"
-echo "  PaCA Adaptativo:    ATIVADO (--adaptive-paca)"
+echo "  PaCA:               FIXO (sem adaptive-paca)"
 echo "  Modelo:             $MODEL"
 echo "  Simulações/dataset: $SIMULATIONS"
 echo "  Clientes:           $CLIENTS"
@@ -121,7 +121,7 @@ for ENTRY in "${DATASETS[@]}"; do
 
     DATASET_START_TIME=$(date +%s)
     echo "================================================================="
-    echo "[$IDX/$TOTAL_DATASETS] Iniciando PUMA-GT: $DATASET_NAME ($NUM_CLASSES classes)"
+    echo "[$IDX/$TOTAL_DATASETS] Iniciando SoRA: $DATASET_NAME ($NUM_CLASSES classes)"
     echo "Horário de início: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "================================================================="
 
@@ -131,7 +131,6 @@ for ENTRY in "${DATASETS[@]}"; do
         --clients "$CLIENTS"
         --strategy "$STRATEGY"
         --prune-freq "$PRUNE_FREQ"
-        --adaptive-paca
         --model "$MODEL"
         --rounds "$ROUNDS"
         --dataset "$DATASET_NAME"
@@ -169,7 +168,7 @@ TOTAL_H=$((TOTAL_DURATION / 3600))
 TOTAL_M=$(((TOTAL_DURATION % 3600) / 60))
 TOTAL_S=$((TOTAL_DURATION % 60))
 
-echo "🎉 TODOS OS EXPERIMENTOS PUMA-GT FORAM CONCLUÍDOS COM SUCESSO!"
+echo "🎉 TODOS OS EXPERIMENTOS SoRA FORAM CONCLUÍDOS COM SUCESSO!"
 echo "Horário final: $(date '+%Y-%m-%d %H:%M:%S')"
 printf "Tempo total de execução: %02dh:%02dm:%02ds\n" "$TOTAL_H" "$TOTAL_M" "$TOTAL_S"
 echo "================================================================="

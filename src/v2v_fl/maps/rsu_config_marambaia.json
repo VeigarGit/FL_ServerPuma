@@ -1,0 +1,42 @@
+{
+  "map_file": "marambaia.net.xml",
+  "seed": 42,
+  "n_rsus": 5,
+  "rsus": [
+    {
+      "id": "rsu_0",
+      "x": 5071.39,
+      "y": 355.42,
+      "radius": 1000.0,
+      "n_antennas": 16
+    },
+    {
+      "id": "rsu_1",
+      "x": 2412.33,
+      "y": 1229.78,
+      "radius": 1000.0,
+      "n_antennas": 16
+    },
+    {
+      "id": "rsu_2",
+      "x": 5779.53,
+      "y": 3230.34,
+      "radius": 1000.0,
+      "n_antennas": 16
+    },
+    {
+      "id": "rsu_3",
+      "x": 6915.76,
+      "y": 628.61,
+      "radius": 1000.0,
+      "n_antennas": 16
+    },
+    {
+      "id": "rsu_4",
+      "x": 3484.22,
+      "y": 376.53,
+      "radius": 1000.0,
+      "n_antennas": 16
+    }
+  ]
+}

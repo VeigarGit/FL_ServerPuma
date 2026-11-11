@@ -20,6 +20,7 @@ import sys
 import argparse
 import csv
 import glob
+import re
 from pathlib import Path
 
 import numpy as np
@@ -40,54 +41,58 @@ import h5py
 EXPERIMENTS = [
     # --- OxfordPets ---
     ("OxfordPets", "LoRA Padrão",
-     "fl_puma_clip_lora_prune1_ala1_paca12",
+     ("fl_lora_slm_OxfordPets_slm_lora_prune1_ala1_paca28", "OxfordPets__LoRA_Padrao_paca12"),
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "SoRA Estático",
-     "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_paca12",
+     ("fl_sora_slm_OxfordPets_slm_sora_with_schedule_prune1_ala1_paca28", "OxfordPets__SoRA_Estatico_paca12"),
+     "server_OxfordPets_*_run*.h5"),
+
+    ("OxfordPets", "PUMA-GT Evolution",
+     ("fl_pumagt_plus_slm_OxfordPets_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "OxfordPets__PUMA-GT_Plus_Cientifico_083"),
      "server_OxfordPets_*_run*.h5"),
 
     ("OxfordPets", "PUMA-GT",
-     "fl_puma_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+     "fl_pumagt_plus_slm_OxfordPets_ONLYPACA_norank",
      "server_OxfordPets_*_run*.h5"),
 
     # --- DTD ---
     ("DTD", "LoRA Padrão",
-     "fl_puma_DTD_clip_lora_prune1_ala1_paca12",
+     ("fl_lora_slm_DTD_slm_lora_prune1_ala1_paca28", "DTD__LoRA_Padrao_paca12"),
      "server_DTD_*_run*.h5"),
 
     ("DTD", "SoRA Estático",
-     "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_paca12",
+     ("fl_sora_slm_DTD_slm_sora_with_schedule_prune1_ala1_paca28", "DTD__SoRA_Estatico_paca12"),
      "server_DTD_*_run*.h5"),
 
-    ("DTD", "PUMA-GT",
-     "fl_puma_DTD_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ("DTD", "PUMA-GT Evolution",
+     ("fl_pumagt_plus_slm_DTD_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "DTD__PUMA-GT_Plus_Desacoplado"),
      "server_DTD_*_run*.h5"),
 
     # --- FGVCAircraft ---
     ("FGVCAircraft", "LoRA Padrão",
-     "fl_puma_FGVCAircraft_clip_lora_prune1_ala1_paca12",
+     ("fl_lora_slm_FGVCAircraft_slm_lora_prune1_ala1_paca28", "FGVCAircraft__LoRA_Padrao_paca12"),
      "server_FGVCAircraft_*_run*.h5"),
 
     ("FGVCAircraft", "SoRA Estático",
-     "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_paca12",
+     ("fl_sora_slm_FGVCAircraft_slm_sora_with_schedule_prune1_ala1_paca28", "FGVCAircraft__SoRA_Estatico_paca12"),
      "server_FGVCAircraft_*_run*.h5"),
 
-    ("FGVCAircraft", "PUMA-GT",
-     "fl_puma_FGVCAircraft_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ("FGVCAircraft", "PUMA-GT Evolution",
+     ("fl_pumagt_plus_slm_FGVCAircraft_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "FGVCAircraft__PUMA-GT_Plus_Desacoplado"),
      "server_FGVCAircraft_*_run*.h5"),
 
     # --- Flowers102 ---
     ("Flowers102", "LoRA Padrão",
-     "fl_puma_Flowers102_clip_lora_prune1_ala1_paca12",
+     ("fl_lora_slm_Flowers102_slm_lora_prune1_ala1_paca28", "Flowers102__LoRA_Padrao_paca12"),
      "server_Flowers102_*_run*.h5"),
 
     ("Flowers102", "SoRA Estático",
-     "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_paca12",
+     ("fl_sora_slm_Flowers102_slm_sora_with_schedule_prune1_ala1_paca28", "Flowers102__SoRA_Estatico_paca12"),
      "server_Flowers102_*_run*.h5"),
 
-    ("Flowers102", "PUMA-GT",
-     "fl_puma_Flowers102_clip_sora_with_schedule_prune1_ala1_adaptpaca",
+    ("Flowers102", "PUMA-GT Evolution",
+     ("fl_pumagt_plus_slm_Flowers102_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "Flowers102__PUMA-GT_Plus_Desacoplado"),
      "server_Flowers102_*_run*.h5"),
 ]
 
@@ -187,13 +192,45 @@ def analyze_experiment(results_dir: str, folder: str, h5_glob: str) -> dict:
     Retorna dict com média ± desvio padrão de cada métrica,
     e o número de runs encontrados.
     """
-    exp_path = os.path.join(results_dir, folder)
-    if not os.path.isdir(exp_path):
+    if isinstance(folder, (list, tuple)):
+        candidates = folder
+    else:
+        candidates = [folder]
+
+    exp_path = None
+    for cand in candidates:
+        p = os.path.join(results_dir, cand)
+        if os.path.isdir(p):
+            exp_path = p
+            break
+        p_leg = os.path.join(results_dir, "legados", "resultados_legados_2", cand)
+        if os.path.isdir(p_leg):
+            exp_path = p_leg
+            break
+        p_leg2 = os.path.join(results_dir, "legados", cand)
+        if os.path.isdir(p_leg2):
+            exp_path = p_leg2
+            break
+
+    if exp_path is None:
         return None
 
     h5_files = sorted(glob.glob(os.path.join(exp_path, h5_glob)))
     if not h5_files:
         return None
+
+    # Deduplicar execuções mantendo o arquivo mais recente para cada run
+    run_dict = {}
+    for f in h5_files:
+        m = re.search(r"_run(\d+)(?:_(\d{8}_\d{6}))?\.h5$", os.path.basename(f))
+        if m:
+            rid = int(m.group(1))
+            ts = m.group(2) or ""
+            if rid not in run_dict or ts > run_dict[rid][0]:
+                run_dict[rid] = (ts, f)
+        else:
+            run_dict[f] = ("", f)
+    h5_files = [v[1] for v in sorted(run_dict.values(), key=lambda x: x[1])]
 
     # Acumular métricas de cada run
     metrics_keys = [
@@ -375,41 +412,74 @@ def main():
     # ======================================================================
     # EXIBIÇÃO: Linhas de Improvement (PUMA-GT Rank Adap vs LoRA Padrão)
     # ======================================================================
-    improvement_data = {}  # dataset -> dict de improvements
-    if args.improvement:
-        print("-" * 168)
-        datasets_list = ["OxfordPets", "DTD", "FGVCAircraft", "Flowers102"]
-        for ds in datasets_list:
-            puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT Rank Adap' and r['status'] == 'OK'), None)
-            if puma is None:
-                puma = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'PUMA-GT' and r['status'] == 'OK'), None)
-            lora = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'LoRA Padrão' and r['status'] == 'OK'), None)
+    # ======================================================================
+    # EXIBIÇÃO: Tabela de Economia Exata vs Baseline (LoRA Padrão)
+    # ======================================================================
+    print("\n")
+    print("=" * 168)
+    print("📉 ECONOMIA EXATA EM RELAÇÃO AO BASELINE (LoRA Padrão)")
+    print("=" * 168)
+    sav_header = (
+        f"{'Dataset':<15} | {'Estratégia':<15} | "
+        f"{'Acurácia (%)':>14} | {'Diferença Acc':>16} | "
+        f"{'Banda Total (MB)':>18} | {'Economia Banda':>28} | "
+        f"{'Tempo/Rod (s)':>15} | {'Economia Tempo':>26}"
+    )
+    print(sav_header)
+    print("-" * 168)
 
-            if puma is None or lora is None:
-                print(
-                    f"{ds:<15} | {'⚡ Improvement':<20} | {'---':>4} | "
-                    f"{'--- DADOS INSUF. ---':>22} | {'---':>20} | "
-                    f"{'---':>22} | {'---':>22} | {'---':>24}"
-                )
-                continue
+    datasets_list = ["OxfordPets", "DTD", "FGVCAircraft", "Flowers102"]
+    savings_map = {}  # (ds, strat) -> dict de métricas de economia
+    for ds in datasets_list:
+        lora = next((r for r in all_results if r['dataset'] == ds and r['strategy'] == 'LoRA Padrão' and r['status'] == 'OK'), None)
+        ds_strats = [r for r in all_results if r['dataset'] == ds and r['status'] == 'OK']
+        if not lora:
+            continue
 
-            imp = compute_improvement(puma, lora)
-            improvement_data[ds] = (imp, puma['strategy'])
+        l_acc = lora['final_accuracy_mean']
+        l_data = lora['total_data_transmitted_mb_mean']
+        l_time = lora['avg_round_time_s_mean']
 
-            acc_imp = format_improvement(imp['accuracy'])
-            conv_imp = format_improvement(imp['convergence'])
-            data_imp = format_improvement(imp['total_data'])
-            time_imp = format_improvement(imp['avg_time'])
-            dpr_imp = format_improvement(imp['avg_data_round'])
+        for r in ds_strats:
+            strat = r['strategy']
+            acc = r['final_accuracy_mean']
+            data = r['total_data_transmitted_mb_mean']
+            time = r['avg_round_time_s_mean']
+
+            if strat == 'LoRA Padrão':
+                diff_acc_str = "Baseline"
+                sav_data_str = "Baseline"
+                sav_time_str = "Baseline"
+                acc_diff = 0.0
+                data_saved_mb = 0.0
+                data_saved_pct = 0.0
+                time_saved_s = 0.0
+                time_saved_pct = 0.0
+            else:
+                acc_diff = acc - l_acc
+                diff_acc_str = f"{acc_diff:+.2f} p.p."
+                data_saved_mb = l_data - data
+                data_saved_pct = (data_saved_mb / l_data) * 100 if l_data else 0.0
+                sav_data_str = f"-{data_saved_mb:,.1f} MB (-{data_saved_pct:.2f}%)" if data_saved_mb >= 0 else f"+{-data_saved_mb:,.1f} MB (+{-data_saved_pct:.2f}%)"
+                time_saved_s = l_time - time
+                time_saved_pct = (time_saved_s / l_time) * 100 if l_time else 0.0
+                sav_time_str = f"-{time_saved_s:.2f}s (-{time_saved_pct:.2f}%)" if time_saved_s >= 0 else f"+{-time_saved_s:.2f}s (+{-time_saved_pct:.2f}%)"
+
+            savings_map[(ds, strat)] = {
+                'acc_diff_pp': acc_diff,
+                'data_saved_mb': data_saved_mb,
+                'data_saved_pct': data_saved_pct,
+                'time_saved_s': time_saved_s,
+                'time_saved_pct': time_saved_pct,
+            }
 
             print(
-                f"{ds:<15} | {'⚡ Improvement':<20} | {'':>4} | "
-                f"{acc_imp:>22} | {conv_imp:>20} | "
-                f"{data_imp:>22} | {time_imp:>22} | "
-                f"{dpr_imp:>24}"
+                f"{ds:<15} | {strat:<15} | "
+                f"{acc:>13.2f}% | {diff_acc_str:>16} | "
+                f"{data:>15,.2f} MB | {sav_data_str:>28} | "
+                f"{time:>13.2f}s | {sav_time_str:>26}"
             )
-
-    print("=" * 168)
+        print("-" * 168)
 
     # ======================================================================
     # EXIBIÇÃO: Eleição do melhor por atributo (por dataset)
@@ -475,21 +545,14 @@ def main():
     csv_columns = [
         'Dataset', 'Estrategia', 'N_Runs',
         'Acuracia_Final_Mean', 'Acuracia_Final_Std',
+        'Dif_Acuracia_pp_vs_LoRA',
         'Rodada_Convergencia_Mean', 'Rodada_Convergencia_Std',
         'Dados_Total_MB_Mean', 'Dados_Total_MB_Std',
+        'Economia_Banda_MB_vs_LoRA', 'Economia_Banda_%_vs_LoRA',
         'Tempo_Medio_Rodada_s_Mean', 'Tempo_Medio_Rodada_s_Std',
+        'Economia_Tempo_s_vs_LoRA', 'Economia_Tempo_%_vs_LoRA',
         'Dados_Medios_Rodada_MB_Mean', 'Dados_Medios_Rodada_MB_Std',
     ]
-
-    # Se --improvement ativo, adicionar colunas de improvement ao CSV
-    if args.improvement:
-        csv_columns.extend([
-            'Improvement_Acuracia_%',
-            'Improvement_Convergencia_%',
-            'Improvement_Dados_Total_%',
-            'Improvement_Tempo_Medio_%',
-            'Improvement_Dados_Rodada_%',
-        ])
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=csv_columns)
@@ -504,35 +567,33 @@ def main():
                 })
                 continue
 
+            sav = savings_map.get((r['dataset'], r['strategy']), {})
+            acc_diff_val = f"{sav['acc_diff_pp']:+.4f}" if sav and r['strategy'] != 'LoRA Padrão' else "Baseline"
+            banda_mb_val = f"{sav['data_saved_mb']:.2f}" if sav and r['strategy'] != 'LoRA Padrão' else "Baseline"
+            banda_pct_val = f"{sav['data_saved_pct']:.2f}%" if sav and r['strategy'] != 'LoRA Padrão' else "Baseline"
+            tempo_s_val = f"{sav['time_saved_s']:.2f}" if sav and r['strategy'] != 'LoRA Padrão' else "Baseline"
+            tempo_pct_val = f"{sav['time_saved_pct']:.2f}%" if sav and r['strategy'] != 'LoRA Padrão' else "Baseline"
+
             writer.writerow({
                 'Dataset': r['dataset'],
                 'Estrategia': r['strategy'],
                 'N_Runs': r['n_runs'],
                 'Acuracia_Final_Mean': f"{r['final_accuracy_mean']:.4f}",
                 'Acuracia_Final_Std': f"{r['final_accuracy_std']:.4f}",
+                'Dif_Acuracia_pp_vs_LoRA': acc_diff_val,
                 'Rodada_Convergencia_Mean': f"{r['convergence_round_mean']:.2f}",
                 'Rodada_Convergencia_Std': f"{r['convergence_round_std']:.2f}",
                 'Dados_Total_MB_Mean': f"{r['total_data_transmitted_mb_mean']:.4f}",
                 'Dados_Total_MB_Std': f"{r['total_data_transmitted_mb_std']:.4f}",
+                'Economia_Banda_MB_vs_LoRA': banda_mb_val,
+                'Economia_Banda_%_vs_LoRA': banda_pct_val,
                 'Tempo_Medio_Rodada_s_Mean': f"{r['avg_round_time_s_mean']:.4f}",
                 'Tempo_Medio_Rodada_s_Std': f"{r['avg_round_time_s_std']:.4f}",
+                'Economia_Tempo_s_vs_LoRA': tempo_s_val,
+                'Economia_Tempo_%_vs_LoRA': tempo_pct_val,
                 'Dados_Medios_Rodada_MB_Mean': f"{r['avg_data_per_round_mb_mean']:.4f}",
                 'Dados_Medios_Rodada_MB_Std': f"{r['avg_data_per_round_mb_std']:.4f}",
             })
-
-        # Linhas de improvement no CSV
-        if args.improvement:
-            for ds, (imp, strat_name) in improvement_data.items():
-                writer.writerow({
-                    'Dataset': ds,
-                    'Estrategia': f'IMPROVEMENT ({strat_name} vs LoRA)',
-                    'N_Runs': '',
-                    'Improvement_Acuracia_%': f"{imp['accuracy']:.4f}",
-                    'Improvement_Convergencia_%': f"{imp['convergence']:.4f}",
-                    'Improvement_Dados_Total_%': f"{imp['total_data']:.4f}",
-                    'Improvement_Tempo_Medio_%': f"{imp['avg_time']:.4f}",
-                    'Improvement_Dados_Rodada_%': f"{imp['avg_data_round']:.4f}",
-                })
 
     print(f"\n📁 Resultados salvos em: {csv_path}")
     print()

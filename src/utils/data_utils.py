@@ -16,54 +16,41 @@
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 import numpy as np
-import os
+from pathlib import Path
 import torch
 
 
-def read_data(dataset, idx, is_train=True):
-    if is_train:
-        train_data_dir = os.path.join('..', 'dataset', dataset, 'train/')
-
-        train_file = train_data_dir + str(idx) + '.npz'
-        with open(train_file, 'rb') as f:
-            train_data = np.load(f, allow_pickle=True)['data'].tolist()
-
-        return train_data
-
-    else:
-        test_data_dir = os.path.join('..', 'dataset', dataset, 'test/')
-
-        test_file = test_data_dir + str(idx) + '.npz'
-        with open(test_file, 'rb') as f:
-            test_data = np.load(f, allow_pickle=True)['data'].tolist()
-
-        return test_data
+def read_data(dataset, idx, is_train=True, *, dataset_dir=None):
+    directory = Path(dataset_dir) if dataset_dir is not None else Path('..') / 'dataset' / dataset
+    path = directory / ('train' if is_train else 'test') / f'{idx}.npz'
+    with path.open('rb') as stream:
+        return np.load(stream, allow_pickle=True)['data'].tolist()
 
 
-def read_client_data(dataset, idx, is_train=True):
+def read_client_data(dataset, idx, is_train=True, *, dataset_dir=None):
     if "News" in dataset:
-        return read_client_data_text(dataset, idx, is_train)
+        return read_client_data_text(dataset, idx, is_train, dataset_dir=dataset_dir)
     elif "Shakespeare" in dataset:
-        return read_client_data_Shakespeare(dataset, idx)
+        return read_client_data_Shakespeare(dataset, idx, dataset_dir=dataset_dir)
 
     if is_train:
-        train_data = read_data(dataset, idx, is_train)
+        train_data = read_data(dataset, idx, is_train, dataset_dir=dataset_dir)
         X_train = torch.Tensor(train_data['x']).type(torch.float32)
         y_train = torch.Tensor(train_data['y']).type(torch.int64)
 
         train_data = [(x, y) for x, y in zip(X_train, y_train)]
         return train_data
     else:
-        test_data = read_data(dataset, idx, is_train)
+        test_data = read_data(dataset, idx, is_train, dataset_dir=dataset_dir)
         X_test = torch.Tensor(test_data['x']).type(torch.float32)
         y_test = torch.Tensor(test_data['y']).type(torch.int64)
         test_data = [(x, y) for x, y in zip(X_test, y_test)]
         return test_data
 
 
-def read_client_data_text(dataset, idx, is_train=True):
+def read_client_data_text(dataset, idx, is_train=True, *, dataset_dir=None):
     if is_train:
-        train_data = read_data(dataset, idx, is_train)
+        train_data = read_data(dataset, idx, is_train, dataset_dir=dataset_dir)
         X_train, X_train_lens = list(zip(*train_data['x']))
         y_train = train_data['y']
 
@@ -74,7 +61,7 @@ def read_client_data_text(dataset, idx, is_train=True):
         train_data = [((x, lens), y) for x, lens, y in zip(X_train, X_train_lens, y_train)]
         return train_data
     else:
-        test_data = read_data(dataset, idx, is_train)
+        test_data = read_data(dataset, idx, is_train, dataset_dir=dataset_dir)
         X_test, X_test_lens = list(zip(*test_data['x']))
         y_test = test_data['y']
 
@@ -86,16 +73,16 @@ def read_client_data_text(dataset, idx, is_train=True):
         return test_data
 
 
-def read_client_data_Shakespeare(dataset, idx, is_train=True):
+def read_client_data_Shakespeare(dataset, idx, is_train=True, *, dataset_dir=None):
     if is_train:
-        train_data = read_data(dataset, idx, is_train)
+        train_data = read_data(dataset, idx, is_train, dataset_dir=dataset_dir)
         X_train = torch.Tensor(train_data['x']).type(torch.int64)
         y_train = torch.Tensor(train_data['y']).type(torch.int64)
 
         train_data = [(x, y) for x, y in zip(X_train, y_train)]
         return train_data
     else:
-        test_data = read_data(dataset, idx, is_train)
+        test_data = read_data(dataset, idx, is_train, dataset_dir=dataset_dir)
         X_test = torch.Tensor(test_data['x']).type(torch.int64)
         y_test = torch.Tensor(test_data['y']).type(torch.int64)
         test_data = [(x, y) for x, y in zip(X_test, y_test)]

@@ -9,26 +9,34 @@ Gera graficos a partir dos resultados HDF5 salvos pelos clientes:
 
 Uso:
     cd FL_ServerPuma/
-    uv run python3 src/sumo_adapter/plot/plot_v2v_accuracy.py
+    uv run python3 src/v2v_fl/plot/plot_v2v_accuracy.py
 
     # Especificando pastas:
-    uv run python3 src/sumo_adapter/plot/plot_v2v_accuracy.py \
+    uv run python3 src/v2v_fl/plot/plot_v2v_accuracy.py \
         --v2v-dir src/results/default_exp \
         --centralized-dir src/results/centralized_exp
 
-Os graficos sao salvos como PDF no diretorio de resultados do experimento V2V.
+Também aceita --run-dir repetido para acurácia média pós-encontro V2V/V2I:
+    uv run python src/v2v_fl/plot/plot_v2v_accuracy.py \
+        --run-dir src/results/runs/v2v/validacao-01 \
+        --run-dir src/results/runs/v2i/validacao-ofc
+
+Os gráficos são salvos como PDF nesta pasta, ou em --output-dir.
 """
 
 import argparse
+import hashlib
+import json
+import math
 import sys
 from pathlib import Path
 
 import h5py
 import matplotlib
-matplotlib.use('Agg')
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-
 
 # ==============================================================================
 # Configurações globais
@@ -39,35 +47,38 @@ import numpy as np
 # False = títulos ocultos (útil para artigos/papers onde a legenda da figura é suficiente)
 SHOW_TITLES = False
 
-plt.rcParams.update({
-    'xtick.labelsize': 24,
-    'ytick.labelsize': 24,
-    'legend.fontsize': 24,
-    'axes.labelsize': 24,
-    'axes.titlesize': 24,
-})
+plt.rcParams.update(
+    {
+        "xtick.labelsize": 24,
+        "ytick.labelsize": 24,
+        "legend.fontsize": 24,
+        "axes.labelsize": 24,
+        "axes.titlesize": 24,
+    }
+)
 
 # ==============================================================================
 # Paleta de cores e estilos para comparação
 # ==============================================================================
 
 STYLES = [
-    {'color': '#1f77b4', 'marker': 'o',  'ls': '-'},
-    {'color': '#d62728', 'marker': 's',  'ls': '--'},
-    {'color': '#2ca02c', 'marker': 'D',  'ls': '-.'},
-    {'color': '#ff7f0e', 'marker': '^',  'ls': ':'},
-    {'color': '#9467bd', 'marker': 'v',  'ls': '-'},
-    {'color': '#8c564b', 'marker': 'P',  'ls': '--'},
-    {'color': '#e377c2', 'marker': 'X',  'ls': '-.'},
-    {'color': '#17becf', 'marker': 'h',  'ls': ':'},
-    {'color': '#bcbd22', 'marker': '*',  'ls': '-'},
-    {'color': '#7f7f7f', 'marker': 'd',  'ls': '--'},
+    {"color": "#1f77b4", "marker": "o", "ls": "-"},
+    {"color": "#d62728", "marker": "s", "ls": "--"},
+    {"color": "#2ca02c", "marker": "D", "ls": "-."},
+    {"color": "#ff7f0e", "marker": "^", "ls": ":"},
+    {"color": "#9467bd", "marker": "v", "ls": "-"},
+    {"color": "#8c564b", "marker": "P", "ls": "--"},
+    {"color": "#e377c2", "marker": "X", "ls": "-."},
+    {"color": "#17becf", "marker": "h", "ls": ":"},
+    {"color": "#bcbd22", "marker": "*", "ls": "-"},
+    {"color": "#7f7f7f", "marker": "d", "ls": "--"},
 ]
 
 
 # ==============================================================================
 # Funções auxiliares
 # ==============================================================================
+
 
 def _mark_every(n):
     return max(1, n // 10)
@@ -76,21 +87,209 @@ def _mark_every(n):
 def _set_title(ax, title):
     """Aplica título ao eixo apenas se SHOW_TITLES estiver ativado."""
     if SHOW_TITLES:
-        ax.set_title(title, fontsize=18, fontweight='bold', pad=12)
+        ax.set_title(title, fontsize=18, fontweight="bold", pad=12)
 
 
-def _save_and_close(fig, output_dir, filename):
+def _save_and_close(fig, output_dir, filename, metadata=None):
     """Salva a figura como PDF e fecha."""
     import os
+
     path = os.path.join(str(output_dir), filename)
-    fig.savefig(path, dpi=150)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight", metadata=metadata)
     plt.close(fig)
     print(f"{path}")
+
+
+def load_encounter_runs(run_dirs: list[Path]) -> list[dict]:
+    """Lê somente as execuções explícitas, sem misturar eventos legados ou seeds."""
+    project_root = Path(__file__).resolve().parents[3]
+    runs = []
+    for directory in run_dirs:
+        directory = (project_root / directory).resolve()
+        metadata = json.loads((directory / "run.json").read_text())
+        mode, run_id = metadata["mode"], metadata["run_id"]
+        if mode not in {"v2v", "v2i"}:
+            raise ValueError(f"Modo não suportado em {directory}: {mode}")
+        path = directory / f"{mode}_events.jsonl"
+        contents = path.read_bytes()
+        events = []
+        seen = set()
+        for line_number, line in enumerate(contents.splitlines(), 1):
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if event.get("type") != "encounter_formed":
+                continue
+            encounter_id = event.get("encounter_id")
+            if (
+                event.get("run_id") != run_id
+                or type(encounter_id) is not int
+                or encounter_id < 1
+                or encounter_id in seen
+            ):
+                raise ValueError(f"Contexto ou ID de encontro inválido: {path}:{line_number}")
+            seen.add(encounter_id)
+            events.append(event)
+        if not events:
+            raise ValueError(f"Nenhum encontro encontrado em {path}")
+        seed = metadata["parameters"]["seed"]
+        runs.append(
+            {
+                "mode": mode,
+                "run_id": run_id,
+                "seed": seed,
+                "label": f"{mode.upper()}: {run_id} (seed {seed})",
+                "events": sorted(events, key=lambda e: e["encounter_id"]),
+                "events_sha256": hashlib.sha256(contents).hexdigest(),
+            }
+        )
+        print(f"{mode.upper()} / {run_id}: {len(events)} encontros, seed {seed}")
+    return runs
+
+
+def encounter_metric_values(events: list[dict], metric: str) -> np.ndarray:
+    """Ausências/falhas viram lacunas; bytes são contados uma vez por transferência."""
+    values = []
+    for event in events:
+        value = None
+        if event.get("status") == "completed":
+            if metric == "transfer_bytes":
+                fields = [event.get("upload_bytes"), event.get("download_bytes")]
+                if event.get("byte_counts_complete") and all(
+                    type(v) is int and v >= 0 for v in fields
+                ):
+                    value = sum(fields) / (1024 * 1024)
+            elif metric in {"accuracy_mean", "accuracy_weighted"}:
+                if event.get("evaluated_count", 0) > 0 and event.get(
+                    "evaluated_count"
+                ) == event.get("participant_count"):
+                    value = event.get(metric)
+            elif metric in {"protocol_time", "total_time"}:
+                value = event.get(metric)
+            else:
+                raise ValueError(f"Métrica não suportada: {metric}")
+        valid = (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and value >= 0
+        )
+        if metric.startswith("accuracy_") and valid:
+            valid = value <= 100
+        values.append(float(value) if valid else np.nan)
+    return np.asarray(values)
+
+
+def plot_encounter_metric(runs: list[dict], output_dir: Path, metric: str) -> Path:
+    """Reutiliza a paleta/tipografia e registra fontes e definição dentro do PDF."""
+    labels = {
+        "accuracy_mean": ("Mean post-encounter accuracy (%)", "encounter_accuracy.pdf"),
+        "accuracy_weighted": (
+            "Post-encounter accuracy (%)",
+            "encounter_accuracy.pdf",
+        ),
+        "transfer_bytes": ("Data (MiB)", "encounter_data_transfer.pdf"),
+        "protocol_time": (
+            "Model exchange protocol time (s)",
+            "encounter_exchange_time.pdf",
+        ),
+        "total_time": (
+            "Total encounter time including evaluation (s)",
+            "encounter_exchange_time.pdf",
+        ),
+    }
+    ylabel, filename = labels[metric]
+    fig, ax = plt.subplots(figsize=(12, 7))
+    plotted = False
+    encounter_ids = set()
+    for index, run in enumerate(runs):
+        events = run["events"]
+        ids = np.array([e["encounter_id"] for e in events])
+        values = encounter_metric_values(events, metric)
+        encounter_ids.update(ids)
+        if not np.isfinite(values).any():
+            print(f"[INFO] {run['label']}: sem valores completos para {metric}.")
+            continue
+        plotted = True
+        style = STYLES[index % len(STYLES)]
+        if metric == "transfer_bytes":
+            width = 0.8 / len(runs)
+            ax.bar(
+                ids + (index - (len(runs) - 1) / 2) * width,
+                values,
+                width=width,
+                color=style["color"],
+                edgecolor="black",
+                alpha=0.85,
+                label=run["label"],
+            )
+        else:
+            ax.plot(
+                ids,
+                values,
+                color=style["color"],
+                marker=style["marker"],
+                linestyle=style["ls"],
+                linewidth=2,
+                markersize=7,
+                label=run["label"],
+            )
+            if metric.startswith("accuracy_"):
+                for encounter_id, value, event in zip(ids, values, events, strict=True):
+                    if np.isfinite(value):
+                        ax.annotate(
+                            f"n={event['participant_count']}",
+                            (encounter_id, value),
+                            xytext=(0, 9),
+                            textcoords="offset points",
+                            ha="center",
+                            fontsize=12,
+                            color=style["color"],
+                        )
+    if not plotted:
+        plt.close(fig)
+        raise ValueError(f"Nenhum encontro completo contém a métrica {metric}.")
+    ax.set_xlabel("Encounter ID")
+    ax.set_ylabel(ylabel)
+    ax.set_ylim(bottom=0)
+    if metric.startswith("accuracy_"):
+        ax.set_ylim(0, 100)
+    if len(encounter_ids) <= 25:
+        ax.set_xticks(sorted(encounter_ids))
+    else:
+        from matplotlib.ticker import MaxNLocator
+
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.23), fontsize=16)
+    ax.grid(True, ls="--", alpha=0.4, axis="y")
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    provenance = {
+        "metric": metric,
+        "definition": ylabel,
+        "sources": [
+            {k: run[k] for k in ("mode", "run_id", "seed", "events_sha256")} for run in runs
+        ],
+    }
+    _save_and_close(
+        fig,
+        output_dir,
+        filename,
+        metadata={
+            "Title": ylabel,
+            "Subject": json.dumps(provenance, ensure_ascii=True),
+            "CreationDate": None,
+            "ModDate": None,
+        },
+    )
+    return output_dir / filename
 
 
 # ==============================================================================
 # Funções de carregamento
 # ==============================================================================
+
 
 def load_results_from_dir(results_dir: Path) -> dict[int, dict]:
     """Carrega todos os arquivos .h5 de um diretorio de resultados.
@@ -117,7 +316,11 @@ def load_results_from_dir(results_dir: Path) -> dict[int, dict]:
             local_acc = hf["rs_local_acc"][:] if "rs_local_acc" in hf else np.array([])
             train_acc = hf["rs_train_acc"][:] if "rs_train_acc" in hf else np.array([])
             post_p2p_acc = hf["rs_post_p2p_acc"][:] if "rs_post_p2p_acc" in hf else np.array([])
-            post_p2p_enc_ids = hf["rs_post_p2p_encounter_ids"][:] if "rs_post_p2p_encounter_ids" in hf else np.array([])
+            post_p2p_enc_ids = (
+                hf["rs_post_p2p_encounter_ids"][:]
+                if "rs_post_p2p_encounter_ids" in hf
+                else np.array([])
+            )
 
         # So incluir clientes com pelo menos 1 epoca de dados
         if len(local_acc) > 0:
@@ -136,6 +339,7 @@ def load_results_from_dir(results_dir: Path) -> dict[int, dict]:
 # 01 - Acurácia Individual por Cliente (V2V)
 # ==============================================================================
 
+
 def plot_individual_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
     """Acuracia de teste de cada cliente V2V ao longo das epocas."""
     fig, ax = plt.subplots(figsize=(12, 7))
@@ -147,10 +351,10 @@ def plot_individual_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
         ax.plot(
             epochs,
             data["local_acc"],
-            color=s['color'],
-            marker=s['marker'],
+            color=s["color"],
+            marker=s["marker"],
             markevery=_mark_every(len(data["local_acc"])),
-            linestyle=s['ls'],
+            linestyle=s["ls"],
             label=f"Client {client_idx}",
         )
 
@@ -158,24 +362,24 @@ def plot_individual_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Accuracy (%)")
     from matplotlib.ticker import MaxNLocator
+
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.legend()
-    ax.grid(True, ls='--', alpha=0.4)
+    ax.grid(True, ls="--", alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "v2v_accuracy_per_client.pdf")
-
 
 
 # ==============================================================================
 # 02 - Acurácia Pós-Agregação P2P por Cliente
 # ==============================================================================
 
+
 def plot_post_p2p_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
     """Acuracia de teste de cada cliente imediatamente apos cada agregacao P2P."""
     # Filtrar clientes que possuem dados de agregacao P2P
     clients_with_p2p = {
-        idx: data for idx, data in v2v_clients.items()
-        if len(data.get("post_p2p_acc", [])) > 0
+        idx: data for idx, data in v2v_clients.items() if len(data.get("post_p2p_acc", [])) > 0
     }
 
     if not clients_with_p2p:
@@ -192,10 +396,10 @@ def plot_post_p2p_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
         ax.plot(
             enc_ids,
             acc,
-            color=s['color'],
-            marker=s['marker'],
+            color=s["color"],
+            marker=s["marker"],
             markevery=_mark_every(len(acc)),
-            linestyle=s['ls'],
+            linestyle=s["ls"],
             label=f"Client {client_idx}",
         )
 
@@ -203,9 +407,10 @@ def plot_post_p2p_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
     ax.set_xlabel("Encounter ID")
     ax.set_ylabel("Accuracy (%)")
     from matplotlib.ticker import MaxNLocator
+
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.legend()
-    ax.grid(True, ls='--', alpha=0.4)
+    ax.grid(True, ls="--", alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "v2v_post_p2p_accuracy.pdf")
 
@@ -213,6 +418,7 @@ def plot_post_p2p_accuracy(v2v_clients: dict[int, dict], output_dir: Path):
 # ==============================================================================
 # 03 - Comparação V2V vs Centralizado (Média de Acurácia)
 # ==============================================================================
+
 
 def plot_comparison(
     v2v_clients: dict[int, dict],
@@ -238,10 +444,10 @@ def plot_comparison(
         ax.plot(
             epochs_v2v,
             v2v_mean,
-            color=s['color'],
-            marker=s['marker'],
+            color=s["color"],
+            marker=s["marker"],
             markevery=_mark_every(len(v2v_mean)),
-            linestyle=s['ls'],
+            linestyle=s["ls"],
             label="V2V Decentralized",
         )
         ax.fill_between(
@@ -249,7 +455,7 @@ def plot_comparison(
             v2v_mean - v2v_std,
             v2v_mean + v2v_std,
             alpha=0.1,
-            color=s['color'],
+            color=s["color"],
         )
 
     # ── Calcular media Centralizado ───────────────────────────────────────
@@ -268,10 +474,10 @@ def plot_comparison(
         ax.plot(
             epochs_cent,
             cent_mean,
-            color=s['color'],
-            marker=s['marker'],
+            color=s["color"],
+            marker=s["marker"],
             markevery=_mark_every(len(cent_mean)),
-            linestyle=s['ls'],
+            linestyle=s["ls"],
             label="Centralized",
         )
         ax.fill_between(
@@ -279,15 +485,19 @@ def plot_comparison(
             cent_mean - cent_std,
             cent_mean + cent_std,
             alpha=0.1,
-            color=s['color'],
+            color=s["color"],
         )
     else:
         ax.text(
-            0.5, 0.3,
-            "Centralized data not available.\n"
-            "Run centralized mode and pass --centralized-dir.",
-            transform=ax.transAxes, fontsize=13,
-            color="#999", ha="center", va="center", style="italic",
+            0.5,
+            0.3,
+            "Centralized data not available.\nRun centralized mode and pass --centralized-dir.",
+            transform=ax.transAxes,
+            fontsize=13,
+            color="#999",
+            ha="center",
+            va="center",
+            style="italic",
         )
 
     _set_title(ax, "V2V Decentralized vs Centralized")
@@ -295,9 +505,10 @@ def plot_comparison(
     ax.set_ylabel("Average Test Accuracy (%)")
     ax.set_ylim(0, 100)
     from matplotlib.ticker import MaxNLocator
+
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.legend()
-    ax.grid(True, ls='--', alpha=0.4)
+    ax.grid(True, ls="--", alpha=0.4)
     fig.tight_layout()
     _save_and_close(fig, output_dir, "v2v_vs_centralized.pdf")
 
@@ -305,6 +516,7 @@ def plot_comparison(
 # ==============================================================================
 # Main
 # ==============================================================================
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -320,9 +532,27 @@ def main():
         "--centralized-dir",
         type=str,
         default="src/results/default_exp",
-        help="Diretorio com os .h5 dos clientes centralizados (default: src/results/centralized_exp)",
+        help=(
+            "Diretorio com os .h5 dos clientes centralizados (default: src/results/default_exp)"
+        ),
     )
+    parser.add_argument(
+        "--run-dir",
+        action="append",
+        type=Path,
+        help="Pasta de execução V2V/V2I; repita para comparar execuções",
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--accuracy", choices=["mean", "weighted"], default="mean")
     args = parser.parse_args()
+
+    if args.run_dir:
+        try:
+            runs = load_encounter_runs(args.run_dir)
+            plot_encounter_metric(runs, args.output_dir, f"accuracy_{args.accuracy}")
+        except (OSError, ValueError, KeyError) as exc:
+            parser.exit(1, f"Erro ao gerar gráfico: {exc}\n")
+        return
 
     # Resolver caminhos relativos a partir da raiz do projeto
     project_root = Path(__file__).resolve().parents[3]
@@ -330,7 +560,7 @@ def main():
     centralized_dir = project_root / args.centralized_dir
 
     # Salvar graficos na pasta de resultados do experimento V2V
-    output_dir = Path(__file__).resolve().parent
+    output_dir = args.output_dir
 
     print(f"Diretorio V2V:          {v2v_dir}")
     print(f"Diretorio Centralizado: {centralized_dir}")
@@ -344,9 +574,15 @@ def main():
         print("  [ERRO] Nenhum arquivo .h5 encontrado em:", v2v_dir)
         sys.exit(1)
     for idx, data in sorted(v2v_clients.items()):
-        p2p_info = f", {len(data['post_p2p_acc'])} encontros P2P" if len(data.get('post_p2p_acc', [])) > 0 else ""
-        print(f"  Cliente {idx}: {len(data['local_acc'])} epocas{p2p_info}, "
-              f"ultima acc={data['local_acc'][-1]:.2f}%")
+        p2p_info = (
+            f", {len(data['post_p2p_acc'])} encontros P2P"
+            if len(data.get("post_p2p_acc", [])) > 0
+            else ""
+        )
+        print(
+            f"  Cliente {idx}: {len(data['local_acc'])} epocas{p2p_info}, "
+            f"ultima acc={data['local_acc'][-1]:.2f}%"
+        )
 
     print()
     print("Carregando resultados centralizados...")
@@ -356,8 +592,10 @@ def main():
         print("         O grafico comparativo mostrara apenas V2V.")
     else:
         for idx, data in sorted(centralized_clients.items()):
-            print(f"  Cliente {idx}: {len(data['local_acc'])} rodadas, "
-                  f"ultima acc={data['local_acc'][-1]:.2f}%")
+            print(
+                f"  Cliente {idx}: {len(data['local_acc'])} rodadas, "
+                f"ultima acc={data['local_acc'][-1]:.2f}%"
+            )
 
     # ── Gerar graficos ────────────────────────────────────────────────────
     print()

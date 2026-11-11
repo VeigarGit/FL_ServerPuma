@@ -74,6 +74,7 @@ ALA=1
 IN_FEATURES=3
 DIM=1600
 NUM_CLASSES=10
+CUSTOM_NUM_CLASSES=0
 TEST_CLIENT_IDX=0
 
 # PaCA
@@ -85,6 +86,9 @@ PACA_MIN=1
 PACA_MAX=12
 CUSTOM_PACA_MAX=0
 PACA_LIST=""
+ADAPTIVE_PACA_MIN=""
+ADAPTIVE_PACA_COOLDOWN=""
+ANNEALING_RATIO=""
 
 # Rank Adaptativo
 ADAPTIVE_RANK=0
@@ -226,12 +230,15 @@ while [ $# -gt 0 ]; do
         # Arquitetura (CNN)
         --in-features) IN_FEATURES="$2"; shift 2 ;;
         --dim) DIM="$2"; shift 2 ;;
-        --num-classes) NUM_CLASSES="$2"; shift 2 ;;
+        --num-classes) NUM_CLASSES="$2"; CUSTOM_NUM_CLASSES=1; shift 2 ;;
         -t|--test-client-idx) TEST_CLIENT_IDX="$2"; shift 2 ;;
 
         # PaCA
         --paca) PACA="$2"; CUSTOM_PACA=1; shift 2 ;;
         --adaptive-paca) ADAPTIVE_PACA=1; shift 1 ;;
+        --adaptive-paca-min) ADAPTIVE_PACA_MIN="$2"; shift 2 ;;
+        --adaptive-paca-cooldown) ADAPTIVE_PACA_COOLDOWN="$2"; shift 2 ;;
+        --annealing-ratio) ANNEALING_RATIO="$2"; shift 2 ;;
         --random-paca) RANDOM_PACA=1; shift 1 ;;
         --paca-min) PACA_MIN="$2"; shift 2 ;;
         --paca-max) PACA_MAX="$2"; CUSTOM_PACA_MAX=1; shift 2 ;;
@@ -241,7 +248,6 @@ while [ $# -gt 0 ]; do
         --adaptive-rank) ADAPTIVE_RANK=1; shift 1 ;;
         --adaptive-rank-min) ADAPTIVE_RANK_MIN="$2"; shift 2 ;;
         --adaptive-rank-max) ADAPTIVE_RANK_MAX="$2"; shift 2 ;;
-        --allow-paca-upscale) ALLOW_PACA_UPSCALE=1; shift 1 ;;
         --allow-rank-upscale) ALLOW_RANK_UPSCALE=1; shift 1 ;;
 
         # Persistência de Modelo
@@ -272,6 +278,18 @@ while [ $# -gt 0 ]; do
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
 done
+
+# ---- Auto-inferência de NUM_CLASSES por Dataset ----
+if [ "$CUSTOM_NUM_CLASSES" -eq 0 ]; then
+    case "$DATASET" in
+        OxfordPets)   NUM_CLASSES=37 ;;
+        DTD)          NUM_CLASSES=47 ;;
+        FGVCAircraft) NUM_CLASSES=100 ;;
+        Flowers102)   NUM_CLASSES=102 ;;
+        Cifar100)     NUM_CLASSES=100 ;;
+        Cifar10|MNIST) NUM_CLASSES=10 ;;
+    esac
+fi
 
 # ---- Auto-detecção de Dispositivo (GPU / MPS / CPU) ----
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
@@ -359,6 +377,10 @@ else
     fi
 fi
 
+if [ "$ADAPTIVE_RANK" -eq 1 ]; then
+    echo "  Rank Adaptativo:    ATIVADO (min: $ADAPTIVE_RANK_MIN, max: $ADAPTIVE_RANK_MAX)"
+fi
+
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
 if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; else echo "  Compressão: INT8 padrão (8 bits/param)"; fi
@@ -383,8 +405,12 @@ TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 if [ -n "$EXP_NAME_OVERRIDE" ]; then
     EXP_NAME="$EXP_NAME_OVERRIDE"
 else
-    if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+    if [ "$ADAPTIVE_PACA" -eq 1 ] && [ "$ADAPTIVE_RANK" -eq 1 ]; then
+        EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca_adaptrank"
+    elif [ "$ADAPTIVE_PACA" -eq 1 ]; then
         EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptpaca"
+    elif [ "$ADAPTIVE_RANK" -eq 1 ]; then
+        EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_adaptrank"
     elif [ "$RANDOM_PACA" -eq 1 ]; then
         EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_randompaca"
     elif [ -n "$PACA_LIST" ]; then
@@ -448,12 +474,18 @@ for RUN in $(seq $START_RUN $END_RUN); do
         --timestamp $TIMESTAMP"
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-paca"
+        if [ -n "$ADAPTIVE_PACA_MIN" ]; then
+            SERVER_CMD="$SERVER_CMD --adaptive-paca-min $ADAPTIVE_PACA_MIN"
+        fi
+        if [ -n "$ADAPTIVE_PACA_COOLDOWN" ]; then
+            SERVER_CMD="$SERVER_CMD --adaptive-paca-cooldown $ADAPTIVE_PACA_COOLDOWN"
+        fi
+    fi
+    if [ -n "$ANNEALING_RATIO" ]; then
+        SERVER_CMD="$SERVER_CMD --annealing-ratio $ANNEALING_RATIO"
     fi
     if [ "$ADAPTIVE_RANK" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --adaptive-rank --adaptive-rank-min $ADAPTIVE_RANK_MIN --adaptive-rank-max $ADAPTIVE_RANK_MAX"
-    fi
-    if [ "${ALLOW_PACA_UPSCALE:-0}" -eq 1 ]; then
-        SERVER_CMD="$SERVER_CMD --allow-paca-upscale"
     fi
     if [ "${ALLOW_RANK_UPSCALE:-0}" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --allow-rank-upscale"
@@ -487,7 +519,8 @@ for RUN in $(seq $START_RUN $END_RUN); do
         EVAL_FLAGS=""
         if [ "$SKIP_POST_EVAL" -eq 1 ]; then
             EVAL_FLAGS="$EVAL_FLAGS --skip-post-eval"
-        elif [ "$SKIP_TRAIN_EVAL" -eq 1 ]; then
+        fi
+        if [ "$SKIP_TRAIN_EVAL" -eq 1 ]; then
             EVAL_FLAGS="$EVAL_FLAGS --skip-train-eval"
         fi
 

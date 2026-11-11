@@ -39,10 +39,20 @@ Depending on your chosen execution method, ensure the following tools are instal
 ## 🛠️ Step 0: Environment Setup & Dataset Generation
 
 Regardless of the execution method, the environment must be synced and the partitioned dataset generated first. You **do not** need to manually activate environments; `uv` handles isolation automatically.
+Install [CUDA](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html).
+
 
 1. **Sync the hermetic environment (installs Python and all dependencies from `uv.lock`):**
    ```bash
    uv sync
+   ```
+   **OR use anaconda with:**
+   Install [conda latest](https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh) and activate conda.
+
+   For additional configurations, refer to the `prepare.sh` script.
+
+   ```bash
+   conda env create -f env_cuda_latest.yaml  # Downgrade torch via pip if needed to match the CUDA version
    ```
 
 2. **Generate the Non-IID Dataset:**
@@ -282,9 +292,9 @@ tmux kill-server
 
 ---
 
-## 🚀 Method 3: V2V-Docker Execution
+## 🚀 Method 3: V2V-OTA Simulation
 
-This method simulates **Vehicular Federated Learning (V2V)** using [SUMO](https://eclipse.dev/sumo/) for urban vehicle mobility and Docker containers as decentralized FL clients. Vehicles train locally and exchange model weights via **D-PSGD (Decentralized Parallel SGD)** when they come within communication range; no central server is required.
+Using [SUMO](https://eclipse.dev/sumo/) for vehicle mobility and Docker clients, this method numerically simulates **V2V Over-the-Air (OTA) aggregation** with path loss, fading, beamforming and thermal noise. Vehicles train locally and exchange model weights over TCP within communication range, following D-PSGD without a central server.
 
 ### Prerequisites
 
@@ -305,25 +315,25 @@ sumo --version
 uv run python src/dataset/generate_MNIST.py noniid - dir
 ```
 
-### Step 2: Run the V2X Simulation
+### Step 2: Run the V2V Simulation
 
-Navigate to the `sumo_adapter` directory and execute the orchestrator:
+Navigate to the `v2v_fl` directory and execute the orchestrator:
 
 ```bash
-cd src/sumo_adapter/
+cd src/v2v_fl/
 
 # First run or after code changes
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg \
+sg docker -c "uv run python3 v2v_docker_orchestrator.py \
+    --sumo-cfg maps/marambaia.sumocfg \
     --build --gui"
 
 # Default run (headless, 5 vehicles, MNIST, max 4 encounters)
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg"
+sg docker -c "uv run python3 v2v_docker_orchestrator.py \
+    --sumo-cfg maps/marambaia.sumocfg"
 
 # With SUMO GUI + custom parameters
-sg docker -c "uv run python3 sumo_docker_orchestrator.py \
-    --sumo-cfg maps/grid.sumocfg \
+sg docker -c "uv run python3 v2v_docker_orchestrator.py \
+    --sumo-cfg maps/marambaia.sumocfg \
     --gui \
     --total-clients 5 \
     --encounters 4 \
@@ -359,8 +369,8 @@ sg docker -c "uv run python3 sumo_docker_orchestrator.py \
 |------|-------------|---------|
 | `--total-clients` | Total vehicle containers to create | `5` |
 | `--encounters` | Maximum viable encounters before stopping | `4` |
-| `--warmup` | Seconds to wait before signaling encounters (containers boot + first epoch) | `60` |
-| `--cooldown` | Seconds between consecutive encounters (prevents encounter spam) | `30` |
+| `--warmup` | Startup wait in seconds before the first training round | `60` |
+| `--cooldown` | SUMO seconds between consecutive encounters | `15` |
 
 **Training:**
 
@@ -373,22 +383,81 @@ sg docker -c "uv run python3 sumo_docker_orchestrator.py \
 
 ### Step 3: Monitor the Simulation
 
-The orchestrator prints real-time logs showing encounter formation, ETC values, and P2P exchange progress:
+The orchestrator prints real-time logs showing encounter formation, ETC values, and training synchronization:
 
 ```
-10:27:42 [INFO] Encontro 1/4! Veiculos ['veh_0', 'veh_3'] (Clientes [0, 1]) | ETC=120.0s
-10:27:42 [INFO] SUMO PAUSADO. Aguardando 2 clientes completarem troca P2P do encontro 1...
-10:27:57 [INFO]   ... 1/2 .pt recebidos (15s)
-10:28:20 [INFO] Todos os 2 .pt recebidos em 38s! Aguardando 5s para agregacao...
-10:28:25 [INFO] SUMO RETOMADO.
+10:27:42 [INFO] Encontro 1/4! Veiculos ['veh_0', 'veh_3'] (Clientes [0, 3]) | ETC=120.0s | (Vezes: 1)
+10:27:57 [INFO] SUMO RETOMADO.
+10:27:57 [INFO] --- Iniciando Treino (Rodada 1) ---
+10:27:57 [INFO] Aguardando todos os 5 clientes completarem a época da rodada 1...
+10:28:20 [INFO] Todos os clientes completaram a época!
 ```
 
 To inspect individual container logs during execution:
 ```bash
-sg docker -c "docker compose -f docker-compose.v2x.yml logs -f fl-client-v2v-0"
+sg docker -c "docker logs -f fl-client-v2v-0"
 ```
 
-## 🚀 Method 4: Manual Execution
+## 🚀 Method 4: V2I-OTA Simulation
+
+V2I uses fixed Road Side Units (RSUs) as OTA receivers. Vehicles train locally;
+the host simulates path loss, Rayleigh fading, reception beamforming, and thermal
+noise using the same OTA pipeline as V2V. Every vehicle in an encounter transmits
+with equal aggregation weight. The RSU contributes no model of its own and keeps
+no model between encounters. Knowledge remains in the vehicles.
+
+Prepare the environment and generate enough dataset partitions for the clients:
+
+```bash
+uv sync
+PYTHONPATH=src uv run python src/dataset/generate_MNIST.py noniid - dir --num-clients 5
+```
+
+The Marambaia scenario uses `marambaia.sumocfg`, `marambaia.net.xml`,
+`marambaia.rou.xml`, and `rsu_config_marambaia.json` in `src/v2v_fl/maps/`.
+To generate RSUs at randomly selected junctions instead:
+
+```bash
+uv run python src/v2v_fl/maps/randomAntenna.py \
+    --net-file src/v2v_fl/maps/marambaia.net.xml \
+    --n-antennas 5 --n-antennas-per-antenna 16 \
+    --radius 1000 --near-junctions --seed 42 \
+    --output src/v2v_fl/maps/rsu_config_marambaia.json
+```
+
+Run from the repository root, with Docker and SUMO available:
+
+```bash
+PYTHONPATH=src uv run python -m v2v_fl.v2i_docker_orchestrator \
+    --sumo-cfg src/v2v_fl/maps/marambaia.sumocfg \
+    --rsu-config src/v2v_fl/maps/rsu_config_marambaia.json \
+    --total-clients 5 --encounters 6 --dataset MNIST --model cnn \
+    --ala 1 --prune 1 --build
+```
+
+Add `--gui` to view traffic. The generated Compose currently reserves NVIDIA
+GPUs, so Docker requires NVIDIA Container Toolkit and a compatible GPU.
+
+- `--min-contact-time`: minimum estimated remaining coverage time (default: 4 s).
+- `--warmup`: wall-clock startup delay (default: 60 s).
+- `--cooldown`: simulation-time delay per RSU (default: 15 s).
+- `--ota-epsilon`: channel estimation error in `[0, 1)` (default: 0.1).
+- `--ota-bandwidth-hz`: bandwidth for thermal noise (default: 100000 Hz).
+- `n_antennas` in the RSU JSON sets the receiver's antenna count (default: 16).
+
+SUMO pauses during weight exchange and training. Shared files transport tensors;
+OTA degradation is simulated numerically on the host, rather than by `docker-tc`.
+Only vehicles associated with the first `--total-clients` containers participate.
+`--encounters` counts encounters across all RSUs; the same unchanged group is
+suppressed until it changes or leaves coverage.
+
+Client metrics are saved in `src/results/default_exp_v2i/`, and events in
+`src/results/v2i_events.jsonl`. Encounter weights are discarded after exchange;
+no `rsu_global_*.pt` checkpoints are created. V2I and V2V share the Compose and
+encounter directory, so run these modes separately. Repeated V2I runs overwrite
+the default metrics and event log.
+
+## 🚀 Method 5: Manual Execution
 
 To isolate logs and debug specific client-server interactions, open multiple terminal windows manually. There is no need to activate virtual environments.
 

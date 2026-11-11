@@ -128,7 +128,8 @@ def resize_model_to_pruned(model: nn.Module, pruned_dict: dict) -> nn.Module:
                         if hasattr(module, 'r') and 'lora_A' in name:
                             module.r = target_weight.shape[0]
                             if hasattr(module, 'lora_alpha') and hasattr(module, 'scaling'):
-                                module.scaling = module.lora_alpha / module.r
+                                base_r = getattr(module, 'base_r', 8)
+                                module.scaling = module.lora_alpha / base_r
                         
                         # PEFT LoraLayer support
                         if 'lora_A.default.weight' in name:
@@ -138,7 +139,8 @@ def resize_model_to_pruned(model: nn.Module, pruned_dict: dict) -> nn.Module:
                             if hasattr(lora_layer, 'r') and isinstance(lora_layer.r, dict) and 'default' in lora_layer.r:
                                 lora_layer.r['default'] = target_weight.shape[0]
                                 if hasattr(lora_layer, 'lora_alpha') and 'default' in lora_layer.lora_alpha:
-                                    lora_layer.scaling['default'] = lora_layer.lora_alpha['default'] / target_weight.shape[0]
+                                    base_r = getattr(lora_layer, 'base_r', {}).get('default', 8) if hasattr(lora_layer, 'base_r') and isinstance(lora_layer.base_r, dict) else 8
+                                    lora_layer.scaling['default'] = lora_layer.lora_alpha['default'] / base_r
                     else:
                         setattr(model, name, new_param)
                 else:

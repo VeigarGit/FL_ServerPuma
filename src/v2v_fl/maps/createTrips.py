@@ -53,7 +53,7 @@ DEFAULT_SPEED = 13.89
 INTERSECTION_PENALTY = 5.0
 
 # Cooldown padrao entre encontros do orquestrador (deve bater com o
-# argumento --cooldown do sumo_docker_orchestrator.py)
+# argumento --cooldown do v2v_docker_orchestrator.py)
 DEFAULT_COOLDOWN = 5
 
 # Margem de seguranca adicionada ao tempo total para evitar que os
@@ -700,9 +700,9 @@ def main():
     print(f"  Seed             : {args.seed}")
     print(f"  Saida            : {output_file.name}")
     print(f"{'=' * 60}")
-    print(f"\nPronto! Execute a simulacao com (de dentro de src/sumo_adapter/):")
+    print(f"\nPronto! Execute a simulacao com (de dentro de src/v2v_fl/):")
     print(
-        f'  uv run python sumo_docker_orchestrator.py '
+        f'  uv run python v2v_docker_orchestrator.py '
         f'--sumo-cfg {sumocfg_relative} '
         f'--total-clients {args.total_vehicles} '
         f'--encounters {args.encounters}'
