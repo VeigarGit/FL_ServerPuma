@@ -1,5 +1,5 @@
-import json
 import hashlib
+import json
 import math
 import os
 import tempfile
@@ -90,6 +90,13 @@ def prepare_run(project_root: Path, mode: str, args) -> tuple[str, Path, Path]:
                 "aggregation_time": "Coordinator elapsed seconds executing the OTA pipeline.",
                 "communication_wait_time": "Protocol time minus aggregation; includes waiting "
                 "and model application, not a pure network latency measurement.",
+                "timings": "Local monotonic seconds per phase/transfer. Concurrent clients "
+                "and transfers overlap and must not be summed as encounter elapsed time. "
+                "receive_time includes waiting for the frame; model_wait_time overlaps "
+                "receiver transfers. server_timings contains the RSU records.",
+                "signal_detection_time": "Seconds from signal publication to client detection, "
+                "outside protocol_time; host and Docker containers share the same monotonic "
+                "clock on this single-host simulator. Null for legacy signals.",
                 "evaluation_time": "Maximum client elapsed seconds evaluating the applied model.",
                 "accuracy": "Percent accuracy on each client's test partition; mean and "
                 "sample-weighted mean cover only completed evaluations.",
@@ -196,6 +203,7 @@ def summarize_encounter_metrics(
         "communication_wait_time": max(0.0, protocol_time - aggregation_time),
         "evaluation_time": max((r.get("evaluation_time", 0.0) for r in records), default=0.0),
         "ota_diagnostics": source.get("ota_diagnostics"),
+        "server_timings": server_status.get("timings", {}) if server_status else {},
         "client_metrics": records,
     }
 
