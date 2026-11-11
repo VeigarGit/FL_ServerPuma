@@ -4,6 +4,10 @@ O protocolo V2I usa dicionários com versão e tipo. UPLOAD, RESULT e APPLIED
 identificam execução, RSU, encontro e cliente. UPLOAD e RESULT carregam pesos
 em CPU; ERROR informa falhas e PING/PONG verificam a prontidão do serviço.
 UPLOAD exige train_samples nos dois modos; V2I v2 rejeita envelopes v1 sem contagens.
+prepare_v2v_frame/prepare_v2i_frame validam e serializam uma única vez; send_frame
+reutiliza esses bytes imutáveis sem alterar o envelope. timings é opcional e
+registra segundos monotônicos locais. Registros de sockets concorrentes se
+sobrepõem e não devem ser somados como duração de uma fase ou de um encontro.
 """
 
 import logging
@@ -36,9 +40,7 @@ def make_v2v_message(message_type: str, **fields) -> dict:
     """Envelope V2V versionado; UPLOAD informa amostras, RESULT carrega a média."""
     if {"version", "type"}.intersection(fields):
         raise ValueError("type e version são definidos pelo construtor V2V.")
-    return validate_v2v_message(
-        {"version": V2V_PROTOCOL_VERSION, "type": message_type, **fields}
-    )
+    return validate_v2v_message({"version": V2V_PROTOCOL_VERSION, "type": message_type, **fields})
 
 
 def validate_v2v_message(message: object, **expected) -> dict:
@@ -69,18 +71,55 @@ def validate_v2v_message(message: object, **expected) -> dict:
 
 
 def _check_deadline(deadline: float | None, cancelled) -> float:
-    """Verifica prazo/cancelamento e limita cada espera no socket a 200 ms."""
+    """Verifica prazo/cancelamento e limita cada espera no socket a 100 ms."""
     if cancelled is not None and cancelled():
         raise ConnectionAbortedError("Operação de rede cancelada.")
     if deadline is None:
-        return 0.2
+        return 0.1
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("Prazo da operação de rede esgotado.")
-    return min(remaining, 0.2)
+    return min(remaining, 0.1)
 
 
-def send_data(conn: socket.socket, data, *, deadline: float | None = None, cancelled=None) -> int:
+def record_elapsed(timings: dict | None, key: str, started: float) -> None:
+    """Acumula apenas operações sequenciais no mesmo registro local."""
+    if timings is not None:
+        timings[key] = timings.get(key, 0.0) + time.monotonic() - started
+
+
+def prepare_frame(data, *, timings: dict | None = None) -> bytes:
+    """Cria um frame imutável, reutilizável em sockets diferentes."""
+    started = time.monotonic()
+    try:
+        payload = pickle.dumps(data)
+        return struct.pack("!I", len(payload)) + payload
+    finally:
+        record_elapsed(timings, "serialization_time", started)
+
+
+def prepare_v2v_frame(message_type: str, *, timings: dict | None = None, **fields) -> bytes:
+    started = time.monotonic()
+    message = make_v2v_message(message_type, **fields)
+    record_elapsed(timings, "validation_time", started)
+    return prepare_frame(message, timings=timings)
+
+
+def prepare_v2i_frame(message_type: str, *, timings: dict | None = None, **fields) -> bytes:
+    started = time.monotonic()
+    message = make_v2i_message(message_type, **fields)
+    record_elapsed(timings, "validation_time", started)
+    return prepare_frame(message, timings=timings)
+
+
+def send_data(
+    conn: socket.socket,
+    data,
+    *,
+    deadline: float | None = None,
+    cancelled=None,
+    timings: dict | None = None,
+) -> int:
     """Serializa e envia dados pelo socket com cabeçalho de tamanho.
 
     Retorna os bytes da mensagem completa (4 de cabeçalho + payload pickle).
@@ -88,32 +127,55 @@ def send_data(conn: socket.socket, data, *, deadline: float | None = None, cance
     sem argumentos que sinaliza cancelamento. Sem ambos, mantém o envio antigo.
     Envios parciais em caso de erro e retransmissões TCP não são contabilizados.
     """
-    controlled = deadline is not None or cancelled is not None
-    if controlled:
+    if deadline is not None or cancelled is not None:
         _check_deadline(deadline, cancelled)
-    data_bytes = pickle.dumps(data)
-    header = struct.pack("!I", len(data_bytes))
-    total_bytes = 4 + len(data_bytes)
+    return send_frame(
+        conn,
+        prepare_frame(data, timings=timings),
+        deadline=deadline,
+        cancelled=cancelled,
+        timings=timings,
+    )
+
+
+def send_frame(
+    conn: socket.socket,
+    frame: bytes,
+    *,
+    deadline: float | None = None,
+    cancelled=None,
+    timings: dict | None = None,
+) -> int:
+    """Envia um frame já preparado; só contabiliza mensagens completas.
+
+    Cada chamada possui seu próprio memoryview e preserva o timeout do socket.
+    A preparação/validação deve ocorrer antes de compartilhar o frame imutável.
+    """
+    started = time.monotonic()
+    controlled = deadline is not None or cancelled is not None
     if not controlled:
-        conn.sendall(header)
-        conn.sendall(data_bytes)
-        return total_bytes
+        try:
+            conn.sendall(frame)
+            return len(frame)
+        finally:
+            record_elapsed(timings, "send_time", started)
 
     previous_timeout = conn.gettimeout()
     try:
-        frame = memoryview(header + data_bytes)
-        while frame:
+        pending = memoryview(frame)
+        while pending:
             conn.settimeout(_check_deadline(deadline, cancelled))
             try:
-                sent = conn.send(frame)
+                sent = conn.send(pending)
             except TimeoutError:
                 continue
             if sent == 0:
                 raise ConnectionError("Conexão encerrada durante o envio.")
-            frame = frame[sent:]
+            pending = pending[sent:]
         _check_deadline(deadline, cancelled)
-        return total_bytes
+        return len(frame)
     finally:
+        record_elapsed(timings, "send_time", started)
         with suppress(OSError):
             conn.settimeout(previous_timeout)
 
@@ -161,6 +223,7 @@ def recv_data(
     *,
     deadline: float | None = None,
     cancelled=None,
+    timings: dict | None = None,
 ):
     """Recebe dados via socket calculando a taxa de bits (bitrate).
 
@@ -173,12 +236,15 @@ def recv_data(
     clock = time.monotonic if controlled else time.time
     start_time = clock()
 
-    raw_msglen = recvall(conn, 4, deadline=deadline, cancelled=cancelled)
-    if not raw_msglen:
-        return (None, 0, 0) if return_bytes else (None, 0)
-
-    msglen = struct.unpack("!I", raw_msglen)[0]
-    data_bytes = recvall(conn, msglen, deadline=deadline, cancelled=cancelled)
+    receive_started = time.monotonic()
+    try:
+        raw_msglen = recvall(conn, 4, deadline=deadline, cancelled=cancelled)
+        if not raw_msglen:
+            return (None, 0, 0) if return_bytes else (None, 0)
+        msglen = struct.unpack("!I", raw_msglen)[0]
+        data_bytes = recvall(conn, msglen, deadline=deadline, cancelled=cancelled)
+    finally:
+        record_elapsed(timings, "receive_time", receive_started)
     end_time = clock()
 
     if not data_bytes and not controlled:
@@ -189,7 +255,11 @@ def recv_data(
     total_time = end_time - start_time
     bit_rate = total_bits / total_time if total_time > 0 else 0
 
-    data = pickle.loads(data_bytes)
+    deserialize_started = time.monotonic()
+    try:
+        data = pickle.loads(data_bytes)
+    finally:
+        record_elapsed(timings, "deserialization_time", deserialize_started)
     if controlled:
         _check_deadline(deadline, cancelled)
     if return_bytes:
@@ -301,7 +371,12 @@ def make_v2i_message(message_type: str, **fields) -> dict:
 
 
 def send_v2i_message(
-    conn: socket.socket, message: dict, *, deadline: float | None = None, cancelled=None
+    conn: socket.socket,
+    message: dict,
+    *,
+    deadline: float | None = None,
+    cancelled=None,
+    timings: dict | None = None,
 ) -> int:
     """Envia uma mensagem validada e retorna bytes de payload mais o cabeçalho.
 
@@ -311,11 +386,15 @@ def send_v2i_message(
     permite interromper a espera mesmo enquanto o socket recebe ou envia dados.
     Sem prazo ou cancelamento, preserva o timeout do socket.
     """
+    started = time.monotonic()
+    validate_v2i_message(message)
+    record_elapsed(timings, "validation_time", started)
     return send_data(
         conn,
-        validate_v2i_message(message),
+        message,
         deadline=deadline,
         cancelled=cancelled,
+        timings=timings,
     )
 
 
@@ -328,6 +407,7 @@ def recv_v2i_message(
     client_id: int | None = None,
     deadline: float | None = None,
     cancelled=None,
+    timings: dict | None = None,
 ) -> tuple[dict, float, int]:
     """Recebe (mensagem, bitrate, bytes) e confere os identificadores esperados.
 
@@ -343,12 +423,15 @@ def recv_v2i_message(
             return_bytes=True,
             deadline=deadline,
             cancelled=cancelled,
+            timings=timings,
         )
     except (pickle.UnpicklingError, EOFError) as exc:
         raise V2IProtocolError("Payload V2I inválido.") from exc
     if message is None:
         raise ConnectionError("Conexão encerrada ou timeout antes da mensagem V2I completa.")
+    started = time.monotonic()
     validate_v2i_message(message)
+    record_elapsed(timings, "validation_time", started)
     expected = {
         "run_id": run_id,
         "rsu_id": rsu_id,
