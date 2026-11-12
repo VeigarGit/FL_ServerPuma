@@ -36,6 +36,9 @@ FL_ServerPuma/
 └── src/
     ├── system/                     # Motor principal de FL (Server, Client, Modelos, Scripts)
     │   ├── server.py               # Servidor centralizado (agregação, γ^c, poda SoRA, avaliação, HDF5)
+    │   ├── server_puma.py          # Mixin do motor PUMA-GT Plus (γ^c, PaCA/Rank adaptativos, Δ_n)
+    │   ├── server_alignment.py     # Mixin de alinhamento estrutural de pesos podados (CNNs)
+    │   ├── server_data.py          # Mixin de medição de payload, DataLoaders de teste e exportação HDF5
     │   ├── client.py               # Ponto de entrada unificado, CLI e loop centralizado do cliente FL
     │   ├── client_data.py          # ClientHistory, load_data (CNN/CLIP/SLM) e save_results (.h5)
     │   ├── client_training.py      # Construção de modelos, FedALA e loop de treino local (local_training)
@@ -253,8 +256,8 @@ Onde:
 
 ### 5.4 QLoRA (`--qlora` em `src/system/lora_slm/qlora.py`)
 - Disponível para `--model slm --strategy lora` no modo centralizado.
-- Carrega o backbone `Qwen3-VL-2B-Instruct` em **4-bit NF4** com **Double Quantization** (`bnb_4bit_compute_dtype=torch.bfloat16`), congela 100% do backbone (`verify_qlora_freezing` garante que nenhum `Params4bit` tenha `requires_grad=True`) e usa o otimizador `bnb.optim.PagedAdamW8bit`.
-- **Invariante de Comunicação QLoRA**: Apenas os adaptadores LoRA (`slm_model.<peft_canonical_key>`) e a cabeça `classifier.*` trafegam pela rede em `bfloat16` (validado por `assert_adapter_only_payload`). A quantização INT8 de transporte é desativada no modo QLoRA, e o servidor acumula os deltas em `float32` antes de converter de volta para `bfloat16`.
+- Carrega o backbone `Qwen3-VL-2B-Instruct` em **4-bit NF4** com **Double Quantization** (`bnb_4bit_compute_dtype=torch.bfloat16`), congela 100% do backbone (`verify_qlora_freezing` garante que nenhum `Params4bit` tenha `requires_grad=True`) e usa o otimizador `AdamW` padrão nos adaptadores treináveis (com `clip_grad_norm_` a 1.0 para estabilidade Non-IID; `paged_adamw_8bit` permanece configurável via `model.qlora.optimizer`).
+- **Invariante de Comunicação QLoRA**: Apenas os adaptadores LoRA (`slm_model.<peft_canonical_key>`) e a cabeça `classifier.*` trafegam pela rede (validado por `assert_adapter_only_payload`), com suporte completo a quantização de transporte (**INT8** padrão ou **LHDQ** via `--delta-coding`). O servidor acumula os deltas em `float32` antes de converter de volta para `bfloat16`.
 
 ---
 
