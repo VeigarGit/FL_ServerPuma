@@ -630,7 +630,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 else:
                     if getattr(self.args, 'delta_coding', False):
                         self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in current_global_state.items()}
-                    if not getattr(self.args, 'delta_coding', False) and not self.qlora:  # QLoRA: envia em 16 bits
+                    if not getattr(self.args, 'delta_coding', False):
                         current_global_state = quantization(current_global_state)
                 server_quant_time = time.time() - server_quant_start
                 

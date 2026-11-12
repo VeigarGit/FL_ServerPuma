@@ -31,7 +31,9 @@ DEFAULT_QLORA_CONFIG = {
     "quant_type": "nf4",
     "double_quant": True,
     "compute_dtype": "bfloat16",
-    "optimizer": "paged_adamw_8bit",
+    # AdamW FP32 nos ~8.8M parâmetros treináveis (~67 MB/cliente) evita
+    # instabilidade dos estados 8-bit em rodadas FL Non-IID
+    "optimizer": "adamw",
     "prepare_kbit": False,
 }
 

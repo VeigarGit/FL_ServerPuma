@@ -260,9 +260,8 @@ def _encode_client_payload(
     previous_sent_state: dict,
     round_num: int,
     delta_coding: bool,
-    qlora: bool,
 ) -> tuple[dict, dict, float]:
-    """Comprime os pesos locais (LHDQ, INT8 ou passthrough 16-bit QLoRA) para envio."""
+    """Comprime os pesos locais (LHDQ ou INT8 padrão) para envio."""
     start = time.time()
     use_lhdq = delta_coding and round_num >= 1 and bool(previous_sent_state)
     if use_lhdq:
@@ -274,7 +273,7 @@ def _encode_client_payload(
                 k: v.clone() if isinstance(v, torch.Tensor) else v
                 for k, v in updated_state.items()
             }
-        elif not qlora:  # QLoRA: adaptadores trafegam em 16 bits (sem int8)
+        else:
             updated_state = quantization(updated_state)
     return updated_state, previous_sent_state, time.time() - start
 
@@ -460,7 +459,7 @@ def run_centralized_client(
                 args, model, train_loader, test_loader, test_accuracy, history
             )
             updated_state, previous_sent_state, client_quant_time = _encode_client_payload(
-                updated_state, previous_sent_state, round_num, args.delta_coding, args.qlora
+                updated_state, previous_sent_state, round_num, args.delta_coding
             )
 
             client_eval_time = client_pre_eval_time + client_post_eval_time

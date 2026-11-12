@@ -436,6 +436,10 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
         loss.backward()
         
         if (step + 1) % accumulation_steps == 0 or (step + 1) == len(loader):
+            # Previne explosão de gradientes em cenários FL Non-IID com QLoRA/bfloat16
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            if trainable_params:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             if sparse_optimizer is not None: sparse_optimizer.step()
             

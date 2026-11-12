@@ -190,7 +190,7 @@ Compressão:
 
 QLoRA:
   --qlora                     Backbone 4-bit NF4 + DoubleQuant, adaptadores LoRA 16 bits
-                              (requer --model slm --strategy lora; adaptadores trafegam em bf16)
+                              (requer --model slm|lfm --strategy lora; suporta INT8 e LHDQ)
 
 Outros:
   --help                      Exibir esta mensagem
@@ -437,15 +437,19 @@ fi
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
-if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; elif [ "$QLORA" -eq 1 ]; then echo "  Compressão: nenhuma (adaptadores QLoRA em bf16)"; else echo "  Compressão: INT8 padrão (8 bits/param)"; fi
-if [ "$QLORA" -eq 1 ]; then echo "  QLoRA:              ATIVADO (NF4 + DoubleQuant, LoRA bf16, PagedAdamW8bit)"; fi
+if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; else echo "  Compressão: INT8 padrão (8 bits/param)"; fi
+if [ "$QLORA" -eq 1 ]; then echo "  QLoRA:              ATIVADO (NF4 + DoubleQuant, LoRA bf16, AdamW + clip 1.0)"; fi
 echo "===================================="
 
 # ---- Preparação do Dataset ----
 # Busca o script no diretório dataset
 SCRIPT_PATH=$(find ../dataset -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
 if [ -n "$SCRIPT_PATH" ]; then
-    uv run --no-sync "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
+    if [ "$DATASET" = "MNIST" ]; then
+        uv run --no-sync "$SCRIPT_PATH" noniid - dir --num-clients "$CLIENT_COUNT"
+    else
+        uv run --no-sync "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
+    fi
 else
     echo "[ERRO] Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
     exit 1

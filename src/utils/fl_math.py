@@ -1,6 +1,9 @@
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
 
 def dequantization(global_state: dict) -> dict:
     """Reverte a quantização int8 para tensores float normais."""
@@ -18,9 +21,14 @@ def quantization(state_dict: dict) -> dict:
     quantized_state_dict = {}
     for k, v in state_dict.items():
         if isinstance(v, torch.Tensor):
-            max_val = torch.max(torch.abs(v))
-            scale = max_val / 127.0 if max_val > 1e-8 else torch.tensor(1.0, device=v.device, dtype=v.dtype)
-            quantized_weights = torch.clamp((v / scale).round(), -128, 127).to(torch.int8)
+            v_f = v.float()
+            max_val = torch.max(torch.abs(v_f))
+            scale = (
+                max_val / 127.0
+                if max_val > 1e-8
+                else torch.tensor(1.0, device=v.device, dtype=torch.float32)
+            )
+            quantized_weights = torch.clamp((v_f / scale).round(), -128, 127).to(torch.int8)
             quantized_state_dict[k] = {
                 'dtype': 'quantized_int8',
                 'scale': scale,
@@ -44,7 +52,7 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
     with torch.no_grad():
         model_dtype = getattr(model, "compute_dtype", None) or next(model.parameters()).dtype
         for batch_idx, batch_data in enumerate(data_loader):
-            if isinstance(batch_data, dict):
+            if isinstance(batch_data, (dict, Mapping)):
                 x = batch_data
                 y = batch_data.get("targets", batch_data.get("labels", None))
             else:
@@ -57,8 +65,8 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
                     x = x.to(device, dtype=model_dtype)
                 else:
                     x = x.to(device)
-            elif isinstance(x, dict):
-                # É um dicionário ou BatchFeature (SLM / LFM)
+            elif isinstance(x, (dict, Mapping)):
+                # É um dicionário ou BatchFeature / UserDict (SLM / LFM)
                 for k in list(x.keys()):
                     if isinstance(x[k], torch.Tensor):
                         if getattr(x[k], "is_floating_point", lambda: False)():
@@ -72,19 +80,22 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
                 else (torch.float16 if device.type == "cuda" else torch.bfloat16)
             )
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
-                if isinstance(x, dict):
+                if isinstance(x, (dict, Mapping)):
                     output = model(x) if hasattr(model, "head") else model(**x)
                 else:
                     output = model(x)
             
-            if isinstance(output, dict):
+            if isinstance(output, (dict, Mapping)):
                 output = output.get("logits", output)
                 
             y = y.view(-1)
             
             # TESTE C: Verificando valores corrompidos (A Teoria da Divisão por Zero)
             if torch.isnan(output).any():
-                print(f"[Teste C] ALERTA: A saída do modelo gerou NaNs (valores infinitos ou inválidos)!")
+                print(
+                    "[Teste C] ALERTA: A saída do modelo gerou NaNs "
+                    "(valores infinitos ou inválidos)!"
+                )
                 
             loss = loss_fn(output, y)
             
