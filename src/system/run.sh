@@ -44,6 +44,7 @@ CLIENT_COUNT=2
 ROUNDS=5
 DATASET="MNIST"
 BATCH_SIZE=32
+CUSTOM_BATCH_SIZE=0
 MAX_CLIENTS=25
 SIMULATIONS=1
 START_RUN=1
@@ -106,6 +107,14 @@ SKIP_TRAIN_EVAL=0
 
 # Delta Coding (LHDQ)
 DELTA_CODING=0
+
+# QLoRA (backbone 4-bit NF4 + adaptadores LoRA 16 bits)
+QLORA=0
+
+# Simulação de Straggler (Cliente Lento)
+STRAGGLER_IDX=-1
+STRAGGLER_DELAY=0.0
+STRAGGLER_ROUND=2
 
 # ---- Função de Ajuda ----
 show_help() {
@@ -179,6 +188,10 @@ Otimização de Avaliação:
 Compressão:
   --delta-coding              Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8
 
+QLoRA:
+  --qlora                     Backbone 4-bit NF4 + DoubleQuant, adaptadores LoRA 16 bits
+                              (requer --model slm|lfm --strategy lora; suporta INT8 e LHDQ)
+
 Outros:
   --help                      Exibir esta mensagem
 EOF
@@ -202,7 +215,7 @@ while [ $# -gt 0 ]; do
         -c|--clients) CLIENT_COUNT="$2"; shift 2 ;;
         -r|--rounds) ROUNDS="$2"; shift 2 ;;
         -d|--dataset) DATASET="$2"; shift 2 ;;
-        --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+        --batch-size) BATCH_SIZE="$2"; CUSTOM_BATCH_SIZE=1; shift 2 ;;
         --max-clients) MAX_CLIENTS="$2"; shift 2 ;;
         --simulations) SIMULATIONS="$2"; shift 2 ;;
         --start-run) START_RUN="$2"; shift 2 ;;
@@ -215,8 +228,16 @@ while [ $# -gt 0 ]; do
         --config) CONFIG_FILE="$2"; shift 2 ;;
 
         # Dispositivo
-        --device) DEVICE="$2"; shift 2 ;;
-        -did|--device-id) DEVICE_ID="$2"; CUSTOM_DID=1; shift 2 ;;
+        --device)
+            DEVICE="$2"
+            if [[ "$DEVICE" =~ ^cuda:([0-9]+)$ ]]; then
+                DEVICE_ID="${BASH_REMATCH[1]}"
+                CUSTOM_DID=1
+                DEVICE="cuda"
+            fi
+            shift 2
+            ;;
+        -did|--device-id|-g|--gpu) DEVICE_ID="$2"; CUSTOM_DID=1; shift 2 ;;
         --cpu) USE_CPU=1; shift 1 ;;
 
         # Pruning
@@ -275,6 +296,14 @@ while [ $# -gt 0 ]; do
         # Delta Coding (LHDQ)
         --delta-coding) DELTA_CODING=1; shift 1 ;;
 
+        # QLoRA
+        --qlora) QLORA=1; shift 1 ;;
+
+        # Straggler
+        --straggler-idx) STRAGGLER_IDX="$2"; shift 2 ;;
+        --straggler-delay) STRAGGLER_DELAY="$2"; shift 2 ;;
+        --straggler-round) STRAGGLER_ROUND="$2"; shift 2 ;;
+
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
 done
@@ -282,6 +311,7 @@ done
 # ---- Auto-inferência de NUM_CLASSES por Dataset ----
 if [ "$CUSTOM_NUM_CLASSES" -eq 0 ]; then
     case "$DATASET" in
+        Banking77)    NUM_CLASSES=77 ;;
         OxfordPets)   NUM_CLASSES=37 ;;
         DTD)          NUM_CLASSES=47 ;;
         FGVCAircraft) NUM_CLASSES=100 ;;
@@ -323,30 +353,48 @@ else
 fi
 
 # ---- Validação ----
-if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ]; then
+if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ]; then
     if [ -z "$CONFIG_FILE" ]; then
-        if [ "$MODEL" = "slm" ]; then
+        if [ "$MODEL" = "lfm" ]; then
+            CONFIG_FILE="lora_lfm/train_config.yml"
+        elif [ "$MODEL" = "slm" ]; then
             CONFIG_FILE="lora_slm/train_config.yml"
         elif [ "$MODEL" = "clip" ]; then
             CONFIG_FILE="lora_clip/train_config.yml"
         fi
     fi
     
-    # Auto-ajuste de PaCA conforme o modelo (SLM=28 camadas, CLIP=12 camadas)
+    # Auto-ajuste de PaCA conforme o modelo (SLM=28 camadas, LFM=24 camadas, CLIP=12 camadas)
     if [ "$CUSTOM_PACA" -eq 0 ]; then
-        if [ "$MODEL" = "slm" ]; then
+        if [ "$MODEL" = "lfm" ]; then
+            PACA=24
+        elif [ "$MODEL" = "slm" ]; then
             PACA=28
         elif [ "$MODEL" = "clip" ]; then
             PACA=12
         fi
     fi
     if [ "$CUSTOM_PACA_MAX" -eq 0 ]; then
-        if [ "$MODEL" = "slm" ]; then
+        if [ "$MODEL" = "lfm" ]; then
+            PACA_MAX=24
+        elif [ "$MODEL" = "slm" ]; then
             PACA_MAX=28
         elif [ "$MODEL" = "clip" ]; then
             PACA_MAX=12
         fi
     fi
+
+    # Batch size padrão reduzido para Foundation Models (SLM/LFM) se não especificado pelo usuário
+    if [ "$CUSTOM_BATCH_SIZE" -eq 0 ]; then
+        if [ "$MODEL" = "lfm" ] || [ "$MODEL" = "slm" ]; then
+            BATCH_SIZE=4
+        fi
+    fi
+fi
+
+if [ "$QLORA" -eq 1 ] && { { [ "$MODEL" != "slm" ] && [ "$MODEL" != "lfm" ]; } || [ "$STRATEGY" != "lora" ]; }; then
+    echo "❌ [ERRO] --qlora requer --model slm|lfm e --strategy lora (atual: model=$MODEL, strategy=$STRATEGY)"
+    exit 1
 fi
 
 # ---- Exibição da Configuração ----
@@ -360,10 +408,16 @@ if [ "$MODEL" = "clip" ]; then
     echo "  Modelo: CLIP | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 elif [ "$MODEL" = "slm" ]; then
     echo "  Modelo: SLM (Qwen-VL) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
+elif [ "$MODEL" = "lfm" ]; then
+    echo "  Modelo: LFM (DecisionLFM LiquidAI) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 else
     echo "  Modelo: CNN Simples Padrão"
 fi
-echo "  Device: $DEVICE ($DEVICE_ID) | Sessão TMUX: $SESSION_NAME"
+if [ "$CUSTOM_DID" -eq 1 ]; then
+    echo "  Device: $DEVICE (GPU $DEVICE_ID EXCLUSIVA para Servidor e todos os Clientes) | Sessão TMUX: $SESSION_NAME"
+else
+    echo "  Device: $DEVICE (Round-Robin entre $NUM_GPUS GPUs detectadas) | Sessão TMUX: $SESSION_NAME"
+fi
 
 if [ "$RANDOM_PACA" -eq 1 ]; then
     echo "  PaCA Heterogêneo: ATIVADO (aleatório entre $PACA_MIN e $PACA_MAX)"
@@ -384,13 +438,18 @@ fi
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
 if [ "$DELTA_CODING" -eq 1 ]; then echo "  Compressão: LHDQ (Delta Coding ~1.67 bits/param)"; else echo "  Compressão: INT8 padrão (8 bits/param)"; fi
+if [ "$QLORA" -eq 1 ]; then echo "  QLoRA:              ATIVADO (NF4 + DoubleQuant, LoRA bf16, AdamW + clip 1.0)"; fi
 echo "===================================="
 
 # ---- Preparação do Dataset ----
 # Busca o script no diretório dataset
 SCRIPT_PATH=$(find ../dataset -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
 if [ -n "$SCRIPT_PATH" ]; then
-    uv run "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
+    if [ "$DATASET" = "MNIST" ]; then
+        uv run --no-sync "$SCRIPT_PATH" noniid - dir --num-clients "$CLIENT_COUNT"
+    else
+        uv run --no-sync "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
+    fi
 else
     echo "[ERRO] Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
     exit 1
@@ -422,6 +481,10 @@ else
     if [ "$DELTA_CODING" -eq 1 ]; then
         EXP_NAME="${EXP_NAME}_deltacoding"
     fi
+    # Sufixo QLoRA
+    if [ "$QLORA" -eq 1 ]; then
+        EXP_NAME="${EXP_NAME}_qlora"
+    fi
 fi
 echo "[INFO] Diretório de Resultados: ../results/$EXP_NAME"
 
@@ -446,7 +509,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
     mkdir -p "$LOG_DIR"
 
     # Comando do servidor
-    SERVER_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run server.py \
+    SERVER_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$DEVICE_ID uv run --no-sync server.py \
         --host $HOST \
         --port $PORT \
         --clients-per-round $CLIENT_COUNT \
@@ -496,7 +559,16 @@ for RUN in $(seq $START_RUN $END_RUN); do
     if [ "$DELTA_CODING" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --delta-coding"
     fi
+    if [ "$QLORA" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --qlora"
+    fi
     SERVER_CMD="$SERVER_CMD 2>&1 | tee $LOG_DIR/server.log"
+
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        echo "[AVISO] Sessão tmux '$SESSION_NAME' anterior encontrada. Encerrando sessão antiga antes de iniciar..."
+        tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+        sleep 1
+    fi
 
     if [ "$AUTO_NEXT" -eq 1 ]; then
         tmux new-session -d -s "$SESSION_NAME" "$SERVER_CMD"
@@ -533,12 +605,13 @@ for RUN in $(seq $START_RUN $END_RUN); do
             CLIENT_DEVICE_ID="0"
         fi
 
-        CLIENT_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run client.py \
+        CLIENT_CMD="OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=$CLIENT_DEVICE_ID uv run --no-sync client.py \
             --client-idx $i \
             --host $HOST \
             --port $PORT \
             --dataset $DATASET \
             --rounds $ROUNDS \
+            --batch-size $BATCH_SIZE \
             --ala $ALA \
             --device $DEVICE \
             --device_id $CLIENT_DEVICE_ID \
@@ -555,6 +628,12 @@ for RUN in $(seq $START_RUN $END_RUN); do
             --timestamp $TIMESTAMP"
         if [ "$DELTA_CODING" -eq 1 ]; then
             CLIENT_CMD="$CLIENT_CMD --delta-coding"
+        fi
+        if [ "$QLORA" -eq 1 ]; then
+            CLIENT_CMD="$CLIENT_CMD --qlora"
+        fi
+        if [ "$STRAGGLER_IDX" -ge 0 ]; then
+            CLIENT_CMD="$CLIENT_CMD --straggler-idx $STRAGGLER_IDX --straggler-delay $STRAGGLER_DELAY --straggler-round $STRAGGLER_ROUND"
         fi
         CLIENT_CMD="$CLIENT_CMD 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then

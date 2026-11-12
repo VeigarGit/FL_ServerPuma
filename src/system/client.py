@@ -1,851 +1,522 @@
+"""Ponto de entrada unificado e modo centralizado do cliente Federated Learning."""
 
-import socket
-import copy
-import time
-import os
-import sys
 import argparse
 import logging
+import os
 import random
-import math
-import json
-import hashlib
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import suppress
+import socket
+import sys
+import time
 from pathlib import Path
 
-# Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import h5py
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import torch.nn as nn  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
 
-from lora_clip.clip_setup import (
-    load_config, resolve_run_modes, build_run_config, build_model
-)
-
-from lora_clip.clip_setup import build_optimizer
-from lora_clip.sora import get_trainable_state_dict
-
-# --- HACK PERMITIDO: Inserindo a pasta 'src' no path do Python ---
-# Nota: Esta é uma mitigação aceita enquanto o projeto não for
-# completamente empacotado como biblioteca via pyproject.toml
 current_dir = Path(__file__).resolve().parent
 parent_dir = current_dir.parent
 if str(parent_dir) not in sys.path:
     sys.path.append(str(parent_dir))
-# -----------------------------------------------------------------
 
-from utils.model_utils import write_json_atomic  # noqa: E402
-from utils.data_utils import read_client_data
-from prunning import prune_and_restructure
-from ALA import ALA
-from ALA_LoRA import ALA_LoRA
-from model import SimpleModel
-from utils.network_utils import (  # noqa: E402
-    V2IProtocolError,
-    prepare_frame,
-    prepare_v2i_frame,
-    prepare_v2v_frame,
-    record_elapsed,
-    recv_data,
-    recv_v2i_message,
-    send_data,
-    send_frame,
-    validate_v2v_message,
+from ALA import ALA  # noqa: E402
+from ALA_LoRA import ALA_LoRA  # noqa: E402
+from client_data import (  # noqa: E402
+    ClientHistory,
+    build_client_dataloaders,
+    load_data,
+    save_results,
 )
-from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
-from utils.fl_math import resize_model_to_pruned
-from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
+from client_training import (  # noqa: E402
+    build_client_model,
+    local_initialization,
+    local_training,
+    map_sequential_to_simplemodel,
+    resolve_device,
+    resolve_heterogeneous_paca,
+)
+from client_v2x import (  # noqa: E402
+    P2PWeightStore,
+    V2VReceiver,
+    exchange_v2i_model,
+    run_decentralized_client,
+    send_p2p_model,
+    send_v2v_results,
+    wait_for_encounter,
+    wait_for_round_signal,
+    write_v2i_failure,
+)
+from lora_slm.qlora import set_qlora_state_dict  # noqa: E402
 
-# --- CONFIGURAÇÃO DE OBSERVABILIDADE (LOGGING ENXUTO) ---
+from utils.fl_math import (  # noqa: E402
+    dequantization,
+    evaluate_model,
+    quantization,
+    resize_model_to_pruned,
+)
+from utils.lhdq import is_lhdq_encoded, lhdq_decode, lhdq_encode  # noqa: E402
+from utils.network_utils import recv_data, send_data  # noqa: E402
+
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(message)s',
-    datefmt='%H:%M:%S'
+    format="%(message)s",
+    datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-# --------------------------------------------------------
 
+__all__ = [
+    "ClientHistory",
+    "P2PWeightStore",
+    "V2VReceiver",
+    "build_client_dataloaders",
+    "build_client_model",
+    "exchange_v2i_model",
+    "load_data",
+    "local_initialization",
+    "local_training",
+    "main",
+    "map_sequential_to_simplemodel",
+    "parse_args",
+    "resolve_device",
+    "resolve_heterogeneous_paca",
+    "run_centralized_client",
+    "run_decentralized_client",
+    "save_results",
+    "send_p2p_model",
+    "send_v2v_results",
+    "wait_for_encounter",
+    "wait_for_round_signal",
+    "write_v2i_failure",
+]
 
-def send_p2p_model(
-    host: str,
-    payload: dict | bytes,
-    *,
-    deadline: float,
-    cancelled=None,
-    timings: dict | None = None,
-    port: int = 9000,
-) -> int:
-    """Conecta com tentativas curtas e envia o modelo até o prazo do encontro.
-
-    O limite de conexão não limita o envio de todos os pesos. O transporte
-    compartilhado mantém o progresso no socket durante esperas/retransmissões.
-    """
-    if isinstance(payload, bytes):
-        frame = payload
-    else:
-        started = time.monotonic()
-        validate_v2v_message(payload)
-        record_elapsed(timings, "validation_time", started)
-        frame = prepare_frame(payload, timings=timings)
-    while True:
-        if cancelled is not None and cancelled():
-            raise ConnectionAbortedError("Simulação encerrada durante o envio V2V.")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"Prazo de envio V2V para {host} esgotado.")
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
-                connection.settimeout(min(2.0, remaining))
-                started = time.monotonic()
-                try:
-                    connection.connect((host, port))
-                finally:
-                    record_elapsed(timings, "connection_time", started)
-                return send_frame(
-                    connection, frame, deadline=deadline, cancelled=cancelled, timings=timings
-                )
-        except ConnectionAbortedError:
-            raise
-        except OSError as exc:
-            logger.warning("Envio V2V para %s: %s", host, exc)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"Prazo de envio V2V para {host} esgotado: {exc}") from exc
-            time.sleep(min(0.2, remaining))
-
-
-class V2VReceiver:
-    """Recebe somente os remetentes esperados de um encontro, em paralelo.
-
-    As threads manipulam envelopes CPU; aplicação e OTA continuam na thread
-    principal. close() encerra listener, sockets e workers antes de soltar pesos.
-    """
-
-    def __init__(
-        self,
-        encounter: dict,
-        senders: list[int],
-        message_type: str,
-        *,
-        deadline: float,
-        cancelled=None,
-        address=("0.0.0.0", 9000),
-    ):
-        self.context = {
-            "run_id": encounter["run_id"],
-            "encounter_id": encounter["encounter_id"],
-            "type": message_type,
-        }
-        self.senders = sorted(senders)
-        self.deadline = deadline
-        self.cancelled = cancelled or (lambda: False)
-        self.condition = threading.Condition()
-        self.stopped = threading.Event()
-        self.messages = {}
-        self.byte_counts = {}
-        self.timings = {}
-        self.connections = set()
-        self.pool = ThreadPoolExecutor(max_workers=max(1, len(senders)))
-        # Limitar também a fila: uma conexão incompleta não bloqueia accept().
-        self.slots = threading.BoundedSemaphore(max(2, 2 * len(senders)))
-        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.thread = None
-        try:
-            self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.listener.bind(address)
-            self.listener.listen(50)
-            self.listener.settimeout(0.05)
-            self.address = self.listener.getsockname()
-            self.thread = threading.Thread(target=self._accept, daemon=True)
-            self.thread.start()
-        except BaseException:
-            self.close()
-            raise
-
-    def _cancelled(self):
-        return self.stopped.is_set() or self.cancelled()
-
-    def _accept(self):
-        while not self._cancelled() and time.monotonic() < self.deadline:
-            try:
-                connection, _ = self.listener.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                break
-            if not self.slots.acquire(blocking=False):
-                connection.close()
-                continue
-            with self.condition:
-                self.connections.add(connection)
-            self.pool.submit(self._receive, connection)
-
-    def _receive(self, connection):
-        timings = {}
-        try:
-            with connection:
-                message, _, count = recv_data(
-                    connection,
-                    return_bytes=True,
-                    deadline=self.deadline,
-                    cancelled=self._cancelled,
-                    timings=timings,
-                )
-                started = time.monotonic()
-                validate_v2v_message(message, **self.context)
-                record_elapsed(timings, "validation_time", started)
-                sender = message["client_id"]
-                with self.condition:
-                    if self._cancelled() or time.monotonic() >= self.deadline:
-                        raise ConnectionAbortedError("Receptor V2V encerrado.")
-                    if sender not in self.senders or sender in self.messages:
-                        raise ValueError("Remetente V2V inesperado ou duplicado.")
-                    self.messages[sender] = message
-                    self.byte_counts[sender] = count
-                    self.timings[str(sender)] = timings
-                    self.condition.notify_all()
-        except Exception as exc:
-            # Rejeitados e frames parciais não contam; uma tentativa válida pode
-            # chegar depois. Ausências continuam sujeitas ao prazo do encontro.
-            logger.warning("Recepção V2V rejeitada: %s", exc)
-        finally:
-            with self.condition:
-                self.connections.discard(connection)
-                self.condition.notify_all()
-            self.slots.release()
-
-    def wait(self):
-        with self.condition:
-            while True:
-                if self._cancelled():
-                    raise ConnectionAbortedError("Simulação encerrada aguardando pesos V2V.")
-                remaining = self.deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Pesos V2V incompletos ao final do prazo do encontro.")
-                if len(self.messages) == len(self.senders):
-                    return [self.messages[sender] for sender in self.senders]
-                self.condition.wait(timeout=min(remaining, 0.1))
-
-    def close(self):
-        self.stopped.set()
-        self.listener.close()
-        if self.thread is not None:
-            self.thread.join()
-        with self.condition:
-            for connection in self.connections:
-                with suppress(OSError):
-                    connection.shutdown(socket.SHUT_RDWR)
-            self.condition.notify_all()
-        self.pool.shutdown(wait=True)
-        self.messages.clear()
-
-
-def send_v2v_results(frame, clients, *, deadline, cancelled, timings, completed):
-    """Fan-out limitado; resultados e contadores são recolhidos na thread principal."""
-    stopping = threading.Event()
-
-    def send(client_id):
-        transfer = timings.setdefault(str(client_id), {})
-        return send_p2p_model(
-            f"fl-client-v2v-{client_id}",
-            frame,
-            deadline=deadline,
-            cancelled=lambda: stopping.is_set() or cancelled(),
-            timings=transfer,
-        )
-
-    error = None
-    with ThreadPoolExecutor(max_workers=len(clients)) as pool:
-        futures = {pool.submit(send, client_id): client_id for client_id in clients}
-        for future in as_completed(futures):
-            try:
-                completed(futures[future], future.result())
-            except Exception as exc:
-                error = error or exc
-                stopping.set()
-    if error is not None:
-        raise error
-
-
-def exchange_v2i_model(
-    model, encounter: dict, client_id: int, *, train_samples: int, cancelled=None, metrics=None
-) -> dict:
-    """Troca uma CNN por TCP e confirma APPLIED somente após carregar o resultado.
-
-    Em caso de falha, preserva os pesos locais anteriores ao encontro. O prazo
-    abrange conexão, upload, espera, download, aplicação e confirmação.
-    """
-    host = encounter.get("rsu_host")
-    port = encounter.get("rsu_port")
-    timeout = encounter.get("exchange_timeout")
-    if (
-        not isinstance(host, str)
-        or not host.strip()
-        or type(port) is not int
-        or not 1 <= port <= 65535
-    ):
-        raise V2IProtocolError("Endereço TCP da RSU inválido no sinal de encontro.")
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, (int, float))
-        or not math.isfinite(timeout)
-        or timeout <= 0
-    ):
-        raise V2IProtocolError("exchange_timeout deve ser positivo e finito.")
-    if client_id not in encounter.get("clients", []):
-        raise V2IProtocolError("Cliente ausente dos participantes do encontro.")
-    context = {key: encounter.get(key) for key in ("run_id", "rsu_id", "encounter_id")}
-    context["client_id"] = client_id
-    started = time.monotonic()
-    metrics = metrics if metrics is not None else {}
-    timings = metrics.setdefault("timings", {})
-    deadline = started + timeout
-    preparation_started = time.monotonic()
-    snapshot = {key: tensor.detach().cpu().clone() for key, tensor in model.state_dict().items()}
-    record_elapsed(timings, "snapshot_time", preparation_started)
-    upload_timings = timings.setdefault("upload", {})
-    upload = prepare_v2i_frame(
-        "UPLOAD", **context, weights=snapshot, train_samples=train_samples, timings=upload_timings
-    )
-    load_started = False
-
-    def remaining() -> float:
-        if cancelled is not None and cancelled():
-            raise ConnectionAbortedError("Simulação encerrada durante a troca V2I.")
-        value = deadline - time.monotonic()
-        if value <= 0:
-            raise TimeoutError("Prazo da troca V2I esgotado.")
-        return value
-
-    try:
-        connection_started = time.monotonic()
-        try:
-            connection = socket.create_connection((host, port), timeout=remaining())
-        finally:
-            record_elapsed(timings, "connection_time", connection_started)
-        with connection:
-            sent = send_frame(
-                connection, upload, deadline=deadline, cancelled=cancelled, timings=upload_timings
-            )
-            metrics["upload_bytes"] = sent
-            del upload
-            response, _, received = recv_v2i_message(
-                connection,
-                **context,
-                deadline=deadline,
-                cancelled=cancelled,
-                timings=timings.setdefault("result", {}),
-            )
-            if response["type"] == "ERROR":
-                metrics["control_download_bytes"] = received
-                raise V2IProtocolError(f"RSU recusou o encontro: {response['error']}")
-            if response["type"] != "RESULT":
-                raise V2IProtocolError("Esperado RESULT após UPLOAD.")
-            metrics["download_bytes"] = received
-            metrics["aggregation_time"] = response.get("aggregation_time", 0.0)
-            state = response["weights"]
-            if state.keys() != snapshot.keys() or any(
-                state[key].shape != snapshot[key].shape or state[key].dtype != snapshot[key].dtype
-                for key in snapshot
-            ):
-                raise V2IProtocolError("O resultado da RSU é incompatível com a CNN local.")
-            remaining()
-            load_started = True
-            application_started = time.monotonic()
-            try:
-                model.load_state_dict(state, strict=True)
-            finally:
-                record_elapsed(timings, "application_time", application_started)
-            remaining()
-            control_timings = timings.setdefault("applied", {})
-            control = send_frame(
-                connection,
-                prepare_v2i_frame("APPLIED", **context, timings=control_timings),
-                deadline=deadline,
-                cancelled=cancelled,
-                timings=control_timings,
-            )
-        metrics.update(applied=True, control_upload_bytes=control)
-        return {
-            "upload_bytes": sent,
-            "download_bytes": received,
-            "control_bytes": control,
-            "protocol_time": time.monotonic() - started,
-        }
-    except Exception:
-        if load_started:
-            # Copiar os tensores também desfaz uma aplicação interrompida por um hook.
-            with torch.no_grad():
-                for key, tensor in model.state_dict().items():
-                    tensor.copy_(snapshot[key])
-        raise
-    finally:
-        metrics["protocol_time"] = time.monotonic() - started
-
-
-def write_v2i_failure(
-    encounters_dir: Path, encounter: dict, client_id: int, error: str, metrics: dict | None = None
-) -> None:
-    """Publica a falha com os contadores já concluídos, sem emitir .done."""
-    data = dict(metrics or {})
-    data.update({key: encounter.get(key) for key in ("run_id", "rsu_id", "encounter_id")})
-    data.update(client_id=client_id, status="failed", error=error)
-    write_json_atomic(
-        data, encounters_dir / f".failed_enc_{data['encounter_id']}_client_{client_id}.json"
-    )
-
-
-def map_sequential_to_simplemodel(state_dict):
-    mapped_dict = {}
-    mapping = {
-        "0.weight": "conv1.0.weight",
-        "0.bias": "conv1.0.bias",
-        "3.weight": "conv2.0.weight",
-        "3.bias": "conv2.0.bias",
-        "7.weight": "fc1.0.weight",
-        "7.bias": "fc1.0.bias",
-        "9.weight": "fc.weight",
-        "9.bias": "fc.bias",
-    }
-    for sequential_key, simple_key in mapping.items():
-        if sequential_key in state_dict:
-            mapped_dict[simple_key] = state_dict[sequential_key]
-    return mapped_dict
-
-# def dequantization(global_state):
-#     dequantized_state_dict = {}
-#     for k, v in global_state.items():
-#         if isinstance(v, dict) and v.get('dtype') == 'quantized_int8':
-#             scale = v['scale']
-#             dequantized_state_dict[k] = v['weights'].float() * scale
-#         else:
-#             dequantized_state_dict[k] = v
-#     return dequantized_state_dict
-
-# def quantization(state_dict):
-#     quantized_state_dict = {}
-#     for k, v in state_dict.items():
-#         if isinstance(v, torch.Tensor):
-#             scale = torch.max(torch.abs(v)) / 127.0
-#             quantized_weights = torch.clamp((v / scale).round(), -128, 127).to(torch.int8)
-#             quantized_state_dict[k] = {
-#                 'dtype': 'quantized_int8',
-#                 'scale': scale,
-#                 'weights': quantized_weights
-#             }
-#         else:
-#             quantized_state_dict[k] = v
-#     return quantized_state_dict
-
-def local_training(model, state_dict, prune, train_loader, test_loader, learning_rate=0.01, round_num=2, alaarg=1, ala=None, model_type='cnn', run_config=None):
-    # Verifica se os pesos precisam ser desquantizados (se não forem tensores)
-    if state_dict and not isinstance(next(iter(state_dict.values())), torch.Tensor):
-        state_dict = dequantization(state_dict)
-    
-    personalized_acc = None  # Inicializa a variável que guardará a acurácia pós-ALA
-    
-    if round_num >= 2 and prune == 1:
-        if model_type == 'cnn':
-            state_dict = map_sequential_to_simplemodel(state_dict)
-    # === CORREÇÃO ESTRUTURAL PARA CLIP E SLM ===
-    if model_type in ['clip', 'slm']:
-        # FedALA_LoRA só se aplica a CLIP (model_type != 'slm').
-        # Evita deepcopy desnecessário do SLM inteiro (~4-6 GB).
-        needs_ala = (alaarg == 0 and round_num >= 2 and model_type != 'slm')
-        
-        if needs_ala:
-            global_model = copy.deepcopy(model)
-            global_model = resize_model_to_pruned(global_model, state_dict)
-            logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
-            local_initialization(ala, global_model, model)
-            personalized_acc, _ = evaluate_model(model, test_loader)
-            logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
-            del global_model
-        else:
-            resize_model_to_pruned(model, state_dict)
-        
-    else:
-        # --- LÓGICA ANTIGA PARA CNN MANTIDA INTACTA ---
-        local_model = resize_model_to_pruned(model, state_dict)
-        state = copy.deepcopy(local_model)
-        
-        if alaarg == 0:
-            # Aviso: Este código da CNN continua bugado (round_num == 2)
-            if round_num == 2:
-                logger.info(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
-                local_initialization(ala, state, model)
-            
-        set_parameters(model, state)
-        
-        if alaarg == 0 and round_num >= 2:
-            personalized_acc, _ = evaluate_model(model, test_loader)
-            logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
-    model.train()
-    loss_fn = nn.CrossEntropyLoss()
-    device = next(model.parameters()).device
-    
-    # --- 1. SELEÇÃO DE OTIMIZADOR ---
-    if model_type in ['clip', 'slm']:
-        if model_type == 'clip':
-            from lora_clip.clip_setup import build_optimizer, train_epoch, update_paca_runtime
-        else:
-            from lora_slm.slm_setup import build_optimizer, train_epoch, update_paca_runtime
-        
-        # --- PaCA RUNTIME UPDATE ---
-        paca_config = run_config["model"].get("paca", {})
-        if paca_config.get("enabled"):
-            update_paca_runtime(model, paca_config.get("upper_layers"))
-        
-        # --- DIAGNÓSTICO: Contagem de parâmetros treináveis (após PaCA update) ---
-        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if not hasattr(model, '_last_trainable_count') or model._last_trainable_count != trainable_count:
-            logger.info(f"[DIAG] Parâmetros treináveis neste round: {trainable_count:,}")
-            model._last_trainable_count = trainable_count
-            
-        # VRAM OPTIMIZATION: Habilita Gradient Checkpointing para SLM (Ação 1)
-        if model_type == 'slm':
-            if hasattr(model, "slm_model") and hasattr(model.slm_model, "gradient_checkpointing_enable"):
-                model.slm_model.gradient_checkpointing_enable()
-                # logger.debug("Gradient Checkpointing ativado no SLM (Redução de VRAM).")
-        
-        optimizer, sparse_optimizer = build_optimizer(model, run_config)
-        is_sora = run_config["model"]["lora"]["mode"] in ["with_sora_no_schedule", "with_sora_schedule"]
-        sparse_lambda = run_config["model"].get("sora", {}).get("sparse_lambda", 0.0) if is_sora else 0.0
-        
-        if model_type == 'slm':
-            accumulation_steps = run_config.get("training", {}).get("gradient_accumulation_steps", 1)
-            metrics = train_epoch(model, train_loader, optimizer, sparse_optimizer, sparse_lambda, accumulation_steps)
-        else:
-            metrics = train_epoch(model, train_loader, optimizer, sparse_optimizer, sparse_lambda)
-        
-        logger.info(f"Métricas do Treino Local - CE Loss: {metrics['ce_loss']:.4f} | Sparse Loss: {metrics['sparse_loss']:.4f}")
-    else:
-        # --- DIAGNÓSTICO: Contagem de parâmetros treináveis ---
-        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        if not hasattr(model, '_last_trainable_count') or model._last_trainable_count != trainable_count:
-            logger.info(f"[DIAG] Parâmetros treináveis neste round: {trainable_count:,}")
-            model._last_trainable_count = trainable_count
-        
-        optimizer = optim.SGD(model.parameters(), lr=learning_rate)
-        sparse_optimizer = None
-
-        model_dtype = next(model.parameters()).dtype
-        
-        for x, y in train_loader:
-            if x.is_floating_point():
-                x = x.to(device, dtype=model_dtype)
-            else:
-                x = x.to(device)
-            y = y.to(device)
-            
-            optimizer.zero_grad()
-            if sparse_optimizer is not None:
-                sparse_optimizer.zero_grad()
-                
-            output = model(x)
-            if isinstance(output, dict):
-                    output = output["logits"]
-                    
-            loss = loss_fn(output, y)
-            loss.backward()
-            optimizer.step()
-            
-            if sparse_optimizer is not None:
-                sparse_optimizer.step()
-    
-    # --- 2. SELEÇÃO DOS PESOS QUE SERÃO ENVIADOS PARA O SERVIDOR ---
-    if model_type in ['clip', 'slm']:
-        if model_type == 'clip':
-            from lora_clip.sora import get_trainable_state_dict
-        else:
-            from lora_slm.sora import get_trainable_state_dict
-        return get_trainable_state_dict(model), personalized_acc 
-    else:
-        return model.state_dict(), personalized_acc 
-
-
-
-import torchvision.transforms as T
-from PIL import Image
-
-def load_data(dataset, client_idx, device, is_train=True, batch_size=32, is_clip=False, is_slm=False, slm_config=None, dataset_dir=None):
-    train_data = read_client_data(dataset, client_idx, is_train, dataset_dir=dataset_dir)
-    X, y = zip(*train_data)
-    X = torch.stack(X)
-    
-    if is_slm:
-        from lora_slm.slm_setup import CustomCollator
-        from transformers import AutoProcessor
-        
-        processor = AutoProcessor.from_pretrained(slm_config["model"]["name"])
-        label_to_idx = {i: i for i in range(1000)}
-        label_to_idx.update({str(i): i for i in range(1000)})
-        collate_fn = CustomCollator(processor, label_to_idx)
-        
-        slm_data = []
-        for x_tensor, y_tensor in zip(X, y):
-            x_tensor = x_tensor.cpu().float()
-            
-            # Se o tensor vier com normalização do CLIP (valores negativos < -0.1)
-            if x_tensor.min() < -0.1:
-                clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
-                clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
-                if x_tensor.shape[0] == 3:
-                    x_tensor = x_tensor * clip_std + clip_mean
-                else:
-                    x_tensor = x_tensor * 0.5 + 0.5
-            elif x_tensor.min() < 0:
-                # Normalização padrão [-1, 1]
-                x_tensor = x_tensor * 0.5 + 0.5
-                
-            if x_tensor.max() <= 1.0:
-                x_tensor = x_tensor * 255.0
-                
-            # Clamp to [0, 255] range
-            x_tensor = torch.clamp(x_tensor, 0, 255)
-            x_numpy = x_tensor.byte().numpy()
-            
-            if x_numpy.shape[0] in [1, 3]: # (C, H, W) -> (H, W, C)
-                x_numpy = np.transpose(x_numpy, (1, 2, 0))
-            if x_numpy.shape[-1] == 1:
-                x_numpy = np.squeeze(x_numpy, axis=-1)
-                
-            pil_img = Image.fromarray(x_numpy)
-            if pil_img.mode != "RGB":
-                pil_img = pil_img.convert("RGB")
-            
-            slm_data.append({"image": pil_img, "label": y_tensor.item()})
-            
-        pin_mem = True if hasattr(device, 'type') and device.type == 'cuda' else False
-        return DataLoader(slm_data, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=pin_mem)
-
-    # Redimensionamento e normalização vitais para o CLIP
-    if is_clip:
-        if X.shape[-2:] != (224, 224):
-            resize = T.Resize((224, 224), antialias=True)
-            X = resize(X)
-        if not X.is_floating_point():
-            X = X.float() / 255.0
-        elif X.min() >= 0.0 and X.max() > 1.0:
-            X = X / 255.0
-        # Se os dados não tiverem normalização do CLIP, aplica a normalização oficial do CLIP
-        if X.min() >= 0.0:
-            normalize = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
-            X = normalize(X)
-        
-    # Garante que o rótulo é inteiro longo e move os dados INTEIROS para a GPU
-    X = X.to(device)
-    y = torch.tensor(y, dtype=torch.long).to(device)
-    
-    dataset = torch.utils.data.TensorDataset(X, y)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-
-def save_results(
-    args,
-    rs_global_acc,
-    rs_global_loss,
-    rs_ala_acc,
-    rs_local_acc,
-    rs_train_acc,
-    idx=0,
-    argalgo=0,
-    rs_post_p2p_acc=None,
-    rs_post_p2p_encounter_ids=None,
-    rs_p2p_data_sent_mb=None,
-    rs_p2p_data_sent_enc_ids=None,
-    rs_ota_encounter_epochs=None,
-    rs_ota_mean_distances=None,
-    rs_ota_is_aggregator=None,
-):
-    b = "FedALA" if argalgo == 0 else "FedAVG"
-
-    paca_val = (
-        args.paca
-        if (
-            isinstance(args.paca, (int, float))
-            and not isinstance(args.paca, bool)
-            and args.paca > 0
-        )
-        else 0
-    )
-    rank_val = (
-        args.rank
-        if (
-            isinstance(args.rank, (int, float))
-            and not isinstance(args.rank, bool)
-            and args.rank > 0
-        )
-        else 8
-    )
-    ts_suffix = f"_{args.timestamp}" if hasattr(args, "timestamp") and args.timestamp else ""
-    algo = f"client_{idx}_{args.dataset}_{args.strategy}_rank{rank_val}_paca{paca_val}_{b}_run{args.run_id}{ts_suffix}"
-
-    current_dir = Path(__file__).resolve().parent
-    result_path = (
-        getattr(args, "results_dir", None) or current_dir.parent / "results" / args.exp_name
-    )
-    result_path.mkdir(parents=True, exist_ok=True)
-
-    file_path = result_path / f"{algo}.h5"
-    logger.info(f"Salvando resultados em: {file_path}")
-
-    with h5py.File(file_path, "w") as hf:
-        hf.create_dataset("rs_global_acc", data=rs_global_acc)
-        hf.create_dataset("rs_global_loss", data=rs_global_loss)
-        if rs_ala_acc is not None and len(rs_ala_acc) > 0:
-            hf.create_dataset("rs_ala_acc", data=rs_ala_acc)
-        hf.create_dataset("rs_local_acc", data=rs_local_acc)
-        hf.create_dataset("rs_train_acc", data=rs_train_acc)
-        if rs_post_p2p_acc is not None and len(rs_post_p2p_acc) > 0:
-            hf.create_dataset("rs_post_p2p_acc", data=rs_post_p2p_acc)
-        if rs_post_p2p_encounter_ids is not None and len(rs_post_p2p_encounter_ids) > 0:
-            hf.create_dataset("rs_post_p2p_encounter_ids", data=rs_post_p2p_encounter_ids)
-        if rs_p2p_data_sent_mb is not None and len(rs_p2p_data_sent_mb) > 0:
-            hf.create_dataset("rs_p2p_data_sent_mb", data=rs_p2p_data_sent_mb)
-            hf["rs_p2p_data_sent_mb"].attrs["unit"] = "MiB (2**20 bytes)"
-        if rs_p2p_data_sent_enc_ids is not None and len(rs_p2p_data_sent_enc_ids) > 0:
-            hf.create_dataset("rs_p2p_data_sent_enc_ids", data=rs_p2p_data_sent_enc_ids)
-        # Métricas OTA (Fase 3): distância, época do encontro, papel do cliente
-        if rs_ota_encounter_epochs is not None and len(rs_ota_encounter_epochs) > 0:
-            hf.create_dataset("rs_ota_encounter_epochs", data=rs_ota_encounter_epochs)
-        if rs_ota_mean_distances is not None and len(rs_ota_mean_distances) > 0:
-            hf.create_dataset("rs_ota_mean_distances", data=rs_ota_mean_distances)
-        if rs_ota_is_aggregator is not None and len(rs_ota_is_aggregator) > 0:
-            hf.create_dataset("rs_ota_is_aggregator", data=rs_ota_is_aggregator)
-        hf.attrs["paca_used"] = paca_val
-        hf.attrs["execution_id"] = getattr(args, "execution_id", "")
-        hf.attrs["seed"] = getattr(args, "seed", 42)
-        if getattr(args, "dataset_dir", None) is not None:
-            hf.attrs["dataset_dir"] = str(args.dataset_dir)
-        if getattr(args, "initial_model_sha256", None) is not None:
-            hf.attrs["initial_model_sha256"] = args.initial_model_sha256
-            hf.attrs["initialization_seed"] = args.seed
-            hf.attrs["training_seed"] = args.training_seed
-        records = getattr(args, "encounter_metrics", [])
-        if records:
-            group = hf.create_group("encounters")
-            group.attrs["bytes_unit"] = "bytes of completed application frames"
-            group.attrs["time_unit"] = "seconds"
-            group.attrs["accuracy_unit"] = "percent"
-            group.create_dataset(
-                "records",
-                data=[json.dumps(r, allow_nan=False) for r in records],
-                dtype=h5py.string_dtype("utf-8"),
-            )
-            for key in (
-                "encounter_id",
-                "participant_count",
-                "upload_bytes",
-                "download_bytes",
-                "control_upload_bytes",
-                "control_download_bytes",
-                "aggregation_time",
-                "protocol_time",
-                "evaluation_time",
-                "accuracy_before",
-                "accuracy_after",
-                "majority_class_baseline",
-                "test_samples",
-                "epoch",
-                "mean_distance",
-                "is_aggregator",
-            ):
-                group.create_dataset(
-                    key, data=[r.get(key) if r.get(key) is not None else np.nan for r in records]
-                )
-
-
-def local_initialization(ala, received_global_model, model, mask=None):
-    ala.adaptive_local_aggregation(received_global_model, model, mask=mask)
-
-
-# def resize_model_to_pruned(model, pruned_dict):
-#     """ Redimensiona o modelo existente para as dimensões podadas """
-#     with torch.no_grad():
-#         for name, param in model.named_parameters():
-#             if name in pruned_dict:
-#                 pruned_weight = pruned_dict[name]
-                
-#                 if param.shape != pruned_weight.shape:
-#                     logger.debug(f"Redimensionando {name}: {param.shape} -> {pruned_weight.shape}")
-#                     new_param = nn.Parameter(pruned_weight.to(param.device))
-                    
-#                     if '.' in name:
-#                         parts = name.split('.')
-#                         module = model
-#                         for part in parts[:-1]:
-#                             module = getattr(module, part)
-#                         setattr(module, parts[-1], new_param)
-#                         if hasattr(module, 'r') and 'lora_A' in name:
-#                             module.r = pruned_weight.shape[0]
-#                     else:
-#                         setattr(model, name, new_param)
-#                 else:
-#                     param.data.copy_(pruned_weight.to(param.device))
-#     return model
 
 def parse_args():
-    # Colocar um argumento -t para servir como um for 
-    parser = argparse.ArgumentParser(description='Federated Learning Client')
-    parser.add_argument('--host', type=str, default='localhost')
-    parser.add_argument('--port', type=int, default=9000)
-    parser.add_argument('--rounds', type=int, default=5)
-    parser.add_argument('--dataset', type=str, default='Cifar100')
-    parser.add_argument('--dataset-dir', type=Path, help='Diretório com config.json, train/ e test/; mantém o nome lógico do dataset')
-    parser.add_argument('--client-idx', type=int, default=0)
-    parser.add_argument('--in-features', type=int, default=3)
-    parser.add_argument('--num-classes', type=int, default=100)
-    parser.add_argument('--dim', type=int, default=1600)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--learning-rate', type=float, default=0.01)
-    parser.add_argument('--random-client', action='store_true')
+    parser = argparse.ArgumentParser(description="Federated Learning Client")
+    parser.add_argument("--host", type=str, default="localhost")
+    parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--dataset", type=str, default="Cifar100")
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        help="Diretório com config.json, train/ e test/; mantém o nome lógico do dataset",
+    )
+    parser.add_argument("--client-idx", type=int, default=0)
+    parser.add_argument("--in-features", type=int, default=3)
+    parser.add_argument("--num-classes", type=int, default=100)
+    parser.add_argument("--dim", type=int, default=1600)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--learning-rate", type=float, default=0.01)
+    parser.add_argument("--random-client", action="store_true")
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"])
-    parser.add_argument('-did', "--device_id", type=str, default="0")
+    parser.add_argument("-did", "--device_id", type=str, default="0")
     parser.add_argument("--ala", type=int, default=0)
-    parser.add_argument("--model", type=str, default="cnn")
-    parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
-    parser.add_argument('--experiments', type=int, default=1)
-    parser.add_argument('--run-id', type=int, default=1)
-    parser.add_argument('--execution-id', default='', help='ID da simulação V2V/V2I')
-    parser.add_argument('--results-dir', type=Path)
-    parser.add_argument('--encounters-dir', type=Path)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--exp-name', type=str, default='default_exp', help='Nome da sessão')
-    parser.add_argument('--timestamp', type=str, default='', help='Timestamp para diferenciar rodadas de simulação')
-    parser.add_argument('--strategy', type=str, default='lora', choices=['lora', 'adalora', 'sora_with_schedule', 'sora_no_schedule'])
-    parser.add_argument('--rank', type=int, default=8, help='Rank para o SoRA/LoRA') 
-    parser.add_argument('--paca', type=int, default=12, help='Número de camadas para a estratégia PaCA')
-    
+    parser.add_argument("--model", type=str, default="cnn", choices=["cnn", "clip", "slm", "lfm"])
+    parser.add_argument("--config", type=str, default="lora_clip/train_config.yml")
+    parser.add_argument("--experiments", type=int, default=1)
+    parser.add_argument("--run-id", type=int, default=1)
+    parser.add_argument("--execution-id", default="", help="ID da simulação V2V/V2I")
+    parser.add_argument("--results-dir", type=Path)
+    parser.add_argument("--encounters-dir", type=Path)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--exp-name", type=str, default="default_exp", help="Nome da sessão")
+    parser.add_argument(
+        "--timestamp", type=str, default="", help="Timestamp para diferenciar rodadas de simulação"
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="lora",
+        choices=["lora", "adalora", "sora_with_schedule", "sora_no_schedule"],
+    )
+    parser.add_argument("--rank", type=int, default=8, help="Rank para o SoRA/LoRA")
+    parser.add_argument(
+        "--paca", type=int, default=12, help="Número de camadas para a estratégia PaCA"
+    )
+
     # --- Parâmetros de Sparsidade (SoRA) ---
-    parser.add_argument('--sparse-lr', type=float, default=None, help='Taxa de aprendizado para a poda (Softshrink)')
-    parser.add_argument('--max-lambda', type=float, default=None, help='Força máxima da penalidade L1 (max_lambda)')
-    
+    parser.add_argument(
+        "--sparse-lr",
+        type=float,
+        default=None,
+        help="Taxa de aprendizado para a poda (Softshrink)",
+    )
+    parser.add_argument(
+        "--max-lambda", type=float, default=None, help="Força máxima da penalidade L1 (max_lambda)"
+    )
+
     # --- PaCA Heterogêneo ---
-    parser.add_argument('--random-paca', action='store_true', help='Sorteia um valor de PaCA aleatório para este cliente')
-    parser.add_argument('--paca-min', type=int, default=1, help='Valor mínimo de PaCA no sorteio aleatório')
-    parser.add_argument('--paca-max', type=int, default=12, help='Valor máximo de PaCA no sorteio aleatório')
-    parser.add_argument('--paca-list', type=str, default=None, help='Lista de PaCAs pré-definidos por cliente (ex: "4,6,8,12"). O cliente usa o valor na posição client_idx %% len(lista)')
-    parser.add_argument('--prune', type=int, default=1, choices=[0, 1], help='Habilitar pruning adaptativo (0=sim, 1=não, default: 1)')
-    parser.add_argument('--mode', type=str, default='centralized', choices=['centralized', 'decentralized'])
-    parser.add_argument('--max-epochs', type=int, default=0, help='Limite de epocas no modo descentralizado (0 = infinito)')
-    parser.add_argument('--delta-coding', action='store_true', help='Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8')
-    
+    parser.add_argument(
+        "--random-paca",
+        action="store_true",
+        help="Sorteia um valor de PaCA aleatório para este cliente",
+    )
+    parser.add_argument(
+        "--paca-min", type=int, default=1, help="Valor mínimo de PaCA no sorteio aleatório"
+    )
+    parser.add_argument(
+        "--paca-max", type=int, default=12, help="Valor máximo de PaCA no sorteio aleatório"
+    )
+    parser.add_argument(
+        "--paca-list",
+        type=str,
+        default=None,
+        help='Lista de PaCAs pré-definidos por cliente (ex: "4,6,8,12"). '
+        "O cliente usa o valor na posição client_idx %% len(lista)",
+    )
+    parser.add_argument(
+        "--prune",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Habilitar pruning estrutural (1=sim, 0=não, default: 1)",
+    )
+    parser.add_argument(
+        "--mode", type=str, default="centralized", choices=["centralized", "decentralized"]
+    )
+    parser.add_argument(
+        "--max-epochs",
+        type=int,
+        default=0,
+        help="Limite de epocas no modo descentralizado (0 = infinito)",
+    )
+    parser.add_argument(
+        "--delta-coding",
+        action="store_true",
+        help="Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8",
+    )
+
     # --- Otimização de Avaliação ---
-    parser.add_argument('--skip-post-eval', action='store_true', help='Pula todas as avaliações pós-treino no cliente (local_test_acc e train_acc) para máxima velocidade, mantendo apenas Global Model Test Acc')
-    parser.add_argument('--skip-train-eval', action='store_true', help='Pula apenas a avaliação demorada no conjunto de treino pós-treino')
-    
+    parser.add_argument(
+        "--skip-post-eval",
+        action="store_true",
+        help="Pula todas as avaliações pós-treino no cliente (local_test_acc e train_acc) "
+        "para máxima velocidade, mantendo apenas Global Model Test Acc",
+    )
+    parser.add_argument(
+        "--skip-train-eval",
+        action="store_true",
+        help="Pula apenas a avaliação demorada no conjunto de treino pós-treino",
+    )
+
+    # --- QLoRA (backbone 4-bit NF4 + adaptadores LoRA 16 bits) ---
+    parser.add_argument(
+        "--qlora",
+        action="store_true",
+        help="Ativa QLoRA (apenas --model slm --strategy lora, modo centralizado)",
+    )
+
+    # --- Simulação de Straggler (Cliente Lento / Timeout) ---
+    parser.add_argument(
+        "--straggler-idx",
+        type=int,
+        default=-1,
+        help="Índice do cliente para simulação de atraso artificial (straggler)",
+    )
+    parser.add_argument(
+        "--straggler-delay",
+        type=float,
+        default=0.0,
+        help="Tempo de atraso artificial em segundos para o cliente straggler",
+    )
+    parser.add_argument(
+        "--straggler-round",
+        type=int,
+        default=2,
+        help="Rodada (1-based) em que o atraso artificial será aplicado (default: 2)",
+    )
+
     return parser.parse_args()
+
+
+# =====================================================================
+# MODO CENTRALIZADO (EXECUÇÃO POR RODADAS TCP)
+# =====================================================================
+
+
+def _decode_server_payload(
+    global_state: dict, previous_recv_state: dict, delta_coding: bool
+) -> tuple[dict, dict, float]:
+    """Descomprime o payload recebido do servidor (LHDQ ou INT8) e atualiza a referência."""
+    start = time.time()
+    if is_lhdq_encoded(global_state):
+        global_state = lhdq_decode(global_state, previous_recv_state)
+        previous_recv_state = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()
+        }
+    else:
+        if delta_coding:
+            previous_recv_state = {
+                k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()
+            }
+        else:
+            global_state = dequantization(global_state)
+    return global_state, previous_recv_state, time.time() - start
+
+
+def _encode_client_payload(
+    updated_state: dict,
+    previous_sent_state: dict,
+    round_num: int,
+    delta_coding: bool,
+) -> tuple[dict, dict, float]:
+    """Comprime os pesos locais (LHDQ ou INT8 padrão) para envio."""
+    start = time.time()
+    use_lhdq = delta_coding and round_num >= 1 and bool(previous_sent_state)
+    if use_lhdq:
+        updated_state = lhdq_encode(updated_state, previous_sent_state)
+        previous_sent_state = lhdq_decode(updated_state, previous_sent_state)
+    else:
+        if delta_coding:
+            previous_sent_state = {
+                k: v.clone() if isinstance(v, torch.Tensor) else v
+                for k, v in updated_state.items()
+            }
+        else:
+            updated_state = quantization(updated_state)
+    return updated_state, previous_sent_state, time.time() - start
+
+
+def _evaluate_global_before_training(
+    model: nn.Module,
+    global_state: dict,
+    test_loader: DataLoader,
+    round_num: int,
+    model_type: str,
+    qlora: bool,
+) -> tuple[float, float, float]:
+    """Avalia o modelo global recebido antes do treino local, preservando pesos locais."""
+    eval_start = time.time()
+    if round_num + 1 >= 2:
+        old_local_weights = None
+        if model_type in ["clip", "slm", "lfm"]:
+            old_local_weights = {
+                n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad
+            }
+        if model_type == "lfm":
+            from lora_lfm.lfm_setup import set_lfm_state_dict
+
+            set_lfm_state_dict(model, global_state)
+            local = model
+        elif qlora:
+            set_qlora_state_dict(model, global_state)
+            local = model
+        else:
+            local = resize_model_to_pruned(model, global_state)
+        test_accuracy, test_loss = evaluate_model(local, test_loader)
+        if old_local_weights is not None:
+            for n, p in model.named_parameters():
+                if (
+                    p.requires_grad
+                    and n in old_local_weights
+                    and p.data.shape == old_local_weights[n].shape
+                ):
+                    p.data.copy_(old_local_weights[n])
+    else:
+        test_accuracy, test_loss = evaluate_model(model, test_loader)
+    return test_accuracy, test_loss, time.time() - eval_start
+
+
+def _evaluate_post_training(
+    args: argparse.Namespace,
+    model: nn.Module,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    fallback_test_acc: float,
+    history: ClientHistory,
+) -> float:
+    """Executa avaliação pós-treino local respeitando --skip-post-eval e --skip-train-eval."""
+    post_eval_start = time.time()
+    if not args.skip_post_eval:
+        local_test_acc, _ = evaluate_model(model, test_loader)
+        history.local_acc.append(local_test_acc)
+        if not args.skip_train_eval:
+            train_accuracy, _ = evaluate_model(model, train_loader)
+            history.train_acc.append(train_accuracy)
+        else:
+            train_accuracy = 0.0
+            history.train_acc.append(0.0)
+        logger.info(
+            f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | "
+            f"Training Accuracy: {train_accuracy:.2f}%"
+        )
+    else:
+        history.local_acc.append(fallback_test_acc)
+        history.train_acc.append(0.0)
+    return time.time() - post_eval_start
+
+
+def _connect_to_central_server(args: argparse.Namespace, sock: socket.socket) -> None:
+    connected = False
+    for attempt in range(10):
+        try:
+            sock.connect((args.host, args.port))
+            connected = True
+            break
+        except OSError:
+            logger.warning(
+                f"Connection failed, retrying in 5 seconds... (Attempt {attempt + 1}/10)"
+            )
+            time.sleep(5)
+    if not connected:
+        logger.exception("Connection failed after multiple attempts")
+        sys.exit(1)
+    client_timeouts = {"cnn": 120, "clip": 300, "slm": 900, "lfm": 900}
+    sock.settimeout(client_timeouts.get(args.model, 300))
+    send_data(sock, args.client_idx)
+    logger.info(f"Connected to server {args.host}:{args.port}")
+
+
+def run_centralized_client(
+    args: argparse.Namespace,
+    model: nn.Module,
+    train_loader: DataLoader,
+    test_loader: DataLoader,
+    ala,
+    run_config: dict | None,
+    history: ClientHistory,
+) -> None:
+    """Executa o ciclo completo de treinamento federado centralizado via TCP."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        _connect_to_central_server(args, s)
+        previous_recv_state: dict = {}
+        previous_sent_state: dict = {}
+
+        for round_num in range(args.rounds):
+            logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
+            if args.model in ["clip", "slm", "lfm"]:
+                server_paca, _ = recv_data(s)
+                if server_paca is None or server_paca == "end":
+                    break
+                if (
+                    isinstance(server_paca, int)
+                    and not isinstance(server_paca, bool)
+                    and server_paca != args.paca
+                ):
+                    args.paca = server_paca
+                    if run_config and "paca" in run_config.get("model", {}):
+                        run_config["model"]["paca"]["upper_layers"] = server_paca
+
+                server_r, _ = recv_data(s)
+                if server_r is None or server_r == "end":
+                    break
+                if (
+                    isinstance(server_r, int)
+                    and not isinstance(server_r, bool)
+                    and server_r != args.rank
+                ):
+                    args.rank = server_r
+                    if run_config and "lora" in run_config.get("model", {}):
+                        run_config["model"]["lora"]["r"] = server_r
+
+            global_state, _ = recv_data(s)
+            if global_state is None or global_state == "end" or not isinstance(global_state, dict):
+                break
+            prune, _ = recv_data(s)
+            if prune is None or prune == "end":
+                break
+            logger.info("Received global model.")
+
+            global_state, previous_recv_state, client_dequant_time = _decode_server_payload(
+                global_state, previous_recv_state, args.delta_coding
+            )
+
+            if round_num + 1 >= 2 and prune == 1 and args.model == "cnn":
+                _amount, _ = recv_data(s)
+
+            test_accuracy, test_loss, client_pre_eval_time = _evaluate_global_before_training(
+                model, global_state, test_loader, round_num, args.model, args.qlora
+            )
+            logger.info(
+                f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | "
+                f"Test Loss: {test_loss:.4f}"
+            )
+            history.global_acc.append(test_accuracy)
+            history.global_loss.append(test_loss)
+
+            train_start = time.time()
+            updated_state, personalized_acc = local_training(
+                model=model,
+                state_dict=global_state,
+                prune=prune,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                learning_rate=args.learning_rate,
+                round_num=round_num + 1,
+                alaarg=args.ala,
+                ala=ala,
+                model_type=args.model,
+                run_config=run_config if args.model in ["clip", "slm", "lfm"] else None,
+            )
+            client_training_time = time.time() - train_start
+            history.ala_acc.append(
+                personalized_acc if personalized_acc is not None else test_accuracy
+            )
+            logger.info(f"Local training completed in {client_training_time:.2f}s.")
+
+            client_post_eval_time = _evaluate_post_training(
+                args, model, train_loader, test_loader, test_accuracy, history
+            )
+            updated_state, previous_sent_state, client_quant_time = _encode_client_payload(
+                updated_state, previous_sent_state, round_num, args.delta_coding
+            )
+
+            client_eval_time = client_pre_eval_time + client_post_eval_time
+            client_processing_overhead = client_eval_time + client_quant_time + client_dequant_time
+            logger.info(
+                f"Client {args.client_idx}: Tempos - treino={client_training_time:.2f}s, "
+                f"eval={client_eval_time:.2f}s, quant={client_quant_time:.2f}s, "
+                f"dequant={client_dequant_time:.2f}s"
+            )
+
+            # Injeção de atraso para teste de straggler/timeout
+            if (
+                args.straggler_idx >= 0
+                and args.client_idx == args.straggler_idx
+                and (round_num + 1) == args.straggler_round
+                and args.straggler_delay > 0
+            ):
+                logger.warning(
+                    f"⚠️ [STRAGGLER TEST] Cliente {args.client_idx} dormindo "
+                    f"{args.straggler_delay:.1f}s na Rodada {round_num + 1}..."
+                )
+                time.sleep(args.straggler_delay)
+                logger.warning(
+                    f"⚠️ [STRAGGLER TEST] Cliente {args.client_idx} acordou do atraso simulado."
+                )
+
+            try:
+                send_data(s, updated_state)
+                send_data(s, len(train_loader))
+                send_data(s, args.ala)
+                send_data(s, client_training_time)
+                send_data(s, test_accuracy)
+                send_data(s, test_loss)
+                send_data(s, client_processing_overhead)
+                logger.info("Client update sent.")
+                if args.model in ["slm", "lfm"]:
+                    round_ack, _ = recv_data(s)
+                    if round_ack is None:
+                        break
+                else:
+                    s.recv(3)
+                logger.info("Ready for next round...")
+            except (OSError, BrokenPipeError, ConnectionResetError, TimeoutError):
+                break
+
+    history.save(args)
+    logger.info("\nTraining completed!")
+
+
+# =====================================================================
+# PONTO DE ENTRADA PRINCIPAL
+# =====================================================================
+
 
 def main():
     args = parse_args()
@@ -854,45 +525,10 @@ def main():
     np.random.seed(args.training_seed)
     torch.manual_seed(args.training_seed)
     args.encounter_metrics = []
-    
-    # Configuração inteligente de device: MPS > CUDA > CPU
-    if args.device == "mps":
-        if torch.backends.mps.is_available():
-            logger.info("Using Metal Performance Shaders (MPS) for MacBook GPU acceleration.")
-        else:
-            logger.warning("MPS is not available. Falling back to CUDA if available, otherwise CPU.")
-            if torch.cuda.is_available():
-                args.device = "cuda"
-            else:
-                args.device = "cpu"
-    elif args.device == "cuda":
-        if not torch.cuda.is_available():
-            logger.warning("CUDA is not available. Checking for MPS...")
-            if torch.backends.mps.is_available():
-                logger.info("Falling back to Metal Performance Shaders (MPS).")
-                args.device = "mps"
-            else:
-                logger.warning("CUDA and MPS not available. Using CPU.")
-                args.device = "cpu"
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = args.device_id
-    
-    logger.info(f"Device set to: {args.device}")
-    
-    device = torch.device(args.device)
-    
-    # --- Resolução do PaCA Heterogêneo ---
-    if args.paca_list is not None:
-        # Modo lista: valores pré-definidos por cliente (determinístico)
-        paca_values = [int(x.strip()) for x in args.paca_list.split(',')]
-        args.paca = paca_values[args.client_idx % len(paca_values)]
-        logger.info(f"PaCA Heterogêneo (lista): Cliente {args.client_idx} usando PaCA = {args.paca}")
-    elif args.random_paca:
-        # Modo aleatório: sorteia uma vez no início (seed baseada no client_idx + run_id para reprodutibilidade)
-        rng = random.Random(args.client_idx * 1000 + args.run_id)
-        args.paca = rng.randint(args.paca_min, args.paca_max)
-        logger.info(f"PaCA Heterogêneo (aleatório): Cliente {args.client_idx} sorteou PaCA = {args.paca} (intervalo [{args.paca_min}, {args.paca_max}])")
-    
+
+    device = resolve_device(args)
+    resolve_heterogeneous_paca(args)
+
     logger.info("=== Federated Learning Client ===")
     logger.info(f"Host: {args.host}:{args.port}")
     logger.info(f"Dataset: {args.dataset}")
@@ -900,863 +536,28 @@ def main():
     logger.info(f"Rounds: {args.rounds}")
     logger.info(f"Batch size: {args.batch_size} | LR: {args.learning_rate}")
     logger.info("=================================")
-    
-    # Adoção de Structural Pattern Matching
-    match args.model:
-        case "cnn":
-            # Isolar a inicialização comum preserva o RNG de treino de cada cliente.
-            # SimpleModel é construído em CPU; os geradores dos aceleradores não mudam.
-            with torch.random.fork_rng(devices=[], enabled=args.mode == "decentralized"):
-                if args.mode == "decentralized":
-                    torch.random.default_generator.manual_seed(args.seed)
-                match args.dataset:
-                    case "MNIST":
-                        model = SimpleModel(in_features=1, num_classes=10, dim=1024)
-                    case "Cifar10":
-                        model = SimpleModel(
-                            in_features=args.in_features, num_classes=10, dim=args.dim
-                        )
-                    case "Cifar100":
-                        model = SimpleModel(
-                            in_features=args.in_features,
-                            num_classes=args.num_classes,
-                            dim=args.dim,
-                        )
-                    case _:
-                        logger.error(f"Dataset inválido: {args.dataset}")
-                        sys.exit(1)
-            if args.mode == "decentralized":
-                initial_digest = hashlib.sha256()
-                for name, tensor in sorted(model.state_dict().items()):
-                    initial_digest.update(
-                        json.dumps([name, str(tensor.dtype), list(tensor.shape)]).encode("utf-8")
-                    )
-                    initial_tensor = tensor.detach().cpu().contiguous().reshape(-1)
-                    initial_digest.update(initial_tensor.view(torch.uint8).numpy().tobytes())
-                args.initial_model_sha256 = initial_digest.hexdigest()
-                logger.info(
-                    "Client %d: CNN inicial comum | seed=%d | treino=%d | SHA256=%s",
-                    args.client_idx,
-                    args.seed,
-                    args.training_seed,
-                    args.initial_model_sha256,
-                )
-        case 'clip' | 'slm':
-            if args.model == 'clip':
-                config = load_config(args.config)
-            else:
-                from lora_slm.slm_setup import load_config as load_config_slm
-                config = load_config_slm(args.config)
-            
-            if args.strategy == 'lora':
-                config["model"]["lora"]["mode"] = "with_lora"
-            elif args.strategy == 'adalora':
-                config["model"]["lora"]["mode"] = "with_adalora"
-            elif args.strategy == 'sora_with_schedule':
-                config["model"]["lora"]["mode"] = "with_sora_schedule"
-            elif args.strategy == 'sora_no_schedule':
-                config["model"]["lora"]["mode"] = "with_sora_no_schedule"
 
-                
-            if "paca" not in config["model"]:
-                config["model"]["paca"] = {}
-                
-            if "lora" in config["model"]:
-                config["model"]["lora"]["r"] = args.rank
-                
-            if args.paca is not None and args.paca > 0:
-                config["model"]["paca"]["enabled"] = True
-                config["model"]["paca"]["upper_layers"] = args.paca
-            else:
-                config["model"]["paca"]["enabled"] = False
-                config["model"]["paca"]["upper_layers"] = None
-            
-            if args.model == 'clip':
-                run_mode = resolve_run_modes(config)[0]
-                run_config = build_run_config(config, run_mode=run_mode)
-                model = build_model(config=run_config, num_classes=args.num_classes, device=device)
-            else:
-                from lora_slm.slm_setup import resolve_run_modes as resolve_run_modes_slm
-                from lora_slm.slm_setup import build_run_config as build_run_config_slm
-                from lora_slm.slm_setup import build_model as build_model_slm
-                run_mode = resolve_run_modes_slm(config)[0]
-                run_config = build_run_config_slm(config, run_mode=run_mode)
-                model = build_model_slm(config=run_config, num_classes=args.num_classes, device=device)
-            
-    model = model.to(device)
+    model, run_config = build_client_model(args, device)
+    train_loader, test_loader, test_majority_baseline = build_client_dataloaders(
+        args, device, run_config
+    )
+
     loss = nn.CrossEntropyLoss()
-    rs_global_acc = []
-    rs_global_loss = []
-    rs_ala_acc = []
-    rs_local_acc = []
-    rs_train_acc = []
-    rs_post_p2p_acc = []
-    rs_post_p2p_encounter_ids = []
-    rs_p2p_data_sent_mb = []
-    rs_p2p_data_sent_enc_ids = []
-    # Métricas OTA (Fase 3): registram informações de cada encontro
-    rs_ota_encounter_epochs = []   # Em qual época cada encontro ocorreu
-    rs_ota_mean_distances = []     # Distância média (metros) dos TX ao Aggregator
-    rs_ota_is_aggregator = []      # 1 se este cliente foi o Aggregator, 0 se TX
-    
-    try:
-        is_clip_flag = (args.model == 'clip')
-        is_slm_flag = (args.model == 'slm')
-        train_loader = load_data(args.dataset, args.client_idx, device, is_train=True, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None, dataset_dir=args.dataset_dir)
-        test_loader = load_data(args.dataset, args.client_idx, device, is_train=False, batch_size=args.batch_size, is_clip=is_clip_flag, is_slm=is_slm_flag, slm_config=run_config if is_slm_flag else None, dataset_dir=args.dataset_dir)
-        test_majority_baseline = None
-        if hasattr(test_loader.dataset, "tensors"):
-            labels = test_loader.dataset.tensors[1]
-            counts = torch.unique(labels, return_counts=True)[1]
-            test_majority_baseline = 100.0 * counts.max().item() / len(labels)
-        logger.info(f"Data loaded successfully - Train batches: {len(train_loader)}, Test batches: {len(test_loader)}")
-    except Exception as e:
-        logger.exception("Error loading data")
-        sys.exit(1)
-    
-    if args.model == 'clip':
+    if args.model == "clip":
         ala = ALA_LoRA(args.client_idx, loss, train_loader, 32, 80, 1.0, device)
     else:
         ala = ALA(args.client_idx, loss, train_loader, 32, 80, 2, 1.0, device)
-        
+
+    history = ClientHistory()
     time.sleep(10)
-    
-    if args.mode == 'centralized':
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            connected = False
-            for attempt in range(10):
-                try:
-                    s.connect((args.host, args.port))
-                    connected = True
-                    break
-                except OSError as e:
-                    logger.warning(f"Connection failed, retrying in 5 seconds... (Attempt {attempt+1}/10)")
-                    time.sleep(5)
-            if not connected:
-                logger.exception("Connection failed after multiple attempts")
-                sys.exit(1)
-            if args.model == 'slm':
-                s.settimeout(1800)
-            else:
-                s.settimeout(120)
-            previous_recv_state = {}
-            previous_sent_state = {}
-            send_data(s, args.client_idx)
-            logger.info(f"Connected to server {args.host}:{args.port}")
-            for round_num in range(args.rounds):
-                logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
-                if args.model in ['clip', 'slm']:
-                    server_paca, _ = recv_data(s)
-                    if server_paca is None or server_paca == "end":
-                        break
-                    if isinstance(server_paca, int) and not isinstance(server_paca, bool):
-                        if server_paca != args.paca:
-                            args.paca = server_paca
-                            if "paca" in run_config.get("model", {}):
-                                run_config["model"]["paca"]["upper_layers"] = server_paca
-                    server_r, _ = recv_data(s)
-                    if server_r is None or server_r == "end":
-                        break
-                    if isinstance(server_r, int) and not isinstance(server_r, bool):
-                        if server_r != args.rank:
-                            args.rank = server_r
-                            if "lora" in run_config.get("model", {}):
-                                run_config["model"]["lora"]["r"] = server_r
-                global_state, _ = recv_data(s)
-                if global_state is None or global_state == "end" or not isinstance(global_state, dict):
-                    break
-                prune, _ = recv_data(s)
-                if prune is None or prune == "end":
-                    break
-                logger.info("Received global model.")
-                client_dequant_start = time.time()
-                if is_lhdq_encoded(global_state):
-                    global_state = lhdq_decode(global_state, previous_recv_state)
-                    previous_recv_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()}
-                else:
-                    if args.delta_coding:
-                        previous_recv_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()}
-                    else:
-                        global_state = dequantization(global_state)
-                client_dequant_time = time.time() - client_dequant_start
-                if round_num + 1 >= 2 and prune == 1 and args.model == 'cnn':
-                    ammount, _ = recv_data(s)
-                eval_start = time.time()
-                if round_num + 1 >= 2:
-                    if args.model in ['clip', 'slm']:
-                        old_local_weights = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
-                    local = resize_model_to_pruned(model, global_state)
-                    test_accuracy, test_loss = evaluate_model(local, test_loader)
-                    if args.model in ['clip', 'slm']:
-                        for n, p in model.named_parameters():
-                            if p.requires_grad and n in old_local_weights:
-                                if p.data.shape == old_local_weights[n].shape:
-                                    p.data.copy_(old_local_weights[n])
-                else:
-                    test_accuracy, test_loss = evaluate_model(model, test_loader)
-                client_pre_eval_time = time.time() - eval_start
-                logger.info(f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | Test Loss: {test_loss:.4f}")
-                rs_global_acc.append(test_accuracy)
-                rs_global_loss.append(test_loss)
-                train_start = time.time()
-                updated_state, personalized_acc = local_training(
-                    model=model, 
-                    state_dict=global_state, 
-                    prune=prune, 
-                    train_loader=train_loader, 
-                    test_loader=test_loader,
-                    learning_rate=args.learning_rate, 
-                    round_num=round_num + 1, 
-                    alaarg=args.ala, 
-                    ala=ala,
-                    model_type=args.model, 
-                    run_config=run_config if args.model in ['clip', 'slm'] else None
-                )
-                client_training_time = time.time() - train_start
-                if personalized_acc is not None:
-                    rs_ala_acc.append(personalized_acc)
-                else:
-                    rs_ala_acc.append(test_accuracy)
-                logger.info(f"Local training completed in {client_training_time:.2f}s.")
-                post_eval_start = time.time()
-                if not args.skip_post_eval:
-                    local_test_acc, local_test_loss = evaluate_model(model, test_loader)
-                    rs_local_acc.append(local_test_acc)
-                    if not args.skip_train_eval:
-                        train_accuracy, train_loss = evaluate_model(model, train_loader)
-                        rs_train_acc.append(train_accuracy)
-                    else:
-                        train_accuracy = 0.0
-                        rs_train_acc.append(0.0)
-                    logger.info(f"Client {args.client_idx}: Post-Training Test Accuracy: {local_test_acc:.2f}% | Training Accuracy: {train_accuracy:.2f}%")
-                else:
-                    local_test_acc = test_accuracy
-                    train_accuracy = 0.0
-                    rs_local_acc.append(test_accuracy)
-                    rs_train_acc.append(0.0)
-                client_post_eval_time = time.time() - post_eval_start
-                quant_start = time.time()
-                use_lhdq = (args.delta_coding and round_num >= 1 and previous_sent_state)
-                if use_lhdq:
-                    updated_state = lhdq_encode(updated_state, previous_sent_state)
-                    previous_sent_state = lhdq_decode(updated_state, previous_sent_state)
-                else:
-                    if args.delta_coding:
-                        previous_sent_state = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
-                    else:
-                        updated_state = quantization(updated_state)
-                client_quant_time = time.time() - quant_start
-                client_eval_time = client_pre_eval_time + client_post_eval_time
-                client_processing_overhead = client_eval_time + client_quant_time + client_dequant_time
-                logger.info(f"Client {args.client_idx}: Tempos - treino={client_training_time:.2f}s, eval={client_eval_time:.2f}s, quant={client_quant_time:.2f}s, dequant={client_dequant_time:.2f}s")
-                try:
-                    send_data(s, updated_state)
-                    send_data(s, len(train_loader))
-                    send_data(s, args.ala)
-                    send_data(s, client_training_time)
-                    send_data(s, test_accuracy)
-                    send_data(s, test_loss)
-                    send_data(s, client_processing_overhead)
-                    logger.info("Client update sent.")
-                    if args.model == 'slm':
-                        round_ack, _ = recv_data(s)
-                        if round_ack is None:
-                            break
-                    else:
-                        s.recv(3)
-                    logger.info("Ready for next round...")
-                except (OSError, BrokenPipeError, ConnectionResetError, socket.timeout) as e:
-                    break
-        save_results(args, rs_global_acc, rs_global_loss, rs_ala_acc, rs_local_acc, rs_train_acc, idx=args.client_idx, argalgo=args.ala)
-        logger.info("\nTraining completed!")
 
-    elif args.mode == 'decentralized':
-        logger.info(f"Client {args.client_idx}: Modo Descentralizado (D-PSGD) Ativado.")
-        encounters_dir = args.encounters_dir or Path(__file__).resolve().parents[1] / "results" / "encounters"
-        def wait_for_round_signal(encounters_dir: Path, round_num: int) -> bool:
-            while True:
-                if (encounters_dir / ".simulation_done").exists():
-                    return False
-                if (encounters_dir / f".start_round_{round_num}").exists():
-                    return True
-                time.sleep(1)
-        def wait_for_encounter(encounters_dir: Path, client_idx: int, last_processed: int, current_round: int):
-            while True:
-                if (encounters_dir / ".simulation_done").exists():
-                    return None
-                if (encounters_dir / f".start_round_{current_round}").exists():
-                    return "skip"
-                encounter_files = list(encounters_dir.glob("encounter_*.json"))
-                if encounter_files:
-                    encounter_files.sort(key=lambda x: int(x.stem.split("_")[-1]))
-                    for ef in encounter_files:
-                        try:
-                            with open(ef, "r") as f:
-                                data = json.load(f)
-                            if args.execution_id and data.get("run_id") != args.execution_id:
-                                continue
-                            enc_id = data.get("encounter_id", 0)
-                            if enc_id <= last_processed:
-                                continue
-                            clients_in_enc = data.get("clients", [])
-                            if client_idx in clients_in_enc:
-                                return data
-                        except Exception:
-                            pass
-                time.sleep(0.05)
-        encounter_failure = None
-        epoch = 1
-        last_processed_encounter = 0
-        max_epochs = args.max_epochs if args.max_epochs > 0 else float('inf')
-        while epoch <= max_epochs:
-            logger.info(f"Client {args.client_idx}: Aguardando inicio da Rodada {epoch-1}...")
-            if not wait_for_round_signal(encounters_dir, epoch - 1):
-                logger.info(f"Client {args.client_idx}: Sinal de fim de simulacao (.simulation_done) recebido!")
-                break
-            logger.info(f"\n--- Iniciando Epoca {epoch}{f'/{args.max_epochs}' if args.max_epochs > 0 else ''} (Rodada {epoch-1}) ---")
-            if args.model in ['clip', 'slm']:
-                if args.model == 'slm':
-                    from lora_slm.sora import get_trainable_state_dict as get_trainable_state_dict_slm
-                    dummy_state = get_trainable_state_dict_slm(model)
-                else:
-                    from lora_clip.sora import get_trainable_state_dict as get_trainable_state_dict_clip
-                    dummy_state = get_trainable_state_dict_clip(model)
-            else:
-                dummy_state = model.state_dict()
-            updated_state, personalized_acc = local_training(
-                model=model,
-                state_dict=dummy_state,
-                prune=args.prune,
-                train_loader=train_loader,
-                test_loader=test_loader,
-                learning_rate=args.learning_rate,
-                round_num=epoch,
-                alaarg=args.ala,
-                ala=ala,
-                model_type=args.model,
-            )
-            # ── FASE 3: Avaliação de Treino (Pré-Encontro) ─────────────────────
-            if not args.skip_post_eval:
-                local_test_acc, _ = evaluate_model(model, test_loader)
-                rs_local_acc.append(local_test_acc)
-                if not args.skip_train_eval:
-                    train_accuracy, _ = evaluate_model(model, train_loader)
-                    rs_train_acc.append(train_accuracy)
-                else:
-                    rs_train_acc.append(0.0)
-                logger.info(
-                    f"Client {args.client_idx}: Epoca {epoch} Local Test Acc: {local_test_acc:.2f}%"
-                )
-
-            save_results(
-                args,
-                rs_global_acc,
-                rs_global_loss,
-                rs_ala_acc,
-                rs_local_acc,
-                rs_train_acc,
-                idx=args.client_idx,
-                argalgo=args.ala,
-                rs_post_p2p_acc=rs_post_p2p_acc,
-                rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
-                rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
-            )
-
-            # ── FASE 4: Sinalizar conclusão da época ────────────────────────
-            (encounters_dir / f".epoch_done_client_{args.client_idx}").touch()
-            logger.info(f"Client {args.client_idx}: Epoca concluida. Aguardando encontro P2P...")
-
-            # ── FASE 5: Aguardar e Processar Encontro ───────────────────────
-            encounter_data = wait_for_encounter(
-                encounters_dir, args.client_idx, last_processed_encounter, current_round=epoch
-            )
-
-            if encounter_data is None:
-                logger.info(
-                    f"Client {args.client_idx}: Sinal de fim de simulacao recebido. Encerrando."
-                )
-                break
-
-            if encounter_data == "skip":
-                logger.info(
-                    f"Client {args.client_idx}: Encontro nao ocorreu para mim nesta rodada. Avancando para prox epoca."
-                )
-                epoch += 1
-                continue
-
-            enc_id = encounter_data.get("encounter_id", 0)
-            clients_in_encounter = encounter_data.get("clients", [])
-            etc_seconds = encounter_data.get("etc_seconds", 60)
-            encounter_type = encounter_data.get("type", "v2v")  # "v2v" ou "v2i"
-
-            # Converter chaves do JSON de volta para int
-            positions = {int(k): tuple(v) for k, v in encounter_data.get("positions", {}).items()}
-
-            if isinstance(etc_seconds, str) and etc_seconds == "Carros Parados":
-                poll_timeout = 115
-            else:
-                poll_timeout = max(5, int(etc_seconds - 5))
-
-            encounter_started = time.monotonic()
-            metrics = {
-                "schema_version": 1,
-                "run_id": encounter_data.get("run_id"),
-                "rsu_id": encounter_data.get("rsu_id"),
-                "mode": encounter_type,
-                "encounter_id": enc_id,
-                "client_id": args.client_idx,
-                "participant_count": len(clients_in_encounter),
-                "epoch": epoch,
-                "status": "pending",
-                "applied": False,
-                "is_aggregator": False,
-                "upload_bytes": 0,
-                "download_bytes": 0,
-                "control_upload_bytes": 0,
-                "control_download_bytes": 0,
-                "received_upload_bytes": 0,
-                "sent_download_bytes": 0,
-                "timings": {},
-                "signal_detection_time": (
-                    max(0.0, encounter_started - encounter_data["published_monotonic"])
-                    if "published_monotonic" in encounter_data else None
-                ),
-                "protocol_time": 0.0,
-                "aggregation_time": 0.0,
-                "evaluation_time": 0.0,
-                "accuracy_before": rs_local_acc[-1]
-                if rs_local_acc and not args.skip_post_eval
-                else None,
-                "accuracy_after": None,
-                "majority_class_baseline": test_majority_baseline,
-                "test_samples": len(test_loader.dataset),
-                "train_samples": len(train_loader.dataset),
-                "evaluation_skipped": args.skip_post_eval,
-                "error": None,
-            }
-            args.encounter_metrics.append(metrics)
-
-            # ══════════════════════════════════════════════════════════════════
-            # BRANCH V2I: CNN → rsu-service por TCP → CNN
-            # ══════════════════════════════════════════════════════════════════
-            if encounter_type == "v2i":
-                try:
-                    if args.model != "cnn":
-                        raise NotImplementedError("A troca V2I por TCP está disponível para CNN.")
-                    rsu_id = encounter_data["rsu_id"]
-                    rsu_position = encounter_data["rsu_position"]
-                    my_position = positions[args.client_idx]
-                    enc_mean_distance = math.hypot(
-                        my_position[0] - rsu_position[0],
-                        my_position[1] - rsu_position[1],
-                    )
-                    logger.info(
-                        "Client %d: [V2I] Encontro %d com %s via %s:%s.",
-                        args.client_idx,
-                        enc_id,
-                        rsu_id,
-                        encounter_data.get("rsu_host"),
-                        encounter_data.get("rsu_port"),
-                    )
-                    exchange = exchange_v2i_model(
-                        model,
-                        encounter_data,
-                        args.client_idx,
-                        train_samples=len(train_loader.dataset),
-                        cancelled=lambda: (encounters_dir / ".simulation_done").exists(),
-                        metrics=metrics,
-                    )
-                    logger.info(
-                        "Client %d: Resultado da RSU aplicado; APPLIED enviado.", args.client_idx
-                    )
-                    rs_p2p_data_sent_mb.append(exchange["upload_bytes"] / (1024 * 1024))
-                    rs_p2p_data_sent_enc_ids.append(enc_id)
-
-                    metrics["mean_distance"] = enc_mean_distance
-                    metrics["status"] = "applied"
-                    write_json_atomic(
-                        metrics,
-                        encounters_dir / f".applied_enc_{enc_id}_client_{args.client_idx}.json",
-                    )
-                    # APPLIED é enviado antes da avaliação; .done exige métricas salvas.
-                    if not args.skip_post_eval:
-                        evaluation_started = time.monotonic()
-                        try:
-                            post_p2p_acc, _ = evaluate_model(model, test_loader)
-                        finally:
-                            metrics["evaluation_time"] = time.monotonic() - evaluation_started
-                        if not math.isfinite(post_p2p_acc):
-                            raise ValueError("A avaliação pós-V2I retornou uma acurácia inválida.")
-                        metrics["accuracy_after"] = float(post_p2p_acc)
-                        rs_post_p2p_acc.append(post_p2p_acc)
-                        rs_post_p2p_encounter_ids.append(enc_id)
-                        logger.info(
-                            "Client %d: Post-V2I Test Accuracy: %.2f%%",
-                            args.client_idx,
-                            post_p2p_acc,
-                        )
-                    metrics["status"] = "completed"
-                    rs_ota_encounter_epochs.append(epoch)
-                    rs_ota_mean_distances.append(enc_mean_distance)
-                    rs_ota_is_aggregator.append(0)
-                    save_results(
-                        args,
-                        rs_global_acc,
-                        rs_global_loss,
-                        rs_ala_acc,
-                        rs_local_acc,
-                        rs_train_acc,
-                        idx=args.client_idx,
-                        argalgo=args.ala,
-                        rs_post_p2p_acc=rs_post_p2p_acc,
-                        rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
-                        rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                        rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
-                        rs_ota_encounter_epochs=rs_ota_encounter_epochs,
-                        rs_ota_mean_distances=rs_ota_mean_distances,
-                        rs_ota_is_aggregator=rs_ota_is_aggregator,
-                    )
-                    write_json_atomic(
-                        metrics, encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
-                    )
-                    logger.info(
-                        "Client %d: Encontro V2I concluído; métricas salvas.", args.client_idx
-                    )
-                except Exception as exc:
-                    encounter_failure = str(exc) or type(exc).__name__
-                    logger.error(
-                        "Client %d: Falha no encontro V2I %d: %s",
-                        args.client_idx,
-                        enc_id,
-                        encounter_failure,
-                    )
-                    metrics.update(status="failed", error=encounter_failure)
-                    write_v2i_failure(
-                        encounters_dir, encounter_data, args.client_idx, encounter_failure, metrics
-                    )
-                    break
-                last_processed_encounter = enc_id
-                epoch += 1
-                continue
-
-            # ══════════════════════════════════════════════════════════════════
-            # BRANCH V2V: Recepção/fan-out concorrentes; OTA na thread principal
-            # ══════════════════════════════════════════════════════════════════
-            receiver = None
-            try:
-                p2p_timeout = encounter_data.get("exchange_timeout", poll_timeout)
-                if (
-                    isinstance(p2p_timeout, bool)
-                    or not isinstance(p2p_timeout, (int, float))
-                    or not math.isfinite(p2p_timeout)
-                    or p2p_timeout <= 0
-                ):
-                    raise ValueError("exchange_timeout V2V deve ser positivo e finito.")
-                exchange_deadline = encounter_started + p2p_timeout
-                cancelled = (encounters_dir / ".simulation_done").exists
-                # Eleição do Aggregator via Medoid
-                from v2v_fl.over_the_air.ota_channel import find_medoid
-
-                aggregator_id = find_medoid(positions)
-                is_aggregator = args.client_idx == aggregator_id
-                metrics["is_aggregator"] = is_aggregator
-
-                logger.info(
-                    f"Client {args.client_idx}: [D-PSGD] Encontro {enc_id} detectado! ETC={etc_seconds}s."
-                )
-                logger.info(
-                    f"Client {args.client_idx}: Aggregator eleito: {aggregator_id}. Sou aggregator? {is_aggregator}"
-                )
-
-                # Calcular distância média TX→Aggregator para métricas OTA
-                from v2v_fl.over_the_air.ota_channel import distances_from_positions
-
-                _, enc_distances = distances_from_positions(positions, aggregator_id)
-                enc_mean_distance = (
-                    float(np.mean(enc_distances)) if len(enc_distances) > 0 else 0.0
-                )
-
-                timings = metrics["timings"]
-                other_clients = sorted(c for c in clients_in_encounter if c != args.client_idx)
-                receiver = V2VReceiver(
-                    encounter_data, other_clients if is_aggregator else [aggregator_id],
-                    "UPLOAD" if is_aggregator else "RESULT",
-                    deadline=exchange_deadline, cancelled=cancelled,
-                )
-                preparation_started = time.monotonic()
-                # ── FASE 6: Troca P2P e Agregação (D-PSGD Assimétrico) ──────────────
-                if args.model == "clip":
-                    from lora_clip.sora import get_trainable_state_dict
-
-                    snapshot = get_trainable_state_dict(model)
-                else:
-
-                    snapshot = {
-                        key: value.detach().cpu().clone()
-                        for key, value in model.state_dict().items()
-                    }
-
-                record_elapsed(timings, "snapshot_time", preparation_started)
-                metrics["mean_distance"] = enc_mean_distance
-
-                # Os remetentes usam um frame validado/serializado uma única vez.
-                if not is_aggregator:
-                    upload_timings = timings.setdefault("upload", {})
-                    snapshot_bytes = send_p2p_model(
-                        f"fl-client-v2v-{aggregator_id}",
-                        prepare_v2v_frame(
-                            "UPLOAD", run_id=encounter_data["run_id"],
-                            client_id=args.client_idx, encounter_id=enc_id,
-                            weights=snapshot, train_samples=len(train_loader.dataset),
-                            timings=upload_timings,
-                        ),
-                        deadline=exchange_deadline, cancelled=cancelled, timings=upload_timings,
-                    )
-                    metrics["upload_bytes"] += snapshot_bytes
-                    rs_p2p_data_sent_mb.append(snapshot_bytes / (1024 * 1024))
-                    rs_p2p_data_sent_enc_ids.append(enc_id)
-
-                wait_started = time.monotonic()
-                try:
-                    received_states = receiver.wait()
-                finally:
-                    record_elapsed(timings, "model_wait_time", wait_started)
-                metrics["received_upload_bytes" if is_aggregator else "download_bytes"] = (
-                    sum(receiver.byte_counts.values())
-                )
-                timings["received_transfers"] = receiver.timings
-
-                # 3. Consolidação (No Aggregator) ou Atualização (Nos Transmissores)
-                if (is_aggregator and len(received_states) == len(other_clients)) or (
-                    not is_aggregator and len(received_states) == 1
-                ):
-                    # ── AGGREGATOR: Pipeline OTA (Over-the-Air) ──────────────────
-                    if is_aggregator:
-                        logger.info(
-                            f"Client {args.client_idx}: Todos os pesos recebidos! Iniciando agregação OTA..."
-                        )
-
-                        from v2v_fl.over_the_air.ota_aggregation import (
-                            ota_aggregate,
-                        )
-
-                        aggregation_started = time.monotonic()
-                        try:
-                            participant_states = {
-                                upload["client_id"]: upload["weights"]
-                                for upload in received_states
-                            }
-                            participant_states[args.client_idx] = snapshot
-                            train_samples = {
-                                upload["client_id"]: upload["train_samples"]
-                                for upload in received_states
-                            }
-                            train_samples[args.client_idx] = len(train_loader.dataset)
-                            diagnostics = {}
-                            snapshot = ota_aggregate(
-                                participant_states,
-                                positions,
-                                {
-                                    "x": positions[aggregator_id][0],
-                                    "y": positions[aggregator_id][1],
-                                    "n_antennas": 8,
-                                },
-                                train_samples=train_samples,
-                                local_client_id=aggregator_id,
-                                diagnostics=diagnostics,
-                            )
-                            metrics["ota_diagnostics"] = diagnostics
-
-                        finally:
-                            metrics["aggregation_time"] = time.monotonic() - aggregation_started
-                        # Carregar o modelo agregado no PyTorch
-                        application_started = time.monotonic()
-                        if args.model in ["clip", "slm"]:
-                            if args.model == "clip":
-                                from lora_clip.sora import set_trainable_state_dict
-
-                                set_trainable_state_dict(model, snapshot)
-                            else:
-                                from lora_slm.sora import (
-                                    set_trainable_state_dict as set_trainable_state_dict_slm,
-                                )
-
-                                set_trainable_state_dict_slm(model, snapshot)
-                        else:
-                            model.load_state_dict(snapshot)
-
-                    # ── TRANSMISSOR: Apenas carrega o modelo recebido do Aggregator ──
-                    else:
-                        logger.info(
-                            f"Client {args.client_idx}: Pesos consolidados recebidos do Aggregator!"
-                        )
-                        # O Transmissor recebe o modelo já agregado (OTA + local do Aggregator)
-                        # e simplesmente o carrega como seu novo modelo local
-                        aggregated_state = received_states[0]["weights"]
-                        application_started = time.monotonic()
-
-                        if args.model in ["clip", "slm"]:
-                            for k in snapshot:
-                                snapshot[k].copy_(aggregated_state[k].to(snapshot[k].dtype))
-                            if args.model == "clip":
-                                from lora_clip.sora import set_trainable_state_dict
-
-                                set_trainable_state_dict(model, snapshot)
-                            else:
-                                from lora_slm.sora import (
-                                    set_trainable_state_dict as set_trainable_state_dict_slm,
-                                )
-
-                                set_trainable_state_dict_slm(model, snapshot)
-                        else:
-                            for k in snapshot:
-                                snapshot[k] = aggregated_state[k].to(snapshot[k].dtype)
-                            model.load_state_dict(snapshot)
-
-                    record_elapsed(timings, "application_time", application_started)
-                    metrics["applied"] = True
-                    if is_aggregator:
-                        preparation_timings = timings.setdefault("result_preparation", {})
-                        result_frame = prepare_v2v_frame(
-                            "RESULT", run_id=encounter_data["run_id"],
-                            client_id=args.client_idx, encounter_id=enc_id, weights=snapshot,
-                            timings=preparation_timings,
-                        )
-
-                        def result_sent(client_id, count, metrics=metrics, enc_id=enc_id):
-                            metrics["sent_download_bytes"] += count
-                            rs_p2p_data_sent_mb.append(count / (1024 * 1024))
-                            rs_p2p_data_sent_enc_ids.append(enc_id)
-
-                        fanout_started = time.monotonic()
-                        try:
-                            send_v2v_results(
-                                result_frame, other_clients, deadline=exchange_deadline,
-                                cancelled=cancelled,
-                                timings=timings.setdefault("sent_transfers", {}),
-                                completed=result_sent,
-                            )
-                        finally:
-                            record_elapsed(timings, "result_fanout_time", fanout_started)
-                        del result_frame
-                    # Nenhuma thread pode manter pesos ou alterar métricas após a aplicação.
-                    receiver.close()
-                    received_states.clear()
-                    if is_aggregator:
-                        participant_states.clear()
-                    else:
-                        aggregated_state.clear()
-                    snapshot.clear()
-
-                    metrics.update(
-                        applied=True,
-                        status="applied",
-                        protocol_time=time.monotonic() - encounter_started,
-                    )
-                    write_json_atomic(
-                        metrics,
-                        encounters_dir / f".applied_enc_{enc_id}_client_{args.client_idx}.json",
-                    )
-                    # ── FASE 7: Avaliação Pós-Agregação ──────────────────────
-                    if not args.skip_post_eval:
-                        evaluation_started = time.monotonic()
-                        try:
-                            post_p2p_acc, _ = evaluate_model(model, test_loader)
-                        finally:
-                            metrics["evaluation_time"] = time.monotonic() - evaluation_started
-                        if not math.isfinite(post_p2p_acc):
-                            raise ValueError("A avaliação pós-V2V retornou uma acurácia inválida.")
-                        metrics["accuracy_after"] = float(post_p2p_acc)
-                        logger.info(
-                            f"Client {args.client_idx}: Post-D-PSGD Test Accuracy: {post_p2p_acc:.2f}%"
-                        )
-                        rs_post_p2p_acc.append(post_p2p_acc)
-                        rs_post_p2p_encounter_ids.append(enc_id)
-
-                    metrics["status"] = "completed"
-                    # Registrar métricas OTA deste encontro (dentro ou fora do skip_post_eval)
-                    rs_ota_encounter_epochs.append(epoch)
-                    rs_ota_mean_distances.append(enc_mean_distance)
-                    rs_ota_is_aggregator.append(1 if is_aggregator else 0)
-
-                    save_results(
-                        args,
-                        rs_global_acc,
-                        rs_global_loss,
-                        rs_ala_acc,
-                        rs_local_acc,
-                        rs_train_acc,
-                        idx=args.client_idx,
-                        argalgo=args.ala,
-                        rs_post_p2p_acc=rs_post_p2p_acc,
-                        rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
-                        rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-                        rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
-                        rs_ota_encounter_epochs=rs_ota_encounter_epochs,
-                        rs_ota_mean_distances=rs_ota_mean_distances,
-                        rs_ota_is_aggregator=rs_ota_is_aggregator,
-                    )
-
-                    # Sinalizar ao SUMO que a troca terminou
-                    write_json_atomic(
-                        metrics, encounters_dir / f".done_enc_{enc_id}_client_{args.client_idx}"
-                    )
-                    logger.info(
-                        f"Client {args.client_idx}: Agregacao concluida. .done_enc enviado."
-                    )
-                else:
-                    raise TimeoutError(f"Pesos V2V incompletos: {len(received_states)} recebidos.")
-            except Exception as exc:
-                encounter_failure = str(exc) or type(exc).__name__
-                if receiver is not None:
-                    receiver.close()
-                    byte_key = (
-                        "received_upload_bytes" if metrics["is_aggregator"] else "download_bytes"
-                    )
-                    metrics[byte_key] = sum(receiver.byte_counts.values())
-                    metrics["timings"]["received_transfers"] = receiver.timings
-                if metrics["status"] == "pending":
-                    metrics["protocol_time"] = time.monotonic() - encounter_started
-                metrics.update(status="failed", error=encounter_failure)
-                write_v2i_failure(
-                    encounters_dir, encounter_data, args.client_idx, encounter_failure, metrics
-                )
-                logger.error("Falha no encontro V2V %d: %s", enc_id, encounter_failure)
-                break
-            finally:
-                if receiver is not None:
-                    receiver.close()
-
-            last_processed_encounter = enc_id
-            epoch += 1
-
-        # Ao final do max_epochs ou simulation_done
-        logger.info(f"Client {args.client_idx}: Loop descentralizado finalizado.")
-        save_results(
-            args,
-            rs_global_acc,
-            rs_global_loss,
-            rs_ala_acc,
-            rs_local_acc,
-            rs_train_acc,
-            idx=args.client_idx,
-            argalgo=args.ala,
-            rs_post_p2p_acc=rs_post_p2p_acc,
-            rs_post_p2p_encounter_ids=rs_post_p2p_encounter_ids,
-            rs_p2p_data_sent_mb=rs_p2p_data_sent_mb,
-            rs_p2p_data_sent_enc_ids=rs_p2p_data_sent_enc_ids,
-            rs_ota_encounter_epochs=rs_ota_encounter_epochs,
-            rs_ota_mean_distances=rs_ota_mean_distances,
-            rs_ota_is_aggregator=rs_ota_is_aggregator,
+    if args.mode == "centralized":
+        run_centralized_client(args, model, train_loader, test_loader, ala, run_config, history)
+    elif args.mode == "decentralized":
+        run_decentralized_client(
+            args, model, train_loader, test_loader, ala, test_majority_baseline, history
         )
-        if encounter_failure is not None:
-            raise RuntimeError(
-                f"Falha na execução descentralizada do cliente {args.client_idx}: "
-                f"{encounter_failure}"
-            )
-        logger.info("\nTraining completed!")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

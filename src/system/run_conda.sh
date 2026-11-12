@@ -70,9 +70,9 @@ Uso: conda activate puma && ./run_conda.sh [opções]
   --num-classes N              Classes (inferidas para os datasets conhecidos)
   --batch-size N               Tamanho do lote no servidor e nos clientes (32)
   --max-clients N              Fila TCP do servidor (padrão de pelo menos 10)
-  -m, --model cnn|clip|slm     Modelo (cnn)
+  -m, --model cnn|clip|slm|lfm Modelo (cnn)
   --strategy ESTRATÉGIA        lora, adalora, sora_with_schedule ou sora_no_schedule
-  --config ARQUIVO             YAML de modelo (padrão em lora_clip/ ou lora_slm/)
+  --config ARQUIVO             YAML de modelo (padrão em lora_clip/, lora_slm/ ou lora_lfm/)
   --rank N                     Rank inicial dos adaptadores (8)
   --device auto|cuda|cpu|mps   Dispositivo (auto)
   -did, --device-id ID         GPU usada por todos os processos
@@ -101,6 +101,7 @@ Uso: conda activate puma && ./run_conda.sh [opções]
   --skip-train-eval            Pular avaliação local do conjunto de treino
   --skip-post-eval             Pular avaliações locais após o treino
   --delta-coding               Usar compressão LHDQ
+  --qlora                      Ativar QLoRA 4-bit NF4 (slm/lfm + lora)
   --help                       Exibir esta ajuda
 EOF
 }
@@ -149,7 +150,10 @@ while (( $# )); do
             SERVER_FLAGS+=("$1"); shift; continue ;;
         --skip-train-eval|--skip-post-eval)
             CLIENT_FLAGS+=("$1"); shift; continue ;;
-        --delta-coding)
+        --straggler-idx|--straggler-delay|--straggler-round)
+            [[ -n ${2-} && $2 != -* ]] || die "Informe o valor de $1."
+            CLIENT_FLAGS+=("$1" "$2"); shift 2; continue ;;
+        --delta-coding|--qlora)
             SERVER_FLAGS+=("$1"); CLIENT_FLAGS+=("$1"); shift; continue ;;
         --save|--load)
             action=$1
@@ -179,6 +183,7 @@ case "$DATASET" in
     MNIST|Cifar10|FashionMNIST) NUM_CLASSES=${NUM_CLASSES:-10} ;;
     OxfordPets) NUM_CLASSES=${NUM_CLASSES:-37} ;;
     DTD) NUM_CLASSES=${NUM_CLASSES:-47} ;;
+    Banking77) NUM_CLASSES=${NUM_CLASSES:-77} ;;
     Flowers102) NUM_CLASSES=${NUM_CLASSES:-102} ;;
     *) NUM_CLASSES=${NUM_CLASSES:-100} ;;
 esac
@@ -186,6 +191,7 @@ case "$MODEL" in
     cnn) PACA=${PACA:-12} ;;
     clip) PACA=${PACA:-12}; CONFIG_FILE=${CONFIG_FILE:-lora_clip/train_config.yml} ;;
     slm) PACA=${PACA:-28}; CONFIG_FILE=${CONFIG_FILE:-lora_slm/train_config.yml} ;;
+    lfm) PACA=${PACA:-24}; CONFIG_FILE=${CONFIG_FILE:-lora_lfm/train_config.yml} ;;
     *) die "Modelo inválido: $MODEL" ;;
 esac
 case "$STRATEGY" in
@@ -325,6 +331,7 @@ if [[ -z $EXP_NAME ]]; then
     fi
     if (( ADAPTIVE_RANK )); then EXP_NAME+=_adaptrank; fi
     if [[ " ${SERVER_FLAGS[*]} " == *' --delta-coding '* ]]; then EXP_NAME+=_deltacoding; fi
+    if [[ " ${SERVER_FLAGS[*]} " == *' --qlora '* ]]; then EXP_NAME+=_qlora; fi
 fi
 RESULTS_DIR="$SCRIPT_DIR/../results/$EXP_NAME"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

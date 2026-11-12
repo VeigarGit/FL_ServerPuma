@@ -8,7 +8,8 @@ import argparse
 import sys
 import os
 import logging
-import math
+import json
+from contextlib import suppress
 from pathlib import Path
 
 # Desativa checagem online redundante do Hugging Face Hub (usa cache local instantaneamente)
@@ -19,9 +20,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 import numpy as np
-import h5py
 
 #Para o Lora
 from lora_clip.clip_setup import (
@@ -42,6 +41,7 @@ from lora_slm.slm_setup import (
     build_run_config as build_run_config_slm, build_model as build_model_slm
 )
 from lora_slm.sora import get_trainable_state_dict as get_trainable_state_dict_slm
+from lora_slm.qlora import enable_qlora_in_config, get_qlora_state_dict, set_qlora_state_dict
 
 
 # --- HACK PERMITIDO: Inserindo a pasta 'src' no path do Python ---
@@ -52,15 +52,17 @@ if str(parent_dir) not in sys.path:
 # -----------------------------------------------------------------
 
 from model import SimpleModel
-from utils.data_utils import read_client_data
 from prunning import prune_and_restructure
-from size_mode import get_model_size, get_trainable_size_and_params
+from size_mode import get_trainable_size_and_params
 from synexp import LayerComplexityCalculator
 from prunning_nisp import prune_fc1
 from prunning_snip import snip_pruning, apply_mask
 from utils.network_utils import send_data, recv_data
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
 from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
+from server_puma import PumaEngineMixin
+from server_alignment import ServerAlignmentMixin
+from server_data import ServerDataMixin, get_state_dict_size_mb
 
 # --- CONFIGURAÇÃO DE OBSERVABILIDADE (LOGGING) ---
 logging.basicConfig(
@@ -71,32 +73,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 # -------------------------------------------------
 
-def get_state_dict_size_mb(state):
-    """Calcula matematicamente o tamanho em MB sem serializar em pickle, evitando travar o GIL e a CPU."""
-    total_bytes = 0
-    if hasattr(state, 'state_dict'):
-        state = state.state_dict()
-        
-    if isinstance(state, dict) and state.get('__lhdq__'):
-        for k, v in state['keys'].items():
-            if 'raw' in v:
-                total_bytes += v['raw'].numel() * v['raw'].element_size()
-            else:
-                total_bytes += len(v['packed']) + 4  # 4 bytes for mu/sigma (float16)
-    elif isinstance(state, dict):
-        for v in state.values():
-            if isinstance(v, torch.Tensor):
-                total_bytes += v.numel() * v.element_size()
-            elif isinstance(v, dict) and v.get('dtype') == 'quantized_int8':
-                if 'weights' in v and isinstance(v['weights'], torch.Tensor):
-                    total_bytes += v['weights'].numel() * v['weights'].element_size()
-                if 'scale' in v and isinstance(v['scale'], torch.Tensor):
-                    total_bytes += v['scale'].numel() * v['scale'].element_size()
-            elif isinstance(v, (int, float)):
-                total_bytes += 8
-    return total_bytes / (1024 * 1024)
-
-class FederatedLearningServer:
+class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataMixin):
     def __init__(self, args):
         self.args = args
         self.config = None
@@ -143,6 +120,12 @@ class FederatedLearningServer:
                 elif args.strategy == 'adalora':
                     print("Linha AdaLoRA =========================================")
                     config["model"]["lora"]["mode"] = "with_adalora"
+
+                if getattr(args, 'qlora', False):
+                    if args.model != 'slm':
+                        raise ValueError("--qlora é suportado apenas com --model slm")
+                    enable_qlora_in_config(config, args.strategy)
+                    logger.info("QLoRA ATIVADO: backbone 4-bit NF4 (não agregado), FedAvg só nos adaptadores LoRA 16 bits.")
                     
                 if "paca" not in config["model"]:
                     config["model"]["paca"] = {}
@@ -188,25 +171,72 @@ class FederatedLearningServer:
                         self.slm_collator = CustomCollator(processor, label_to_idx)
                     except Exception as e:
                         logger.warning(f"Não foi possível pré-carregar CustomCollator para SLM na inicialização: {e}")
+            case 'lfm':
+                import yaml
+                from lora_lfm.lfm_setup import LFMCollator, setup_lfm_model
+
+                config_path = (
+                    Path(args.config) if args.config else Path("src/system/lora_lfm/train_config.yml")
+                )
+                if not config_path.exists():
+                    config_path = Path("lora_lfm/train_config.yml")
+                with config_path.open("r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+                self.config = config
+
+                if args.rank:
+                    config["model"]["lora"]["r"] = args.rank
+                    config["model"]["lora"]["alpha"] = 2 * args.rank
+
+                if args.paca is not None and args.paca > 0:
+                    config["model"]["paca"]["enabled"] = True
+                    config["model"]["paca"]["upper_layers"] = args.paca
+                else:
+                    config["model"]["paca"]["enabled"] = False
+                    config["model"]["paca"]["upper_layers"] = None
+
+                config["is_qlora"] = bool(getattr(args, "qlora", False))
+                self.global_model, tokenizer = setup_lfm_model(
+                    config, args.device, is_qlora=bool(getattr(args, "qlora", False))
+                )
+                self.input_size = None
+                self.lfm_collator = LFMCollator(tokenizer.pad_token_id)
+                self.lfm_tokenizer = tokenizer
                         
                         
+        self.qlora = getattr(args, 'qlora', False)
+
         if args.load_model:
             logger.info(f"Carregando pesos salvos de: {args.load_model}")
             state_dict = torch.load(args.load_model, map_location=args.device)
             
-            # 1. Redimensiona a arquitetura do modelo em memória para o tamanho podado
-            self.global_model = resize_model_to_pruned(self.global_model, state_dict)
-            
-            # 2. Agora os formatos coincidem, podemos carregar os pesos com segurança
-            self.global_model.load_state_dict(state_dict, strict=False)
-            self.global_state = self.global_model.state_dict()
+            if self.args.model == 'lfm':
+                from lora_lfm.lfm_setup import set_lfm_state_dict
+                set_lfm_state_dict(self.global_model, state_dict)
+            elif self.qlora:
+                # QLoRA: o checkpoint contém apenas adaptadores + head
+                set_qlora_state_dict(self.global_model, state_dict)
+            else:
+                # 1. Redimensiona a arquitetura do modelo em memória para o tamanho podado
+                self.global_model = resize_model_to_pruned(self.global_model, state_dict)
+                
+                # 2. Agora os formatos coincidem, podemos carregar os pesos com segurança
+                self.global_model.load_state_dict(state_dict, strict=False)
+                self.global_state = self.global_model.state_dict()
                 
 
-        self.global_model = self.global_model.to(args.device)
+        if not self.qlora:  # QLoRA: backbone 4-bit já alocado via device_map
+            self.global_model = self.global_model.to(args.device)
         self.rs_test_acc = []
         self.rs_test_loss = []
         self.rs_aux_simple_avg_acc = []  # Média simples das acurácias reportadas pelos clientes (usada pelo PaCA/Rank adaptativo)
-        self.global_state = self.global_model.state_dict()
+        # QLoRA / PEFT: o estado agregável contém SOMENTE adaptadores LoRA + head (backbone nunca é agregado)
+        if self.args.model == 'lfm':
+            self.global_state = self._lfm_trainable_state(trainable_only=False)
+        elif self.qlora:
+            self.global_state = get_qlora_state_dict(self.global_model, trainable_only=False)
+        else:
+            self.global_state = self.global_model.state_dict()
         self.lock = threading.Lock()
         self.client_data = {}
         self.client_connections = []
@@ -237,14 +267,15 @@ class FederatedLearningServer:
         # Performance tracking variables
         self.time_threshold = 0.0
         self.mean_training_time = 0.0
+        self.current_server_round = 0
         
         # LHDQ: cache do estado anterior por cliente (para delta coding)
         self.previous_sent_state = {}   # client_id → state_dict enviado na rodada anterior
         self.previous_recv_state = {}   # client_id → state_dict recebido na rodada anterior
         
-        if self.args.model == 'slm':
+        if self.args.model in ['slm', 'lfm']:
             alpha_list, beta_list = [0], [0]
-            logger.info("Cálculo de complexidade ignorado para SLM (forward multimodal complexo).")
+            logger.info("Cálculo de complexidade ignorado para SLM/LFM.")
         else:
             calculator = LayerComplexityCalculator(self.global_model, self.input_size)
             alpha_list, beta_list = calculator.calculate_alpha_beta()
@@ -264,6 +295,10 @@ class FederatedLearningServer:
             from lora_slm.slm_setup import _get_encoder_layers
             layers = _get_encoder_layers(self.global_model)
             self.total_encoder_layers = len(layers) if layers else self.args.paca
+        elif self.args.model == 'lfm':
+            from lora_lfm.lfm_setup import _get_encoder_layers
+            layers = _get_encoder_layers(self.global_model)
+            self.total_encoder_layers = len(layers) if layers else (self.args.paca or 24)
         else:
             self.total_encoder_layers = self.args.paca  # fallback
         logger.info(f"Total encoder layers detectado: {self.total_encoder_layers}")
@@ -271,11 +306,26 @@ class FederatedLearningServer:
         # Dicionário para armazenar máscaras por cliente
         self.client_masks = {}
         
-        self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
-        if self.test_loader is not None:
-            self.test_loaders_cache[args.test_client_idx if args.test_client_idx is not None else 0] = self.test_loader
+        if args.model in ['slm', 'lfm']:
+            self.test_loader = None
+            logger.info(f"Modelo {args.model}: Avaliação global configurada via agregação federada ponderada dos clientes (Zero Data Leakage).")
         else:
-            logger.warning("Could not load test data. Evaluation will be skipped.")
+            self.test_loader = self.load_test_data(args.dataset, args.test_client_idx, args.batch_size)
+            if self.test_loader is not None:
+                self.test_loaders_cache[args.test_client_idx if args.test_client_idx is not None else 0] = self.test_loader
+            else:
+                logger.warning("Could not load test data. Evaluation will be skipped.")
+
+    def _slm_trainable_state(self):
+        """Estado do SLM que trafega/é salvo. No QLoRA: apenas adaptadores LoRA 16 bits + head."""
+        if self.qlora:
+            return get_qlora_state_dict(self.global_model, trainable_only=False)
+        return get_trainable_state_dict_slm(self.global_model)
+
+    def _lfm_trainable_state(self, trainable_only: bool = False):
+        """Estado do LFM que trafega/é salvo (apenas adaptadores LoRA + DecisionHead)."""
+        from lora_lfm.lfm_setup import get_lfm_state_dict
+        return get_lfm_state_dict(self.global_model, trainable_only=trainable_only)
 
     def aggregate_models(self, model_list, global_model, client_weights=None):
         agg_state = global_model.copy()
@@ -311,135 +361,50 @@ class FederatedLearningServer:
                         weight = normalized_weights[idx]
                         
                         if weighted_sum is None:
-                            weighted_sum = torch.zeros_like(aligned_val)
+                            # Acumula em fp32 quando os tensores são 16 bits (ex.: adaptadores QLoRA bf16)
+                            out_dtype = aligned_val.dtype
+                            acc_dtype = torch.float32 if out_dtype in (torch.float16, torch.bfloat16) else out_dtype
+                            weighted_sum = torch.zeros_like(aligned_val, dtype=acc_dtype)
                         
-                        weighted_sum += aligned_val * weight
+                        weighted_sum += aligned_val.to(weighted_sum.dtype) * weight
                         total_weight_for_key += weight
             
             if weighted_sum is not None and total_weight_for_key > 0:
-                agg_state[key] = weighted_sum / total_weight_for_key
+                agg_state[key] = (weighted_sum / total_weight_for_key).to(out_dtype)
         
         return agg_state
-    
-    def _are_compatible_with_pruning(self, local_val, global_val, key):
-        if not hasattr(local_val, 'shape') or not hasattr(global_val, 'shape'):
-            try:
-                len_local = len(local_val) if hasattr(local_val, '__len__') else 1
-                len_global = len(global_val) if hasattr(global_val, '__len__') else 1
-                return len_local == len_global
-            except TypeError:
-                return True
-        
-        if local_val.ndim != global_val.ndim:
-            return False
-        
-        if 'conv' in key and 'weight' in key:
-            if local_val.ndim == 4:
-                return local_val.shape[2:] == global_val.shape[2:]
-        elif 'weight' in key and local_val.ndim == 2:
-            return True
-            
-        return local_val.ndim == global_val.ndim
-    
-    def _align_to_global_structure(self, local_val, global_val, key, model_state, client_idx):
-        if local_val.shape == global_val.shape:
-            return local_val
-        
-        if client_idx in self.client_masks and key in self.client_masks[client_idx]:
-            return self._align_with_mask(local_val, global_val, self.client_masks[client_idx][key])
-        
-        if 'conv' in key and 'weight' in key and local_val.ndim == 4:
-            return self._align_conv_weights(local_val, global_val)
-        elif ('weight' in key or 'lora_' in key or 'gate' in key) and local_val.ndim == 2:
-            return self._align_linear_weights(local_val, global_val)
-        elif 'bias' in key and local_val.ndim == 1:
-            return self._align_bias(local_val, global_val)
-        
-        logger.warning(f"Não foi possível alinhar {key}. Usando valor local.")
-        return local_val
-    
-    def _align_with_mask(self, local_val, global_val, mask_info):
-        aligned = torch.zeros_like(global_val)
-        if 'indices' in mask_info:
-            indices = mask_info['indices']
-            if len(indices) == len(local_val):
-                for i, idx in enumerate(indices):
-                    if idx is not None:
-                        aligned[idx] = local_val[i]
-        else:
-            slices = tuple(slice(0, min(l, g)) for l, g in zip(local_val.shape, global_val.shape))
-            aligned[slices] = local_val[slices]
-        return aligned
 
-    def _get_mask(self, local_val, global_val):
-        mask = torch.zeros_like(global_val)
-        if local_val.ndim == 2:
-            min_out = min(local_val.shape[0], global_val.shape[0])
-            min_in = min(local_val.shape[1], global_val.shape[1])
-            mask[:min_out, :min_in] = 1.0
-        elif local_val.ndim == 1:
-            min_len = min(local_val.shape[0], global_val.shape[0])
-            mask[:min_len] = 1.0
-        elif local_val.ndim == 4:
-            min_out = min(local_val.shape[0], global_val.shape[0])
-            min_in = min(local_val.shape[1], global_val.shape[1])
-            mask[:min_out, :min_in, :, :] = 1.0
-        return mask
-    
-    def _align_conv_weights(self, local_val, global_val):
-        if local_val.ndim != 4 or global_val.ndim != 4:
-            return local_val
-        
-        local_out, local_in, kh, kw = local_val.shape
-        global_out, global_in, kh_global, kw_global = global_val.shape
-        
-        if kh != kh_global or kw != kw_global:
-            logger.warning("Kernel size incompatível para convolução")
-            return local_val
-        
-        aligned = torch.zeros_like(global_val)
-        min_out = min(local_out, global_out)
-        min_in = min(local_in, global_in)
-        aligned[:min_out, :min_in, :, :] = local_val[:min_out, :min_in, :, :]
-        return aligned
-    
-    def _align_linear_weights(self, local_val, global_val):
-        if local_val.ndim != 2 or global_val.ndim != 2:
-            return local_val
-        
-        local_out, local_in = local_val.shape
-        global_out, global_in = global_val.shape
-        
-        aligned = torch.zeros_like(global_val)
-        min_out = min(local_out, global_out)
-        min_in = min(local_in, global_in)
-        aligned[:min_out, :min_in] = local_val[:min_out, :min_in]
-        return aligned
-    
-    def _align_bias(self, local_val, global_val):
-        if local_val.ndim != 1 or global_val.ndim != 1:
-            return local_val
-        
-        aligned = torch.zeros_like(global_val)
-        min_len = min(local_val.shape[0], global_val.shape[0])
-        aligned[:min_len] = local_val[:min_len]
-        return aligned
-    
-    
-    def recvall(self, conn, n):
-        data = b'' 
-        while len(data) < n:
-            packet = conn.recv(n - len(data))
-            if not packet:
-                return None
-            data += packet
-        return data
-    
+    def _deactivate_client(self, client_id, conn, *, shutdown: bool = True) -> None:
+        """Marca um cliente como inativo e encerra seu socket com tolerância a erros."""
+        self.clients_info[client_id]['active'] = False
+        if shutdown:
+            with suppress(OSError):
+                conn.shutdown(socket.SHUT_RDWR)
+        with suppress(OSError):
+            conn.close()
+
+    def _cleanup_pending_round_threads(
+        self, round_num, active_round_threads, round_cancel_event, *, log_timeout: bool = True
+    ) -> None:
+        """Sinaliza cancelamento e encerra threads de clientes bloqueadas ao fim da rodada."""
+        round_cancel_event.set()
+        for cid, conn, thread in active_round_threads:
+            if thread.is_alive():
+                if log_timeout:
+                    logger.warning(
+                        f"Round {round_num}: Cliente {cid} não respondeu até o fim da "
+                        "rodada. Encerrando conexão e thread."
+                    )
+                self._deactivate_client(cid, conn)
+                thread.join(timeout=2.0)
+
     def set_threshold(self):
         tot_time = 0
         clients_with_time = 0
         max_client_time = 0.0
         for info in self.clients_info.values():
+            if not info.get('active', True):
+                continue
             t_train = info.get('training_time', 0.0) or 0.0
             t_eval = info.get('client_eval_time', 0.0) or 0.0
             t_proc = info.get('server_processing_time', 0.0) or 0.0
@@ -463,417 +428,65 @@ class FederatedLearningServer:
         # Utilizada pelo PaCA e Rank adaptativos para identificar stragglers relativos
         self.target_latency = mean_time * 1.15
         
-        # Pisos de segurança por tipo de modelo para evitar colapso de timeout em rodadas pontualmente rápidas
-        if self.args.model == 'slm':
-            min_floor = 1200.0
-            multiplier = 2.5
+        # Pisos físicos realistas por tipo de modelo para evitar colapso de timeout
+        if self.args.model in ['slm', 'lfm']:
+            min_floor = 240.0
         elif self.args.model == 'clip':
-            min_floor = 300.0
-            multiplier = 2.0
-        else:
             min_floor = 60.0
-            multiplier = 1.5
-            
-        calculated_threshold = max(min_floor, multiplier * mean_time, 1.5 * max_client_time)
-        
-        # Amortecimento: impede quedas bruscas de timeout entre rodadas
-        if hasattr(self, 'time_threshold') and self.time_threshold is not None:
-            self.time_threshold = max(calculated_threshold, self.time_threshold * 0.8, min_floor)
+        else:
+            min_floor = 15.0
+
+        # Limiar realista alinhado ao PUMA-GT Plus: 1.5x a meta de latência (ou 1.25x o pior)
+        calculated_threshold = max(
+            min_floor, 1.50 * self.target_latency, 1.25 * max_client_time
+        )
+
+        # Amortecimento ágil: impede quedas bruscas, permitindo redução de até 40% por rodada
+        if getattr(self, 'time_threshold', 0) and self.time_threshold > 0:
+            self.time_threshold = max(
+                calculated_threshold, self.time_threshold * 0.60, min_floor
+            )
         else:
             self.time_threshold = calculated_threshold
-            
-        logger.info(f"Limiares definidos: timeout_socket={self.time_threshold:.2f}s | target_latency={self.target_latency:.2f}s (mean_time={mean_time:.2f}s)")
+
+        logger.info(
+            f"Limiares definidos: timeout_socket={self.time_threshold:.2f}s | "
+            f"target_latency={self.target_latency:.2f}s (mean_time={mean_time:.2f}s)"
+        )
     
-    def new_set_amount_prune(self, client_id):
-        """
-        Calcula a taxa de poda estruturada para CNNs usando o Índice de Capacidade γ^c.
-        
-        p^c = 1 - γ^c, clamped em [0.20, 0.85]
-        
-        Mantém o ajuste histórico da Equação (5) do artigo PUMA (ISCC 2026)
-        para correção de instabilidades temporais.
-        """
-        gamma = self.calculate_capacity_index(client_id)
-        pruning_rate = 1.0 - gamma  # γ=1.0 → 0% poda, γ=0.2 → 80% poda
-        pruning_rate = max(0.2, min(0.85, pruning_rate))
-        pruning_rate = self._adjust_pruning_with_history(client_id, pruning_rate)
-        logger.debug(f"Pruning rate γ-driven {client_id}: {pruning_rate:.3f} (γ={gamma:.3f})")
-        return pruning_rate
-
-    def calculate_capacity_index(self, client_id):
-        """
-        Calcula o Índice de Capacidade γ^c ∈ [γ_min, 1.0] para um cliente.
-        
-        Fórmula:
-            γ^c = clamp(η^c × ψ^c, γ_min, 1.0)
-        
-        Onde:
-            η^c = T_target / T_full^c   (viabilidade de tempo e rede, Eq. 4 do PUMA ISCC 2026)
-            ψ^c = (Acc_avg / Acc^c)^δ   (fator de necessidade de qualidade/acurácia)
-        
-        Dinâmica do fator de qualidade (ψ^c):
-            - Clientes com acurácia abaixo da média (Acc^c < Acc_avg) necessitam de MAIS
-              capacidade de modelo (ψ > 1.0) para convergir sobre dados heterogêneos locais,
-              prevenindo o ciclo vicioso de compressão punitiva.
-            - Clientes com acurácia acima da média (Acc^c >= Acc_avg) já convergiram bem
-              e toleram maior compressão estrutural (ψ <= 1.0).
-            - Clientes com alta perda local (loss local > 1.2 * loss global) têm sua
-              capacidade preservada.
-        
-        Variáveis de entrada (client_info):
-            - training_time   → T^c
-            - dataset_size    → |D^c|
-            - bandwidth       → B^c (MB/s)
-            - acc_history[-1] → Acc^c
-            - last_loss       → Loss^c
-        
-        Retorna:
-            float: γ^c no intervalo [γ_min, 1.0]
-        """
-        gamma_min = 0.15  # Piso de segurança (evita colapso total de capacidade)
-        
-        try:
-            client_info = self.clients_info[client_id]
-        except KeyError:
-            return 1.0
-        
-        training_time = client_info.get('training_time')
-        bandwidth = client_info.get('bandwidth')
-        dataset_size = max(client_info.get('dataset_size', 1.0), 1.0)
-        acc_history = client_info.get('acc_history', [])
-        comm_time = client_info.get('comm_time')
-        eval_time = client_info.get('client_eval_time', 0.0) or 0.0
-        proc_time = client_info.get('server_processing_time', 0.0) or 0.0
-        
-        # Sem dados suficientes na primeira rodada, retorna capacidade máxima
-        if training_time is None or training_time <= 0:
-            self.clients_info[client_id]['capacity_index'] = 1.0
-            return 1.0
-        
-        # ── TERMO 1: Restrição Física de Tempo e Rede (η^c) ──────────────
-        # Evolução da Equação (4) do PUMA (ISCC 2026):
-        #   η^c = T_target / T_full^c
-        #
-        # Onde T_full^c é a latência total real do cliente (computação + transmissão + overheads):
-        #   T_full^c = T^c_treino + T^c_comm + T^c_eval + T^c_proc
-        #
-        # Correção da anomalia de medição:
-        # 1. Elimina a contagem dupla do tempo de treino que ocorria quando B^c embutia espera de socket.
-        # 2. Harmoniza a escala de T_full^c exatamente com a métrica de cluster em set_threshold()
-        #    (onde target_latency = mean_time * 1.15).
-        
-        target_latency = getattr(self, 'target_latency', getattr(self, 'time_threshold', 60.0))
-        tau_c = training_time / dataset_size  # Tempo por amostra (s/sample)
-        
-        # S_model: tamanho do modelo treinável em MB
-        if self.model_size_per_round:
-            s_model = self.model_size_per_round[-1]
-        else:
-            s_model = get_state_dict_size_mb(self.global_model)
-        
-        bw_safe = max(bandwidth, 0.01) if bandwidth is not None else 10.0
-        
-        # Latência pura de rede: prioriza comm_time medido pelo servidor; fallback teórico S_model / B^c
-        if comm_time is not None and comm_time >= 0:
-            t_comm = comm_time
-        else:
-            t_comm = s_model / bw_safe
-            
-        t_full = training_time + t_comm + eval_time + proc_time
-        
-        if t_full <= 0:
-            eta = 1.0
-        else:
-            # Clamping em 1.0: viabilidade de tempo física normalizada em [0, 1].
-            # Clientes com tempo excedente (T_full < T_target) têm 100% de capacidade temporal viável (1.0).
-            # Evita que tempo excedente neutralize o fator de platô ou o fator de necessidade.
-            eta = min(1.0, target_latency / t_full)
-        
-        # ── TERMO 2: Fator de Necessidade / Qualidade (ψ^c) ─────────────
-        # ψ^c = (Acc_avg / Acc^c)^δ
-        # Clientes com dificuldade recebem estímulo de capacidade (ψ > 1.0)
-        # Clientes bem consolidados toleram compressão (ψ <= 1.0)
-        
-        delta = getattr(self.args, 'gamma_delta', 0.5)  # Expoente de sensibilidade
-        
-        if acc_history and self.rs_aux_simple_avg_acc:
-            acc_c = acc_history[-1]
-            acc_avg = self.rs_aux_simple_avg_acc[-1] if self.rs_aux_simple_avg_acc[-1] > 0 else 1.0
-            
-            if acc_c > 0 and acc_avg > 0:
-                need_ratio = acc_avg / acc_c
-                # Clamping da razão para manter estabilidade numérica [0.80, 1.35]
-                need_ratio = max(0.8, min(1.35, need_ratio))
-                psi = need_ratio ** delta
-            else:
-                psi = 1.0
-        else:
-            psi = 1.0  # Sem histórico de acurácia, neutro
-            
-        # Proteção adicional por Loss: clientes com alta perda relativa aos demais
-        # (dados heterogêneos/não-IID desafiadores) recebem reforço de capacidade
-        client_loss = client_info.get('last_loss', 0.0) or 0.0
-        global_loss = self.rs_test_loss[-1] if self.rs_test_loss else 0.0
-        if client_loss > 0 and global_loss > 0 and client_loss > global_loss * 1.2:
-            psi = max(psi, 1.15)
-        
-        # ── TERMO 3: Fator de Platô e Maturação (ϕ^c) ─────────────────────
-        # Quando a acurácia atinge alto desempenho estável (platô de convergência),
-        # as representações essenciais já estão consolidadas e o cliente tolera
-        # compressão oportunista de adaptadores (PaCA e Rank) para economizar banda.
-        window = 5
-        current_round = len(self.rs_aux_simple_avg_acc)
-        eval_history = acc_history if len(acc_history) >= window else self.rs_aux_simple_avg_acc
-        
-        if current_round >= 12 and len(eval_history) >= window:
-            recent_accs = eval_history[-window:]
-            mean_acc = sum(recent_accs) / window
-            std_acc = (sum((x - mean_acc) ** 2 for x in recent_accs) / window) ** 0.5
-            best_acc = max(eval_history) if eval_history else 0.0
-            
-            # Critério de Platô:
-            # 1. Acurácia em alto nível (>= 90% do pico observado no histórico)
-            # 2. Desvio padrão baixo (< 1.8% ou variação relativa < 2.5%)
-            is_plateau = (mean_acc >= best_acc * 0.90) and (std_acc < 1.8 or (mean_acc > 0 and (std_acc / mean_acc) < 0.025))
-            
-            # FREIO DE ACURÁCIA: Proteção contra compressão destrutiva.
-            # Só atua quando o platô já acumulou rodadas significativas (>= 8),
-            # indicando que a compressão já ocorreu. Usa a acurácia global do servidor
-            # (mais estável que a acurácia individual do cliente em cenários não-IID)
-            # para evitar falsos positivos por variação natural entre rodadas.
-            plateau_rounds_current = client_info.get('plateau_rounds', 0)
-            if plateau_rounds_current >= 8 and len(self.rs_test_acc) >= 10:
-                global_recent = self.rs_test_acc[-5:]
-                global_mean = sum(global_recent) / len(global_recent)
-                global_peak = max(self.rs_test_acc[-10:])
-                if global_mean < global_peak - 3.0:
-                    is_plateau = False
-                    client_info['plateau_rounds'] = max(0, plateau_rounds_current - 3)
-                    logger.debug(
-                        f"PLATEAU BRAKE {client_id}: global acc {global_mean:.1f}% < "
-                        f"peak {global_peak:.1f}% - 3pp. plateau_rounds "
-                        f"{plateau_rounds_current} → {client_info['plateau_rounds']}"
-                    )
-            
-            # Atualiza contador de rodadas em platô (apenas uma vez por rodada por cliente)
-            last_checked = client_info.get('last_plateau_check_round', -1)
-            plateau_rounds = client_info.get('plateau_rounds', 0)
-            if last_checked != current_round:
-                client_info['last_plateau_check_round'] = current_round
-                if is_plateau:
-                    plateau_rounds += 1
-                else:
-                    plateau_rounds = max(0, plateau_rounds - 1)
-                client_info['plateau_rounds'] = plateau_rounds
-                
-            # Compressão gradual por platô:
-            # - Decaimento de 2.5% por rodada confirmada em platô
-            # - Piso seguro de platô: phi_min = 0.45
-            #   Com phi_min=0.45, γ mínimo ≈ 0.45, levando a rank ≈ 4 e PaCA ≈ 5-6
-            #   Permite compressão significativa para economia de banda,
-            #   protegido pelo Freio de Acurácia (acima) que reverte plateau_rounds
-            #   quando a acurácia cai >2pp do pico recente, e pelo Panic Reversal
-            #   (+2 imediato se acurácia cair >2pp) e Cooldown de 2 rodadas.
-            phi_min = getattr(self.args, 'plateau_phi_min', 0.45)
-            plateau_decay_rate = getattr(self.args, 'plateau_decay_rate', 0.025)
-            phi_plateau = max(phi_min, 1.0 - (plateau_rounds * plateau_decay_rate))
-        else:
-            phi_plateau = 1.0
-        
-        # ── COMPOSIÇÃO FINAL ─────────────────────────────────────────────
-        # γ^c = clamp(η^c × ψ^c × ϕ^c, γ_min, 1.0)
-        gamma = max(gamma_min, min(1.0, eta * psi * phi_plateau))
-        
-        # Salvar no client_info para logging e debug
-        self.clients_info[client_id]['capacity_index'] = gamma
-        self.clients_info[client_id]['eta'] = eta
-        self.clients_info[client_id]['psi'] = psi
-        self.clients_info[client_id]['phi_plateau'] = phi_plateau
-        
-        logger.debug(f"γ({client_id}): η={eta:.3f} × ψ={psi:.3f} × ϕ={phi_plateau:.3f} = γ={gamma:.3f} "
-                     f"(T={training_time:.1f}s, |D|={dataset_size}, B={bw_safe:.2f}MB/s, "
-                     f"T_target={target_latency:.1f}s, S={s_model:.2f}MB)")
-        
-        return gamma
-
-    def calculate_adaptive_paca(self, client_id):
-        """
-        Calcula o PaCA ideal para um cliente usando o Índice de Capacidade γ^c
-        com rede de segurança (Panic Reversal) e Cooldown de reduções.
-        
-        1. Panic Reversal: se a acurácia do cliente caiu >2pp após redução, reverte imediatamente (+2).
-        2. Cooldown: impede reduções consecutivas antes da estabilização (default: 3 rounds).
-        3. PaCA^c = round(γ^c × L_max), suavizado em ±2 camadas/round.
-        """
-        client_info = self.clients_info.get(client_id, {})
-        max_paca = self.args.paca
-        paca_min = getattr(self.args, 'adaptive_paca_min', 2)
-        current_paca = client_info.get('current_paca', max_paca)
-        acc_history = client_info.get('acc_history', [])
-        current_round = len(self.rs_aux_simple_avg_acc)
-        cooldown_rounds = getattr(self.args, 'adaptive_paca_cooldown', 2)
-        last_reduction_round = client_info.get('last_paca_reduction_round', -999)
-        
-        # ── 1. REDE DE SEGURANÇA: PANIC REVERSAL ─────────────────────────
-        paca_before = client_info.get('paca_before_change')
-        paca_acc_at_reduction = client_info.get('paca_acc_at_reduction')
-        if paca_before is not None and paca_before > current_paca and acc_history and paca_acc_at_reduction is not None:
-            recent_acc = acc_history[-1]
-            if recent_acc < paca_acc_at_reduction - 2.0:
-                reverted_paca = min(current_paca + 2, max_paca)
-                logger.warning(
-                    f"PANIC REVERSAL PaCA {client_id}: acurácia caiu de {paca_acc_at_reduction:.1f}% "
-                    f"para {recent_acc:.1f}%. Revertendo {current_paca} → {reverted_paca}!"
-                )
-                client_info['plateau_rounds'] = max(0, client_info.get('plateau_rounds', 0) - 3)
-                client_info['paca_before_change'] = None
-                client_info['paca_acc_at_reduction'] = None
-                client_info['last_paca_reduction_round'] = current_round
-                return reverted_paca
-            elif (current_round - last_reduction_round) >= cooldown_rounds:
-                # Estabilizou com sucesso na capacidade reduzida
-                client_info['paca_before_change'] = None
-                client_info['paca_acc_at_reduction'] = None
-        
-        # ── 2. CÁLCULO BASE VIA ÍNDICE DE CAPACIDADE γ ─────────────────────
-        gamma = self.calculate_capacity_index(client_id)
-        ideal_paca = round(gamma * max_paca)
-        ideal_paca = max(paca_min, min(max_paca, ideal_paca))
-        
-        # ── 3. COOLDOWN & SUAVIZAÇÃO DE TRANSIÇÃO ─────────────────────────
-        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
-        
-        if ideal_paca < current_paca:
-            if in_cooldown:
-                logger.debug(f"PaCA {client_id} em cooldown (round {current_round}, última redução: {last_reduction_round}). Mantendo {current_paca}")
-                return current_paca
-            # Suavização: limitar redução a no máximo -2 por rodada
-            ideal_paca = max(current_paca - 2, ideal_paca)
-            client_info['paca_before_change'] = current_paca
-            client_info['paca_acc_at_reduction'] = acc_history[-1] if acc_history else 0.0
-            client_info['last_paca_reduction_round'] = current_round
-            logger.info(f"PaCA γ-driven {client_id}: reduzindo {current_paca} → {ideal_paca} (γ={gamma:.3f})")
-        elif ideal_paca > current_paca:
-            # Subida/recuperação é permitida mesmo em cooldown quando as condições físicas/acurácia melhoram
-            ideal_paca = min(current_paca + 2, ideal_paca)
-            client_info['paca_before_change'] = None
-            client_info['paca_acc_at_reduction'] = None
-            logger.info(f"PaCA γ-driven {client_id}: subindo {current_paca} → {ideal_paca} (γ={gamma:.3f})")
-        
-        return ideal_paca
-
-    def calculate_adaptive_rank(self, client_id):
-        """
-        Calcula o Rank ideal para um cliente usando o Índice de Capacidade γ^c
-        com rede de segurança (Panic Reversal) e Cooldown de reduções.
-        
-        1. Panic Reversal: se a acurácia do cliente caiu >2pp após redução, reverte imediatamente (+2).
-        2. Cooldown: impede reduções consecutivas antes da estabilização (default: 3 rounds).
-        3. Rank^c = round(γ^c × R_max), suavizado em ±2 por round.
-        """
-        client_info = self.clients_info.get(client_id, {})
-        max_rank = getattr(self.args, 'adaptive_rank_max', 8)
-        min_rank = getattr(self.args, 'adaptive_rank_min', 4)
-        current_rank = client_info.get('current_rank', max_rank)
-        acc_history = client_info.get('acc_history', [])
-        current_round = len(self.rs_aux_simple_avg_acc)
-        cooldown_rounds = getattr(self.args, 'adaptive_rank_cooldown', 3)
-        last_reduction_round = client_info.get('last_rank_reduction_round', -999)
-        
-        # ── 1. REDE DE SEGURANÇA: PANIC REVERSAL ─────────────────────────
-        rank_before = client_info.get('rank_before_change')
-        rank_acc_at_reduction = client_info.get('rank_acc_at_reduction')
-        if rank_before is not None and rank_before > current_rank and acc_history and rank_acc_at_reduction is not None:
-            recent_acc = acc_history[-1]
-            if recent_acc < rank_acc_at_reduction - 2.0:
-                reverted_rank = min(current_rank + 2, max_rank)
-                logger.warning(
-                    f"PANIC REVERSAL Rank {client_id}: acurácia caiu de {rank_acc_at_reduction:.1f}% "
-                    f"para {recent_acc:.1f}%. Revertendo {current_rank} → {reverted_rank}!"
-                )
-                client_info['plateau_rounds'] = max(0, client_info.get('plateau_rounds', 0) - 3)
-                client_info['rank_before_change'] = None
-                client_info['rank_acc_at_reduction'] = None
-                client_info['last_rank_reduction_round'] = current_round
-                return reverted_rank
-            elif (current_round - last_reduction_round) >= cooldown_rounds:
-                # Estabilizou com sucesso no rank reduzido
-                client_info['rank_before_change'] = None
-                client_info['rank_acc_at_reduction'] = None
-        
-        # ── 2. CÁLCULO BASE VIA ÍNDICE DE CAPACIDADE γ ─────────────────────
-        gamma = self.calculate_capacity_index(client_id)
-        ideal_rank = round(gamma * max_rank)
-        ideal_rank = max(min_rank, min(max_rank, ideal_rank))
-        
-        # ── 3. COOLDOWN & SUAVIZAÇÃO DE TRANSIÇÃO ─────────────────────────
-        in_cooldown = (current_round - last_reduction_round) < cooldown_rounds
-        allow_upscale = getattr(self.args, 'allow_rank_upscale', True)
-        
-        if ideal_rank < current_rank:
-            if in_cooldown:
-                logger.debug(f"Rank {client_id} em cooldown (round {current_round}, última redução: {last_reduction_round}). Mantendo {current_rank}")
-                return current_rank
-            # Suavização do Rank: reduzir no máximo -1 por rodada para estabilidade
-            ideal_rank = max(current_rank - 1, ideal_rank)
-            client_info['rank_before_change'] = current_rank
-            client_info['rank_acc_at_reduction'] = acc_history[-1] if acc_history else 0.0
-            client_info['last_rank_reduction_round'] = current_round
-            logger.info(f"Rank γ-driven {client_id}: reduzindo {current_rank} → {ideal_rank} (γ={gamma:.3f})")
-        elif ideal_rank > current_rank:
-            if not allow_upscale:
-                return current_rank
-            ideal_rank = min(current_rank + 2, ideal_rank)
-            client_info['rank_before_change'] = None
-            client_info['rank_acc_at_reduction'] = None
-            logger.info(f"Rank γ-driven {client_id}: subindo {current_rank} → {ideal_rank} (γ={gamma:.3f})")
-        
-        return ideal_rank
-
-
-    def _is_excluded_by_paca(self, key, min_layer_idx):
-        """Retorna True se a chave pertence a uma camada ABAIXO do PaCA mínimo."""
-        if "encoder.layers." not in key and ".layers." not in key:
-            return False  # Head de classificação etc. sempre incluída
-        try:
-            if "encoder.layers." in key:
-                layer_idx = int(key.split("encoder.layers.")[1].split(".")[0])
-            elif ".layers." in key:
-                layer_idx = int(key.split(".layers.")[1].split(".")[0])
-            else:
-                return False
-            return layer_idx < min_layer_idx
-        except (ValueError, IndexError):
-            return False
-
-    # _fallback_prune_calculation foi substituído pelo calculate_capacity_index.
-    # O índice γ^c já lida com todos os cenários de fallback via clamping em [γ_min, 1.0].
-
-    def _adjust_pruning_with_history(self, client_id, base_pruning_rate):
-        try:
-            client_info = self.clients_info[client_id]
-        except KeyError:
-            return base_pruning_rate
-        
-        training_time = client_info.get('training_time', 0)
-        last_training_time = client_info.get('last_training_time', training_time)
-        client_info['last_training_time'] = training_time
-        
-        if training_time > last_training_time * 1.5:
-            adjustment = 0.05
-        elif training_time > self.time_threshold * 1.2:
-            adjustment = 0.03
-        else:
-            adjustment = 0.0
-        return max(0.2, min(0.85, base_pruning_rate + adjustment))
-    
-    def handle_client(self, conn, client_updates, client_weights, round_num, client_id, client_accuracies, client_losses):
+    def handle_client(
+        self,
+        conn,
+        client_updates,
+        client_weights,
+        round_num,
+        client_id,
+        client_accuracies,
+        client_losses,
+        round_closed_event=None,
+        round_cancel_event=None,
+        completed_clients=None,
+    ):
         bit_rate = []
         masks = []
         if 'socket_lock' not in self.clients_info[client_id]:
             self.clients_info[client_id]['socket_lock'] = threading.Lock()
             
-        self.clients_info[client_id]['socket_lock'].acquire()
+        lock_timeout = max(5.0, self.time_threshold if self.time_threshold > 0 else 60.0)
+        acquired = self.clients_info[client_id]['socket_lock'].acquire(timeout=lock_timeout)
+        if not acquired:
+            logger.warning(
+                f"Round {round_num}: Cliente {client_id} com socket_lock retido por "
+                "thread anterior. Desativando cliente."
+            )
+            self._deactivate_client(client_id, conn)
+            return
+
+        cancelled_fn = (
+            round_cancel_event.is_set if round_cancel_event is not None else None
+        )
+        base_timeout = self.time_threshold if self.time_threshold > 0 else 60.0
+        deadline = time.monotonic() + max(15.0, base_timeout * 1.5)
         try:
             start_time = time.time()
             logger.info(f"Round {round_num}: Handling client {client_id}")
@@ -885,12 +498,14 @@ class FederatedLearningServer:
                     if self.args.model == 'clip':
                         current_global_state = get_trainable_state_dict(self.global_model)
                     elif self.args.model == 'slm':
-                        current_global_state = get_trainable_state_dict_slm(self.global_model)
+                        current_global_state = self._slm_trainable_state()
+                    elif self.args.model == 'lfm':
+                        current_global_state = self._lfm_trainable_state()
                     else:
                         current_global_state = self.global_state.copy()
             
-            # --- PaCA DINÂMICO (para CLIP e SLM, a partir do round 2, se ativado) ---
-            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            # --- PaCA DINÂMICO (para CLIP, SLM e LFM, a partir do round 2, se ativado) ---
+            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
                 ideal_paca = self.calculate_adaptive_paca(client_id)
                 self.clients_info[client_id]['current_paca'] = ideal_paca
                 
@@ -907,8 +522,8 @@ class FederatedLearningServer:
                         logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
                                     f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
 
-            # --- RANK ADAPTATIVO (para CLIP e SLM, a partir do round 2, se ativado) ---
-            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
+            # --- RANK ADAPTATIVO (para CLIP, SLM e LFM, a partir do round 2, se ativado) ---
+            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
                 ideal_rank = self.calculate_adaptive_rank(client_id)
                 self.clients_info[client_id]['current_rank'] = ideal_rank
                 
@@ -924,7 +539,7 @@ class FederatedLearningServer:
 
             
             # --- Problema #4: Envia PaCA dinâmico para que o cliente treine apenas as camadas necessárias ---
-            if self.args.model in ['clip', 'slm']:
+            if self.args.model in ['clip', 'slm', 'lfm']:
                 client_paca = self.clients_info[client_id].get('current_paca', self.args.paca) if getattr(self.args, 'adaptive_paca', False) else self.args.paca
                 send_data(conn, client_paca)
 
@@ -1030,7 +645,9 @@ class FederatedLearningServer:
             logger.debug(f"Tamanho antes: {size_before:.2f} MB | Tamanho depois: {size_after:.2f} MB | Economia: {size_saved:.2f} MB")
             logger.info(f"Round {round_num}: Sent global model to client {client_id}")
             
-            updated_state, rate, recv_bytes = recv_data(conn, return_bytes=True)
+            updated_state, rate, recv_bytes = recv_data(
+                conn, return_bytes=True, deadline=deadline, cancelled=cancelled_fn
+            )
             bit_rate.append(rate)
             if updated_state is not None:
                 recv_size_mb = recv_bytes / (1024 * 1024)
@@ -1038,8 +655,11 @@ class FederatedLearningServer:
                     self.received_ammount.append(self.received_ammount[-1] + recv_size_mb)
             
             if updated_state is None:
-                logger.warning(f"Round {round_num}: Cliente {client_id} falhou/desconectou. Abortando thread.")
+                logger.warning(
+                    f"Round {round_num}: Cliente {client_id} falhou/desconectou. Abortando thread."
+                )
                 self.clients_info[client_id]['training_time'] = time.time() - start_time
+                self._deactivate_client(client_id, conn)
                 return
             
             # --- Medição granular: dequantização do servidor ---
@@ -1056,7 +676,7 @@ class FederatedLearningServer:
             if getattr(self.args, 'delta_coding', False) and updated_state is not None:
                 self.previous_recv_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
             
-            data, rate = recv_data(conn)
+            data, rate = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
             self.client_data[client_id] = data
             
             dataset_size = data if isinstance(data, (int, float)) else 1.0
@@ -1064,20 +684,27 @@ class FederatedLearningServer:
             
             logger.debug(f"Client {client_id} dataset size: {dataset_size}")
             
-            self.argalgo, rate = recv_data(conn)
+            self.argalgo, rate = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
             
             # Recebe tempo de treino puro medido pelo cliente
-            client_training_time, rate = recv_data(conn)
+            client_training_time, rate = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
             
-            client_test_acc, _ = recv_data(conn)
-            client_test_loss, _ = recv_data(conn)
+            client_test_acc, _ = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
+            client_test_loss, _ = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
             
             # Recebe overhead de processamento do cliente (eval + quant + dequant)
-            client_processing_overhead, _ = recv_data(conn)
+            client_processing_overhead, _ = recv_data(
+                conn, deadline=deadline, cancelled=cancelled_fn
+            )
             if not isinstance(client_processing_overhead, (int, float)):
                 client_processing_overhead = 0.0
             
-            if client_test_acc is not None:
+            is_round_open = (
+                (round_closed_event is None or not round_closed_event.is_set())
+                and getattr(self, 'current_server_round', round_num) == round_num
+            )
+
+            if client_test_acc is not None and is_round_open:
                 with self.lock:
                     client_accuracies.append(client_test_acc)
                     client_losses.append(client_test_loss)
@@ -1091,7 +718,7 @@ class FederatedLearningServer:
             self.clients_info[client_id]['data'] = self.client_data[client_id]
             
             # --- PaCA DINÂMICO: Remove chaves devolvidas que o cliente NÃO treinou ---
-            if self.args.model in ['clip', 'slm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
                 ideal_paca = self.clients_info[client_id].get('current_paca', self.args.paca)
                 min_layer = self.total_encoder_layers - ideal_paca
                 if min_layer > 0 and updated_state is not None:
@@ -1130,10 +757,18 @@ class FederatedLearningServer:
                         f"server_proc={server_processing_time:.2f}s")
             
             if updated_state is not None:
-                with self.lock:
-                    client_updates.append(updated_state)
-                    client_weights.append(dataset_size)
-                
+                if is_round_open:
+                    with self.lock:
+                        client_updates.append(updated_state)
+                        client_weights.append(dataset_size)
+                else:
+                    logger.warning(
+                        f"Round {round_num}: Update tardio do cliente {client_id} recebido após o "
+                        f"fechamento da janela de agregação (descartado da agregação)."
+                    )
+                if completed_clients is not None:
+                    with self.lock:
+                        completed_clients.add(client_id)
                 self.clients_info[client_id]['training_time'] = training_time
             else:
                 logger.warning(f"Round {round_num}: No update received from client {client_id}")
@@ -1141,146 +776,16 @@ class FederatedLearningServer:
                 
         # Tratamento Exato de Exceções de Rede e Pickle 
         except (OSError, pickle.PickleError, struct.error) as e:
-            logger.warning(f"Round {round_num}: Cliente {client_id} excedeu o timeout ou desconectou.")
+            logger.warning(
+                f"Round {round_num}: Cliente {client_id} excedeu o timeout "
+                f"ou desconectou ({type(e).__name__})."
+            )
+            self._deactivate_client(client_id, conn)
         except Exception as e:
             logger.exception(f"Round {round_num}: Critical error handling client {client_id}")
         finally:
             self.clients_info[client_id]['socket_lock'].release()
 
-    def _prepare_slm_test_loader(self, X, y, batch_size=32):
-        from PIL import Image
-        import numpy as np
-        
-        if not hasattr(self, 'slm_collator') or self.slm_collator is None:
-            from lora_slm.slm_setup import CustomCollator
-            from transformers import AutoProcessor
-            model_name = getattr(self, 'config', {}).get("model", {}).get("name", "Qwen/Qwen3-VL-2B-Instruct") if getattr(self, 'config', None) else "Qwen/Qwen3-VL-2B-Instruct"
-            processor = AutoProcessor.from_pretrained(model_name)
-            label_to_idx = {i: i for i in range(1000)}
-            label_to_idx.update({str(i): i for i in range(1000)})
-            self.slm_collator = CustomCollator(processor, label_to_idx)
-            
-        slm_data = []
-        for x_tensor, y_tensor in zip(X, y):
-            x_tensor = x_tensor.cpu().float()
-            
-            # Se o tensor vier com normalização do CLIP (valores negativos < -0.1)
-            if x_tensor.min() < -0.1:
-                clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
-                clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
-                if x_tensor.shape[0] == 3:
-                    x_tensor = x_tensor * clip_std + clip_mean
-                else:
-                    x_tensor = x_tensor * 0.5 + 0.5
-            elif x_tensor.min() < 0:
-                # Normalização padrão [-1, 1]
-                x_tensor = x_tensor * 0.5 + 0.5
-                
-            if x_tensor.max() <= 1.0:
-                x_tensor = x_tensor * 255.0
-                
-            # Clamp to [0, 255] range
-            x_tensor = torch.clamp(x_tensor, 0, 255)
-            x_numpy = x_tensor.byte().numpy()
-            
-            if x_numpy.shape[0] in [1, 3]: # (C, H, W) -> (H, W, C)
-                x_numpy = np.transpose(x_numpy, (1, 2, 0))
-            if x_numpy.shape[-1] == 1:
-                x_numpy = np.squeeze(x_numpy, axis=-1)
-                
-            pil_img = Image.fromarray(x_numpy)
-            if pil_img.mode != "RGB":
-                pil_img = pil_img.convert("RGB")
-            
-            slm_data.append({"image": pil_img, "label": y_tensor.item()})
-            
-        pin_mem = True if hasattr(self.args, 'device') and torch.device(self.args.device).type == 'cuda' else False
-        return DataLoader(slm_data, batch_size=batch_size, shuffle=False, collate_fn=self.slm_collator, pin_memory=pin_mem)
-
-    def load_test_data(self, dataset, client_idx=0, batch_size=32):
-        try:
-            test_data = read_client_data(dataset, client_idx if client_idx is not None else 0, is_train=False)
-            X, y = zip(*test_data)
-            X = torch.stack(X)
-            y = torch.tensor(y)
-            
-            if getattr(self.args, 'model', 'cnn') == 'slm':
-                return self._prepare_slm_test_loader(X, y, batch_size)
-                
-            if getattr(self.args, 'model', 'cnn') == 'clip':
-                import torchvision.transforms as T
-                if X.shape[-2:] != (224, 224):
-                    X = T.Resize((224, 224), antialias=True)(X)
-                if not X.is_floating_point():
-                    X = X.float() / 255.0
-                elif X.min() >= 0.0 and X.max() > 1.0:
-                    X = X / 255.0
-                if X.min() >= 0.0:
-                    normalize = T.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
-                    X = normalize(X)
-            dataset = torch.utils.data.TensorDataset(X, y)
-            return DataLoader(dataset, batch_size=batch_size, shuffle=False)
-        except Exception as e:
-            logger.exception("Error loading test data")
-            return None
-    
-    def set_amount_prune(self):
-        values = [v for v in self.client_data.values() if v is not None]
-        if not values:
-            return 0
-        
-        if len(values) == 1:
-            data = values[0]
-            non_null_times = [info['training_time'] for info in self.clients_info.values() if info.get('training_time')]
-            return non_null_times[0] / data if non_null_times else 0.0
-        else:
-            sorted_values = sorted(values, reverse=True)
-            maior_valor = sorted_values[0]
-            penultimo_maior = sorted_values[1]
-            
-            distancia_normalizada = (1 - ((maior_valor - penultimo_maior) / maior_valor)) if maior_valor != 0 else 0
-            return 0.85 if distancia_normalizada > 0.9 else distancia_normalizada
-    
-    def save_results(self, i: int):
-        i_str = str(i)
-        a = "prune" if self.args.prune == 1 else "withou_Prune"
-        b = "FedALA" if getattr(self, 'argalgo', 0) == 0 else "FedAVG"
-        
-        paca_val = self.args.paca if (isinstance(self.args.paca, (int, float)) and not isinstance(self.args.paca, bool) and self.args.paca > 0) else 0
-        rank_val = self.args.rank if (isinstance(self.args.rank, (int, float)) and not isinstance(self.args.rank, bool) and self.args.rank > 0) else 8
-        ts_suffix = f"_{self.args.timestamp}" if hasattr(self.args, 'timestamp') and self.args.timestamp else ""
-        algo = f"{self.args.dataset}_{self.args.strategy}_rank{rank_val}_paca{paca_val}_{a}_freq{self.args.prune_freq}_{b}_run{self.args.run_id}{ts_suffix}"
-        
-        current_dir = Path(__file__).resolve().parent
-        result_path = current_dir.parent / "results" / self.args.exp_name
-        result_path.mkdir(parents=True, exist_ok=True)
-        
-        # Padronizando com o prefixo 'server_' para não misturar com o client
-        file_path = result_path / f"server_{algo}.h5"
-        
-        with h5py.File(file_path, 'w') as hf:
-            hf.create_dataset('rs_test_acc', data=self.rs_test_acc)
-            hf.create_dataset('rs_test_loss', data=self.rs_test_loss)
-            hf.create_dataset('rs_aux_simple_avg_acc', data=self.rs_aux_simple_avg_acc)
-            hf.create_dataset('sended_model_Mb', data=self.sended_ammount)
-            hf.create_dataset('Sended_without_quant', data=self.sended_withouquant)
-            hf.create_dataset('Aggregated_clients', data=self.aggregated_clients)
-            hf.create_dataset('Round_time', data=self.round_time)
-            hf.create_dataset('Model_size_per_round_Mb', data=self.model_size_per_round)
-            hf.create_dataset('Trainable_params', data=self.trainable_params_per_round)
-            hf.create_dataset('rs_client_paca', data=self.rs_client_paca)
-            if hasattr(self, 'rs_client_rank') and self.rs_client_rank:
-                hf.create_dataset('rs_client_rank', data=self.rs_client_rank)
-            hf.create_dataset('rs_client_training_time', data=self.rs_client_training_time)
-            hf.create_dataset('rs_client_comm_time', data=self.rs_client_comm_time)
-            hf.create_dataset('rs_client_eval_time', data=self.rs_client_eval_time)
-            hf.create_dataset('rs_server_processing_time', data=self.rs_server_processing_time)
-            hf.create_dataset('server_pruning_time', data=self.server_pruning_time)
-            hf.create_dataset('received_from_clients_Mb', data=self.received_ammount)
-            hf.create_dataset('total_transmitted_per_round_Mb', data=self.total_transmitted_per_round)
-            if self.rs_client_gamma:
-                hf.create_dataset('rs_client_gamma', data=self.rs_client_gamma)
-            
     def run_server(self, times):
         logger.info("=== Federated Learning Server ===")
         logger.info(f"Host: {self.args.host}:{self.args.port}")
@@ -1289,12 +794,12 @@ class FederatedLearningServer:
         logger.info(f"Total rounds: {self.args.rounds}")
         logger.info("=======================================")
         
-        if self.args.model == 'slm':
-            self.time_threshold = 1800.0
-        elif self.args.model == 'clip':
+        if self.args.model in ['slm', 'lfm']:
             self.time_threshold = 600.0
+        elif self.args.model == 'clip':
+            self.time_threshold = 180.0
         else:
-            self.time_threshold = 120.0
+            self.time_threshold = 60.0
         
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1314,6 +819,8 @@ class FederatedLearningServer:
                 clientsid.append(idx)
                 
                 self.clients_info[idx] = {
+                    'active': True,
+                    'socket_lock': threading.Lock(),
                     'training_time': None, 
                     'bandwidth': None, 
                     'original_model_size': None, 
@@ -1351,6 +858,11 @@ class FederatedLearningServer:
                 client_losses = []
                 threads = []
                 self.stop_event = threading.Event()
+                self.current_server_round = round_num + 1
+                round_closed_event = threading.Event()
+                round_cancel_event = threading.Event()
+                completed_clients = set()
+                active_round_threads = []
                 round_pruning_time = 0.0
                 
                 # Extrai o estado global treinável UMA ÚNICA VEZ para todas as threads deste round,
@@ -1359,26 +871,46 @@ class FederatedLearningServer:
                     if self.args.model == 'clip':
                         self.current_round_state = get_trainable_state_dict(self.global_model)
                     elif self.args.model == 'slm':
-                        self.current_round_state = get_trainable_state_dict_slm(self.global_model)
+                        self.current_round_state = self._slm_trainable_state()
+                    elif self.args.model == 'lfm':
+                        self.current_round_state = self._lfm_trainable_state()
                     else:
                         self.current_round_state = self.global_state.copy()
                 self.size_before_cache = {}
                 
                 for i, conn in enumerate(self.client_connections):
+                    cid = clientsid[i]
+                    if not self.clients_info[cid].get('active', True):
+                        continue
                     t = threading.Thread(
                         target=self.handle_client, 
                         daemon=True, 
-                        args=(conn, client_updates, client_weights, round_num + 1, clientsid[i], client_accuracies, client_losses)
+                        args=(
+                            conn,
+                            client_updates,
+                            client_weights,
+                            round_num + 1,
+                            cid,
+                            client_accuracies,
+                            client_losses,
+                            round_closed_event,
+                            round_cancel_event,
+                            completed_clients,
+                        ),
                     )
                     t.start()
                     threads.append(t)
+                    active_round_threads.append((cid, conn, t))
                 
                 init_time = time.time()
-                for t in threads:
+                for _, _, t in active_round_threads:
                     remaining_time = max(0.0, self.time_threshold - (time.time() - init_time))
                     t.join(timeout=remaining_time)
                 
-                if round_num <= 2 or (self.args.model == 'slm' and client_updates):
+                # Fecha a janela de agregação desta rodada (bloqueia updates tardios)
+                round_closed_event.set()
+                
+                if round_num <= 2 or client_updates:
                     self.set_threshold()
                     
                 round_duration = time.time() - init_time
@@ -1442,9 +974,29 @@ class FederatedLearningServer:
                     
                     with self.lock:
                         self.global_state = aggregated_state
-                        self.global_model.load_state_dict(self.global_state, strict=False)
+                        if self.args.model == 'lfm':
+                            from lora_lfm.lfm_setup import set_lfm_state_dict
+                            set_lfm_state_dict(self.global_model, self.global_state)
+                        elif self.qlora:
+                            set_qlora_state_dict(self.global_model, self.global_state)
+                        else:
+                            self.global_model.load_state_dict(self.global_state, strict=False)
                     
-                    if self.test_loader is not None or self.client_idx:
+                    if self.args.model in ['slm', 'lfm']:
+                        # Avaliação Federada Canônica: Média ponderada reportada pelos clientes
+                        if client_accuracies and safe_client_weights and len(client_accuracies) == len(safe_client_weights):
+                            tot_weight = sum(safe_client_weights)
+                            final_accuracy = sum(w * a for w, a in zip(safe_client_weights, client_accuracies)) / tot_weight if tot_weight > 0 else 0.0
+                            final_loss = sum(w * l for w, l in zip(safe_client_weights, client_losses)) / tot_weight if tot_weight > 0 else 0.0
+                        elif client_accuracies:
+                            final_accuracy = sum(client_accuracies) / len(client_accuracies)
+                            final_loss = sum(client_losses) / len(client_losses) if client_losses else 0.0
+                        else:
+                            final_accuracy, final_loss = 0.0, 0.0
+                        self.rs_test_acc.append(final_accuracy)
+                        self.rs_test_loss.append(final_loss)
+                        logger.info(f"Round {round_num + 1}: Federated Weighted Test Acc (from clients): {final_accuracy:.2f}% | Loss: {final_loss:.4f}")
+                    elif self.test_loader is not None or self.client_idx:
                         try:
                             total_correct_weight = 0.0
                             total_loss_weight = 0.0
@@ -1530,20 +1082,42 @@ class FederatedLearningServer:
                     
                     self.server_pruning_time.append(round_pruning_time)
                     
+                    # Cancela e limpa qualquer thread de cliente bloqueada no socket
+                    self._cleanup_pending_round_threads(
+                        round_num + 1, active_round_threads, round_cancel_event
+                    )
+
                     successful_notifications = 0
-                    for conn in self.client_connections:
+                    for cid, conn, _ in active_round_threads:
+                        if (
+                            cid not in completed_clients
+                            or not self.clients_info[cid].get('active', True)
+                        ):
+                            continue
                         try:
-                            if self.args.model == 'slm':
+                            if self.args.model in ['slm', 'lfm']:
                                 send_data(conn, "end")
                             else:
                                 conn.send('end'.encode('utf-8'))
                             successful_notifications += 1
                         except (OSError, BrokenPipeError, ConnectionResetError) as e:
-                            logger.error(f"Error notifying client: {e}")
-                    
-                    logger.info(f"Round {round_num + 1}: Notified {successful_notifications} clients.")
+                            logger.error(f"Error notifying client {cid}: {e}")
+                            self._deactivate_client(cid, conn, shutdown=False)
+
+                    logger.info(
+                        f"Round {round_num + 1}: Notified {successful_notifications} clients."
+                    )
                 else:
-                    logger.warning(f"Round {round_num + 1}: No client updates received (timeout or client failure).")
+                    logger.warning(
+                        f"Round {round_num + 1}: No client updates received "
+                        "(timeout or client failure)."
+                    )
+                    self._cleanup_pending_round_threads(
+                        round_num + 1, active_round_threads, round_cancel_event, log_timeout=False
+                    )
+                    if not any(info.get('active', True) for info in self.clients_info.values()):
+                        logger.error("Nenhum cliente ativo restante. Encerrando treinamento.")
+                        break
             
             logger.info(f"\nTraining completed after {self.args.rounds} rounds!")
             
@@ -1564,7 +1138,9 @@ class FederatedLearningServer:
                 # Salva APENAS o LoRA/SoRA e a Head de classificação para economizar espaço
                 weights_to_save = get_trainable_state_dict(self.global_model)
             elif self.args.model == 'slm':
-                weights_to_save = get_trainable_state_dict_slm(self.global_model)
+                weights_to_save = self._slm_trainable_state()
+            elif self.args.model == 'lfm':
+                weights_to_save = self._lfm_trainable_state()
             else:
                 weights_to_save = self.global_model.state_dict()
 
@@ -1591,7 +1167,7 @@ def parse_args():
     parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('--experiments', type=int, default=1)
-    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip", "slm"])
+    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip", "slm", "lfm"])
     parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
     parser.add_argument('--prune-freq', type=int, default=0)
     
@@ -1619,6 +1195,7 @@ def parse_args():
     parser.add_argument('--gamma-delta', type=float, default=0.5, help='Expoente de sensibilidade da acurácia no índice de capacidade γ (default: 0.5)')
     parser.add_argument('--plateau-phi-min', type=float, default=0.45, help='Piso mínimo de capacidade no platô (default: 0.45)')
     parser.add_argument('--plateau-decay-rate', type=float, default=0.025, help='Taxa de decaimento por rodada no platô (default: 0.025)')
+    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA (suportado para --model slm e --model lfm): backbone 4-bit NF4, agrega só adaptadores LoRA 16 bits')
     return parser.parse_args()
 
 def main():
