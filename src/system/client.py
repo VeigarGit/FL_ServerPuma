@@ -207,6 +207,26 @@ def parse_args():
         help="Ativa QLoRA (apenas --model slm --strategy lora, modo centralizado)",
     )
 
+    # --- Simulação de Straggler (Cliente Lento / Timeout) ---
+    parser.add_argument(
+        "--straggler-idx",
+        type=int,
+        default=-1,
+        help="Índice do cliente para simulação de atraso artificial (straggler)",
+    )
+    parser.add_argument(
+        "--straggler-delay",
+        type=float,
+        default=0.0,
+        help="Tempo de atraso artificial em segundos para o cliente straggler",
+    )
+    parser.add_argument(
+        "--straggler-round",
+        type=int,
+        default=2,
+        help="Rodada (1-based) em que o atraso artificial será aplicado (default: 2)",
+    )
+
     return parser.parse_args()
 
 
@@ -343,7 +363,8 @@ def _connect_to_central_server(args: argparse.Namespace, sock: socket.socket) ->
     if not connected:
         logger.exception("Connection failed after multiple attempts")
         sys.exit(1)
-    sock.settimeout(1800 if args.model == "slm" else 120)
+    client_timeouts = {"cnn": 120, "clip": 300, "slm": 900, "lfm": 900}
+    sock.settimeout(client_timeouts.get(args.model, 300))
     send_data(sock, args.client_idx)
     logger.info(f"Connected to server {args.host}:{args.port}")
 
@@ -449,6 +470,23 @@ def run_centralized_client(
                 f"eval={client_eval_time:.2f}s, quant={client_quant_time:.2f}s, "
                 f"dequant={client_dequant_time:.2f}s"
             )
+
+            # Injeção de atraso para teste de straggler/timeout
+            if (
+                args.straggler_idx >= 0
+                and args.client_idx == args.straggler_idx
+                and (round_num + 1) == args.straggler_round
+                and args.straggler_delay > 0
+            ):
+                logger.warning(
+                    f"⚠️ [STRAGGLER TEST] Cliente {args.client_idx} dormindo "
+                    f"{args.straggler_delay:.1f}s na Rodada {round_num + 1}..."
+                )
+                time.sleep(args.straggler_delay)
+                logger.warning(
+                    f"⚠️ [STRAGGLER TEST] Cliente {args.client_idx} acordou do atraso simulado."
+                )
+
             try:
                 send_data(s, updated_state)
                 send_data(s, len(train_loader))

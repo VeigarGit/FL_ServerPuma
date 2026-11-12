@@ -111,6 +111,11 @@ DELTA_CODING=0
 # QLoRA (backbone 4-bit NF4 + adaptadores LoRA 16 bits)
 QLORA=0
 
+# Simulação de Straggler (Cliente Lento)
+STRAGGLER_IDX=-1
+STRAGGLER_DELAY=0.0
+STRAGGLER_ROUND=2
+
 # ---- Função de Ajuda ----
 show_help() {
     cat << 'EOF'
@@ -293,6 +298,11 @@ while [ $# -gt 0 ]; do
 
         # QLoRA
         --qlora) QLORA=1; shift 1 ;;
+
+        # Straggler
+        --straggler-idx) STRAGGLER_IDX="$2"; shift 2 ;;
+        --straggler-delay) STRAGGLER_DELAY="$2"; shift 2 ;;
+        --straggler-round) STRAGGLER_ROUND="$2"; shift 2 ;;
 
         *) echo "❌ Argumento desconhecido: $1"; exit 1 ;;
     esac
@@ -617,6 +627,9 @@ for RUN in $(seq $START_RUN $END_RUN); do
         fi
         if [ "$QLORA" -eq 1 ]; then
             CLIENT_CMD="$CLIENT_CMD --qlora"
+        fi
+        if [ "$STRAGGLER_IDX" -ge 0 ]; then
+            CLIENT_CMD="$CLIENT_CMD --straggler-idx $STRAGGLER_IDX --straggler-delay $STRAGGLER_DELAY --straggler-round $STRAGGLER_ROUND"
         fi
         CLIENT_CMD="$CLIENT_CMD 2>&1 | tee $LOG_DIR/client_$i.log"
         if [ "$AUTO_NEXT" -eq 0 ]; then
