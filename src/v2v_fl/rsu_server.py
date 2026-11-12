@@ -37,7 +37,10 @@ from utils.model_utils import write_json_atomic
 from utils.network_utils import (
     V2IProtocolError,
     make_v2i_message,
+    prepare_v2i_frame,
+    record_elapsed,
     recv_v2i_message,
+    send_frame,
     send_v2i_message,
 )
 from v2v_fl.over_the_air.ota_aggregation import (
@@ -110,6 +113,7 @@ class Encounter:
     phase: str = "waiting_uploads"
     connections: dict[int, socket.socket] = field(default_factory=dict, repr=False)
     finished: float | None = None
+    timings: dict = field(default_factory=dict)
 
     @property
     def deadline(self) -> float:
@@ -276,6 +280,7 @@ class RSUServer(socketserver.ThreadingTCPServer):
             "control_download_bytes": encounter.control_download_bytes,
             "aggregation_time": encounter.aggregation_time,
             "ota_diagnostics": encounter.ota_diagnostics,
+            "timings": encounter.timings,
             "exchange_time": round(encounter.finished - encounter.started, 6),
         }
         self._write_status(encounter.encounter_id, data)
@@ -297,7 +302,11 @@ class RSUServer(socketserver.ThreadingTCPServer):
         )
         result = None
         try:
-            self._wait_for(encounter, lambda: encounter.received == encounter.clients)
+            started = time.monotonic()
+            try:
+                self._wait_for(encounter, lambda: encounter.received == encounter.clients)
+            finally:
+                record_elapsed(encounter.timings, "upload_wait_time", started)
             with self.condition:
                 self._check_encounter(encounter)
                 encounter.phase = "aggregating"
@@ -324,7 +333,11 @@ class RSUServer(socketserver.ThreadingTCPServer):
                 result = None
                 encounter.phase = "waiting_applied"
                 self.condition.notify_all()
-            self._wait_for(encounter, lambda: encounter.applied == encounter.clients)
+            started = time.monotonic()
+            try:
+                self._wait_for(encounter, lambda: encounter.applied == encounter.clients)
+            finally:
+                record_elapsed(encounter.timings, "applied_wait_time", started)
         except Exception as exc:
             expired = isinstance(exc, TimeoutError) or time.monotonic() >= encounter.deadline
             status = "timed_out" if expired else "failed"
@@ -449,8 +462,23 @@ class RSURequestHandler(socketserver.BaseRequestHandler):
         encounter = None
         message = result = ack = None
         context = {}
+        timings = {"upload": {}, "result": {}, "applied": {}}
+
+        def cancelled():
+            return (
+                server.stopping.is_set() or (server.encounters_dir / ".simulation_done").exists()
+            )
+
         try:
-            message, _, received = recv_v2i_message(connection)
+            with server.condition:
+                deadline = (
+                    server.active.deadline
+                    if server.active is not None
+                    else time.monotonic() + server.exchange_timeout
+                )
+            message, _, received = recv_v2i_message(
+                connection, deadline=deadline, cancelled=cancelled, timings=timings["upload"]
+            )
             if message["type"] == "PING":
                 send_v2i_message(connection, make_v2i_message("PONG"))
                 return
@@ -460,26 +488,42 @@ class RSURequestHandler(socketserver.BaseRequestHandler):
                 key: message[key] for key in ("run_id", "rsu_id", "encounter_id", "client_id")
             }
             encounter = server.accept_upload(message, received, connection)
+            with server.condition:
+                encounter.timings.setdefault("clients", {})[str(context["client_id"])] = timings
             message = None
-            server._wait_for(encounter, lambda: encounter.result is not None)
+            started = time.monotonic()
+            try:
+                server._wait_for(encounter, lambda: encounter.result is not None)
+            finally:
+                record_elapsed(timings, "result_wait_time", started)
             with server.condition:
                 server._check_encounter(encounter)
                 result = encounter.result
             connection.settimeout(max(0.001, encounter.deadline - time.monotonic()))
-            sent = send_v2i_message(
+            sent = send_frame(
                 connection,
-                make_v2i_message(
+                prepare_v2i_frame(
                     "RESULT",
                     **context,
                     weights=result,
                     aggregation_time=encounter.aggregation_time,
+                    timings=timings["result"],
                 ),
+                deadline=encounter.deadline,
+                cancelled=cancelled,
+                timings=timings["result"],
             )
             result = None
             with server.condition:
                 encounter.download_bytes += sent
             connection.settimeout(max(0.001, encounter.deadline - time.monotonic()))
-            ack, _, control_bytes = recv_v2i_message(connection, **context)
+            ack, _, control_bytes = recv_v2i_message(
+                connection,
+                **context,
+                deadline=encounter.deadline,
+                cancelled=cancelled,
+                timings=timings["applied"],
+            )
             with server.condition:
                 encounter.control_upload_bytes += control_bytes
             if ack["type"] != "APPLIED":

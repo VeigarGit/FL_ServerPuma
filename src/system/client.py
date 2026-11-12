@@ -42,9 +42,11 @@ from client_training import (  # noqa: E402
 )
 from client_v2x import (  # noqa: E402
     P2PWeightStore,
+    V2VReceiver,
     exchange_v2i_model,
     run_decentralized_client,
     send_p2p_model,
+    send_v2v_results,
     wait_for_encounter,
     wait_for_round_signal,
     write_v2i_failure,
@@ -70,6 +72,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ClientHistory",
     "P2PWeightStore",
+    "V2VReceiver",
     "build_client_dataloaders",
     "build_client_model",
     "exchange_v2i_model",
@@ -85,6 +88,7 @@ __all__ = [
     "run_decentralized_client",
     "save_results",
     "send_p2p_model",
+    "send_v2v_results",
     "wait_for_encounter",
     "wait_for_round_signal",
     "write_v2i_failure",

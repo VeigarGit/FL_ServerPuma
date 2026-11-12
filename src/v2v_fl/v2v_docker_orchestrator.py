@@ -736,6 +736,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
 
                     exchange_start = time.monotonic()
                     # Escrita ATOMICA do JSON (write-to-temp + rename)
+                    encounter_data["published_monotonic"] = time.monotonic()
                     write_encounter_signal(encounters_dir, encounter_data, encounter_count)
 
                     # Registrar evento para log de analise

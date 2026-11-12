@@ -728,6 +728,7 @@ def run_orchestrator(args: argparse.Namespace) -> None:
                 # O relógio total inclui controle, protocolo e avaliação dos clientes.
                 exchange_start = time.monotonic()
                 # Escrita atômica do JSON
+                encounter_data["published_monotonic"] = time.monotonic()
                 write_encounter_signal(encounters_dir, encounter_data, encounter_count)
 
                 # Registrar evento
