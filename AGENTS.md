@@ -66,6 +66,12 @@ FL_ServerPuma/
     │   │   ├── slm_sora_utils.py   # Poda iterativa de rank para SLM (preserva ordenação ordinal de keep_idx)
     │   │   ├── trainer.py          # Loop de treino SLM (gradient accumulation, AMP bfloat16, PagedAdamW8bit)
     │   │   └── train_config.yml    # Hiperparâmetros base (batch_size=2, grad_accum=8, r=16)
+    │   ├── lora_d1/                # Subsistema DecisionD1 (LiquidAI/d1-2B, texto e imagem single-pass)
+    │   │   ├── d1_setup.py         # DecisionD1, D1DecisionDataset, D1Collator, PaCA (24 camadas)
+    │   │   ├── qlora.py            # QLoRA 4-bit NF4 preservando patchifier em bf16 + AdamW
+    │   │   ├── trainer.py          # Loop de treino/avaliação d1 (CE + Brier Loss, clip_grad_norm_)
+    │   │   ├── test_d1_pipeline.py # Testes unitários de tokenização, imagem e isolamento de payload
+    │   │   └── train_config.yml    # Hiperparâmetros base (lr=5e-5, PaCA=24)
     │   └── plot/                   # Scripts de pós-processamento e geração de gráficos científicos
     ├── utils/                      # Utilitários compartilhados de rede, matemática e dados
     │   ├── network_utils.py        # Framing TCP (4 bytes !I + pickle) e validação do protocolo V2I (v1)
@@ -229,6 +235,7 @@ Definido em `src/utils/network_utils.py`. Toda mensagem usa um cabeçalho de **4
 | `clip` | `CLIPForClassification` (`src/system/lora_clip/clip_setup.py`) | `openai/clip-vit-base-patch32` (`vision_model` + `classifier`) | `float32` (`sdpa`) | 12 camadas (`encoder.layers`) |
 | `slm` | `SLMForClassification` (`src/system/lora_slm/slm_setup.py`) | `Qwen/Qwen3-VL-2B-Instruct` (`language_model` + `classifier` no último token não-pad) | `bfloat16` (`sdpa`) | 28 camadas (`language_model.layers`) |
 | `lfm` | `DecisionLFM` (`src/system/lora_lfm/lfm_setup.py`) | `LiquidAI/LFM3-VL-2B` (`language_model` + `DecisionHead` cosseno em 1 passagem) | `bfloat16` / `4-bit NF4` | 24 camadas (`language_model.layers`) |
+| `d1` | `DecisionD1` (`src/system/lora_d1/d1_setup.py`) | `LiquidAI/d1-2B` (*System One* sobre `LFM3-VL-2B`, `d1_attention` + `slot_logits` multimodais) | `bfloat16` / `4-bit NF4` | 24 camadas (`language_model.layers`) |
 
 ### 5.2 Equação do Índice de Capacidade ($\gamma^c$) no Servidor
 Calculado em `calculate_capacity_index` (`src/system/server.py`) a cada rodada para guiar a poda CNN, o **PaCA Adaptativo** (`--adaptive-paca`) e o **Rank Adaptativo** (`--adaptive-rank`):
