@@ -202,6 +202,40 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 self.input_size = None
                 self.lfm_collator = LFMCollator(tokenizer.pad_token_id)
                 self.lfm_tokenizer = tokenizer
+            case 'd1':
+                import yaml
+                from lora_d1.d1_setup import setup_d1_model
+
+                config_path = Path(
+                    args.config or "src/system/lora_d1/train_config.yml"
+                )
+                if not config_path.exists():
+                    config_path = Path("lora_d1/train_config.yml")
+                with config_path.open("r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+                self.config = config
+
+                if args.rank:
+                    config["model"]["lora"]["r"] = args.rank
+                    config["model"]["lora"]["alpha"] = 2 * args.rank
+
+                if args.paca is not None and args.paca > 0:
+                    config["model"]["paca"]["enabled"] = True
+                    config["model"]["paca"]["upper_layers"] = args.paca
+                else:
+                    config["model"]["paca"]["enabled"] = False
+                    config["model"]["paca"]["upper_layers"] = None
+
+                config["is_qlora"] = bool(getattr(args, "qlora", False))
+                self.global_model, tokenizer = setup_d1_model(
+                    config,
+                    args.device,
+                    is_qlora=bool(getattr(args, "qlora", False)),
+                    dataset=args.dataset,
+                    num_classes=args.num_classes,
+                )
+                self.input_size = None
+                self.d1_tokenizer = tokenizer
                         
                         
         self.qlora = getattr(args, 'qlora', False)
@@ -210,7 +244,10 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             logger.info(f"Carregando pesos salvos de: {args.load_model}")
             state_dict = torch.load(args.load_model, map_location=args.device)
             
-            if self.args.model == 'lfm':
+            if self.args.model == 'd1':
+                from lora_d1.d1_setup import set_d1_state_dict
+                set_d1_state_dict(self.global_model, state_dict)
+            elif self.args.model == 'lfm':
                 from lora_lfm.lfm_setup import set_lfm_state_dict
                 set_lfm_state_dict(self.global_model, state_dict)
             elif self.qlora:
@@ -225,13 +262,15 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 self.global_state = self.global_model.state_dict()
                 
 
-        if not self.qlora:  # QLoRA: backbone 4-bit já alocado via device_map
+        if not self.qlora and self.args.model != 'd1':  # QLoRA: backbone 4-bit já alocado via device_map
             self.global_model = self.global_model.to(args.device)
         self.rs_test_acc = []
         self.rs_test_loss = []
         self.rs_aux_simple_avg_acc = []  # Média simples das acurácias reportadas pelos clientes (usada pelo PaCA/Rank adaptativo)
         # QLoRA / PEFT: o estado agregável contém SOMENTE adaptadores LoRA + head (backbone nunca é agregado)
-        if self.args.model == 'lfm':
+        if self.args.model == 'd1':
+            self.global_state = self._d1_trainable_state(trainable_only=False)
+        elif self.args.model == 'lfm':
             self.global_state = self._lfm_trainable_state(trainable_only=False)
         elif self.qlora:
             self.global_state = get_qlora_state_dict(self.global_model, trainable_only=False)
@@ -273,9 +312,9 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         self.previous_sent_state = {}   # client_id → state_dict enviado na rodada anterior
         self.previous_recv_state = {}   # client_id → state_dict recebido na rodada anterior
         
-        if self.args.model in ['slm', 'lfm']:
+        if self.args.model in ['slm', 'lfm', 'd1']:
             alpha_list, beta_list = [0], [0]
-            logger.info("Cálculo de complexidade ignorado para SLM/LFM.")
+            logger.info("Cálculo de complexidade ignorado para SLM/LFM/d1.")
         else:
             calculator = LayerComplexityCalculator(self.global_model, self.input_size)
             alpha_list, beta_list = calculator.calculate_alpha_beta()
@@ -299,6 +338,10 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             from lora_lfm.lfm_setup import _get_encoder_layers
             layers = _get_encoder_layers(self.global_model)
             self.total_encoder_layers = len(layers) if layers else (self.args.paca or 24)
+        elif self.args.model == 'd1':
+            from lora_d1.d1_setup import _get_encoder_layers
+            layers = _get_encoder_layers(self.global_model)
+            self.total_encoder_layers = len(layers) if layers else (self.args.paca or 24)
         else:
             self.total_encoder_layers = self.args.paca  # fallback
         logger.info(f"Total encoder layers detectado: {self.total_encoder_layers}")
@@ -306,7 +349,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         # Dicionário para armazenar máscaras por cliente
         self.client_masks = {}
         
-        if args.model in ['slm', 'lfm']:
+        if args.model in ['slm', 'lfm', 'd1']:
             self.test_loader = None
             logger.info(f"Modelo {args.model}: Avaliação global configurada via agregação federada ponderada dos clientes (Zero Data Leakage).")
         else:
@@ -326,6 +369,11 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         """Estado do LFM que trafega/é salvo (apenas adaptadores LoRA + DecisionHead)."""
         from lora_lfm.lfm_setup import get_lfm_state_dict
         return get_lfm_state_dict(self.global_model, trainable_only=trainable_only)
+
+    def _d1_trainable_state(self, trainable_only: bool = False):
+        """Estado do d1-2B que trafega/é salvo (apenas adaptadores LoRA)."""
+        from lora_d1.d1_setup import get_d1_state_dict
+        return get_d1_state_dict(self.global_model, trainable_only=trainable_only)
 
     def aggregate_models(self, model_list, global_model, client_weights=None):
         agg_state = global_model.copy()
@@ -429,7 +477,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         self.target_latency = mean_time * 1.15
         
         # Pisos físicos realistas por tipo de modelo para evitar colapso de timeout
-        if self.args.model in ['slm', 'lfm']:
+        if self.args.model in ['slm', 'lfm', 'd1']:
             min_floor = 240.0
         elif self.args.model == 'clip':
             min_floor = 60.0
@@ -501,11 +549,13 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         current_global_state = self._slm_trainable_state()
                     elif self.args.model == 'lfm':
                         current_global_state = self._lfm_trainable_state()
+                    elif self.args.model == 'd1':
+                        current_global_state = self._d1_trainable_state()
                     else:
                         current_global_state = self.global_state.copy()
             
-            # --- PaCA DINÂMICO (para CLIP, SLM e LFM, a partir do round 2, se ativado) ---
-            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            # --- PaCA DINÂMICO (para CLIP, SLM, LFM e d1, a partir do round 2, se ativado) ---
+            if self.args.model in ['clip', 'slm', 'lfm', 'd1'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
                 ideal_paca = self.calculate_adaptive_paca(client_id)
                 self.clients_info[client_id]['current_paca'] = ideal_paca
                 
@@ -522,8 +572,8 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
                                     f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
 
-            # --- RANK ADAPTATIVO (para CLIP, SLM e LFM, a partir do round 2, se ativado) ---
-            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
+            # --- RANK ADAPTATIVO (para CLIP, SLM, LFM e d1, a partir do round 2, se ativado) ---
+            if self.args.model in ['clip', 'slm', 'lfm', 'd1'] and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
                 ideal_rank = self.calculate_adaptive_rank(client_id)
                 self.clients_info[client_id]['current_rank'] = ideal_rank
                 
@@ -539,7 +589,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
 
             
             # --- Problema #4: Envia PaCA dinâmico para que o cliente treine apenas as camadas necessárias ---
-            if self.args.model in ['clip', 'slm', 'lfm']:
+            if self.args.model in ['clip', 'slm', 'lfm', 'd1']:
                 client_paca = self.clients_info[client_id].get('current_paca', self.args.paca) if getattr(self.args, 'adaptive_paca', False) else self.args.paca
                 send_data(conn, client_paca)
 
@@ -718,7 +768,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             self.clients_info[client_id]['data'] = self.client_data[client_id]
             
             # --- PaCA DINÂMICO: Remove chaves devolvidas que o cliente NÃO treinou ---
-            if self.args.model in ['clip', 'slm', 'lfm'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            if self.args.model in ['clip', 'slm', 'lfm', 'd1'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
                 ideal_paca = self.clients_info[client_id].get('current_paca', self.args.paca)
                 min_layer = self.total_encoder_layers - ideal_paca
                 if min_layer > 0 and updated_state is not None:
@@ -794,7 +844,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         logger.info(f"Total rounds: {self.args.rounds}")
         logger.info("=======================================")
         
-        if self.args.model in ['slm', 'lfm']:
+        if self.args.model in ['slm', 'lfm', 'd1']:
             self.time_threshold = 600.0
         elif self.args.model == 'clip':
             self.time_threshold = 180.0
@@ -874,6 +924,8 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         self.current_round_state = self._slm_trainable_state()
                     elif self.args.model == 'lfm':
                         self.current_round_state = self._lfm_trainable_state()
+                    elif self.args.model == 'd1':
+                        self.current_round_state = self._d1_trainable_state()
                     else:
                         self.current_round_state = self.global_state.copy()
                 self.size_before_cache = {}
@@ -974,7 +1026,10 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                     
                     with self.lock:
                         self.global_state = aggregated_state
-                        if self.args.model == 'lfm':
+                        if self.args.model == 'd1':
+                            from lora_d1.d1_setup import set_d1_state_dict
+                            set_d1_state_dict(self.global_model, self.global_state)
+                        elif self.args.model == 'lfm':
                             from lora_lfm.lfm_setup import set_lfm_state_dict
                             set_lfm_state_dict(self.global_model, self.global_state)
                         elif self.qlora:
@@ -982,7 +1037,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         else:
                             self.global_model.load_state_dict(self.global_state, strict=False)
                     
-                    if self.args.model in ['slm', 'lfm']:
+                    if self.args.model in ['slm', 'lfm', 'd1']:
                         # Avaliação Federada Canônica: Média ponderada reportada pelos clientes
                         if client_accuracies and safe_client_weights and len(client_accuracies) == len(safe_client_weights):
                             tot_weight = sum(safe_client_weights)
@@ -1095,7 +1150,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         ):
                             continue
                         try:
-                            if self.args.model in ['slm', 'lfm']:
+                            if self.args.model in ['slm', 'lfm', 'd1']:
                                 send_data(conn, "end")
                             else:
                                 conn.send('end'.encode('utf-8'))
@@ -1141,6 +1196,8 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 weights_to_save = self._slm_trainable_state()
             elif self.args.model == 'lfm':
                 weights_to_save = self._lfm_trainable_state()
+            elif self.args.model == 'd1':
+                weights_to_save = self._d1_trainable_state()
             else:
                 weights_to_save = self.global_model.state_dict()
 
@@ -1167,7 +1224,7 @@ def parse_args():
     parser.add_argument('--pm', type=str, default='OPALA', choices=['OPALA', 'SNIP', 'NISP'])
     parser.add_argument('-did', "--device_id", type=str, default="0")
     parser.add_argument('--experiments', type=int, default=1)
-    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip", "slm", "lfm"])
+    parser.add_argument('--model', type=str, default="cnn", choices=["cnn", "clip", "slm", "lfm", "d1"])
     parser.add_argument('--config', type=str, default="lora_clip/train_config.yml")
     parser.add_argument('--prune-freq', type=int, default=0)
     
@@ -1195,7 +1252,7 @@ def parse_args():
     parser.add_argument('--gamma-delta', type=float, default=0.5, help='Expoente de sensibilidade da acurácia no índice de capacidade γ (default: 0.5)')
     parser.add_argument('--plateau-phi-min', type=float, default=0.45, help='Piso mínimo de capacidade no platô (default: 0.45)')
     parser.add_argument('--plateau-decay-rate', type=float, default=0.025, help='Taxa de decaimento por rodada no platô (default: 0.025)')
-    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA (suportado para --model slm e --model lfm): backbone 4-bit NF4, agrega só adaptadores LoRA 16 bits')
+    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA (suportado para --model slm, lfm e d1): backbone 4-bit NF4, agrega só adaptadores LoRA 16 bits')
     return parser.parse_args()
 
 def main():

@@ -70,9 +70,9 @@ Uso: conda activate puma && ./run_conda.sh [opções]
   --num-classes N              Classes (inferidas para os datasets conhecidos)
   --batch-size N               Tamanho do lote no servidor e nos clientes (32)
   --max-clients N              Fila TCP do servidor (padrão de pelo menos 10)
-  -m, --model cnn|clip|slm|lfm Modelo (cnn)
+  -m, --model cnn|clip|slm|lfm|d1 Modelo (cnn)
   --strategy ESTRATÉGIA        lora, adalora, sora_with_schedule ou sora_no_schedule
-  --config ARQUIVO             YAML de modelo (padrão em lora_clip/, lora_slm/ ou lora_lfm/)
+  --config ARQUIVO             YAML de modelo (padrão em lora_clip/, lora_slm/, lora_lfm/ ou lora_d1/)
   --rank N                     Rank inicial dos adaptadores (8)
   --device auto|cuda|cpu|mps   Dispositivo (auto)
   -did, --device-id ID         GPU usada por todos os processos
@@ -101,7 +101,7 @@ Uso: conda activate puma && ./run_conda.sh [opções]
   --skip-train-eval            Pular avaliação local do conjunto de treino
   --skip-post-eval             Pular avaliações locais após o treino
   --delta-coding               Usar compressão LHDQ
-  --qlora                      Ativar QLoRA 4-bit NF4 (slm/lfm + lora)
+  --qlora                      Ativar QLoRA 4-bit NF4 (slm/lfm/d1 + lora)
   --help                       Exibir esta ajuda
 EOF
 }
@@ -192,6 +192,7 @@ case "$MODEL" in
     clip) PACA=${PACA:-12}; CONFIG_FILE=${CONFIG_FILE:-lora_clip/train_config.yml} ;;
     slm) PACA=${PACA:-28}; CONFIG_FILE=${CONFIG_FILE:-lora_slm/train_config.yml} ;;
     lfm) PACA=${PACA:-24}; CONFIG_FILE=${CONFIG_FILE:-lora_lfm/train_config.yml} ;;
+    d1) PACA=${PACA:-24}; CONFIG_FILE=${CONFIG_FILE:-lora_d1/train_config.yml} ;;
     *) die "Modelo inválido: $MODEL" ;;
 esac
 case "$STRATEGY" in

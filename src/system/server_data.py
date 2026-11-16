@@ -115,6 +115,59 @@ class ServerDataMixin:
                 dataset, client_idx if client_idx is not None else 0, is_train=False
             )
 
+            if getattr(self.args, "model", "cnn") == "d1":
+                from client_data import _tensor_to_pil_rgb
+                from lora_d1.d1_setup import (
+                    DEFAULT_QUESTION,
+                    MODEL_NAME,
+                    MODEL_REVISION,
+                    D1Collator,
+                    D1DecisionDataset,
+                    resolve_d1_options,
+                )
+                from PIL import Image
+
+                model_cfg = getattr(self, "config", {}).get("model", {})
+                ds_cfg = getattr(self, "config", {}).get("dataset", {})
+                classes_file = ds_cfg.get("classes_file")
+                if ds_cfg.get("name") and ds_cfg.get("name") != dataset:
+                    classes_file = None
+                options = resolve_d1_options(
+                    dataset, getattr(self.args, "num_classes", 100), classes_file=classes_file
+                )
+                norm_data = [
+                    (
+                        _tensor_to_pil_rgb(x)
+                        if isinstance(x, torch.Tensor)
+                        else (x if isinstance(x, Image.Image) else x),
+                        int(y_val),
+                    )
+                    for x, y_val in test_data
+                ]
+                d1_ds = D1DecisionDataset(
+                    norm_data,
+                    self.d1_tokenizer,
+                    options,
+                    question=model_cfg.get("question", DEFAULT_QUESTION),
+                    max_length=int(model_cfg.get("max_length", 2048)),
+                    attention_mode=model_cfg.get("attention", "set"),
+                    model_name=model_cfg.get("name", MODEL_NAME),
+                    revision=model_cfg.get("revision", MODEL_REVISION),
+                )
+                pin_mem = bool(
+                    hasattr(self.args, "device") and torch.device(self.args.device).type == "cuda"
+                )
+                return DataLoader(
+                    d1_ds,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    collate_fn=D1Collator(
+                        self.d1_tokenizer.pad_token_id or 0,
+                        media_reader=d1_ds.media_reader,
+                    ),
+                    pin_memory=pin_mem,
+                )
+
             if getattr(self.args, "model", "cnn") == "lfm":
                 from lora_lfm.lfm_setup import LFMDecisionDataset
 

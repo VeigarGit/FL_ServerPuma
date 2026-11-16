@@ -140,10 +140,10 @@ Opções de Treinamento:
   --exp-name <nome>           Nome customizado do experimento
 
 Opções de Modelo:
-  -m, --model <tipo>          Modelo: cnn ou clip (padrão: cnn)
+  -m, --model <tipo>          Modelo: cnn, clip, slm, lfm ou d1 (padrão: cnn)
   --strategy <tipo>           Estratégia: lora, sora_with_schedule, etc. (padrão: lora)
   --rank <n>                  Rank do LoRA/SoRA (padrão: 8)
-  --config <path>             Caminho do YAML de config CLIP (padrão: lora_clip/train_config.yml)
+  --config <path>             Caminho do YAML de config (ex: lora_clip/train_config.yml)
 
 Opções de Dispositivo:
   --device <tipo>             Dispositivo: cuda, cpu, mps (padrão: auto-detectado)
@@ -190,7 +190,7 @@ Compressão:
 
 QLoRA:
   --qlora                     Backbone 4-bit NF4 + DoubleQuant, adaptadores LoRA 16 bits
-                              (requer --model slm|lfm --strategy lora; suporta INT8 e LHDQ)
+                              (requer --model slm|lfm|d1 --strategy lora; suporta INT8 e LHDQ)
 
 Outros:
   --help                      Exibir esta mensagem
@@ -353,9 +353,11 @@ else
 fi
 
 # ---- Validação ----
-if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ]; then
+if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ] || [ "$MODEL" = "d1" ]; then
     if [ -z "$CONFIG_FILE" ]; then
-        if [ "$MODEL" = "lfm" ]; then
+        if [ "$MODEL" = "d1" ]; then
+            CONFIG_FILE="lora_d1/train_config.yml"
+        elif [ "$MODEL" = "lfm" ]; then
             CONFIG_FILE="lora_lfm/train_config.yml"
         elif [ "$MODEL" = "slm" ]; then
             CONFIG_FILE="lora_slm/train_config.yml"
@@ -364,9 +366,9 @@ if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ]; then
         fi
     fi
     
-    # Auto-ajuste de PaCA conforme o modelo (SLM=28 camadas, LFM=24 camadas, CLIP=12 camadas)
+    # Auto-ajuste de PaCA conforme o modelo (SLM=28, LFM/d1=24, CLIP=12)
     if [ "$CUSTOM_PACA" -eq 0 ]; then
-        if [ "$MODEL" = "lfm" ]; then
+        if [ "$MODEL" = "lfm" ] || [ "$MODEL" = "d1" ]; then
             PACA=24
         elif [ "$MODEL" = "slm" ]; then
             PACA=28
@@ -375,7 +377,7 @@ if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ]; then
         fi
     fi
     if [ "$CUSTOM_PACA_MAX" -eq 0 ]; then
-        if [ "$MODEL" = "lfm" ]; then
+        if [ "$MODEL" = "lfm" ] || [ "$MODEL" = "d1" ]; then
             PACA_MAX=24
         elif [ "$MODEL" = "slm" ]; then
             PACA_MAX=28
@@ -384,16 +386,16 @@ if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ]; then
         fi
     fi
 
-    # Batch size padrão reduzido para Foundation Models (SLM/LFM) se não especificado pelo usuário
+    # Batch size padrão reduzido para Foundation Models (SLM/LFM/d1) se não especificado pelo usuário
     if [ "$CUSTOM_BATCH_SIZE" -eq 0 ]; then
-        if [ "$MODEL" = "lfm" ] || [ "$MODEL" = "slm" ]; then
+        if [ "$MODEL" = "lfm" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "d1" ]; then
             BATCH_SIZE=4
         fi
     fi
 fi
 
-if [ "$QLORA" -eq 1 ] && { { [ "$MODEL" != "slm" ] && [ "$MODEL" != "lfm" ]; } || [ "$STRATEGY" != "lora" ]; }; then
-    echo "❌ [ERRO] --qlora requer --model slm|lfm e --strategy lora (atual: model=$MODEL, strategy=$STRATEGY)"
+if [ "$QLORA" -eq 1 ] && { { [ "$MODEL" != "slm" ] && [ "$MODEL" != "lfm" ] && [ "$MODEL" != "d1" ]; } || [ "$STRATEGY" != "lora" ]; }; then
+    echo "❌ [ERRO] --qlora requer --model slm|lfm|d1 e --strategy lora (atual: model=$MODEL, strategy=$STRATEGY)"
     exit 1
 fi
 
@@ -410,6 +412,8 @@ elif [ "$MODEL" = "slm" ]; then
     echo "  Modelo: SLM (Qwen-VL) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 elif [ "$MODEL" = "lfm" ]; then
     echo "  Modelo: LFM (DecisionLFM LiquidAI) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
+elif [ "$MODEL" = "d1" ]; then
+    echo "  Modelo: d1-2B (LiquidAI Decision System One) | Estratégia: $STRATEGY | Config: $CONFIG_FILE"
 else
     echo "  Modelo: CNN Simples Padrão"
 fi

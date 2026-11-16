@@ -1,0 +1,53 @@
+dataset:
+  name: Banking77
+  classes_file: src/dataset/Banking77/classes.json
+
+model:
+  name: LiquidAI/d1-2B
+  revision: a6bce774e6dde338dcc3036ceb5d91f78bf4c19e
+  max_length: 2048
+  gradient_checkpointing: true
+  attention: set
+  question: "Identify the customer's intent or class."
+  lora:
+    mode: with_lora
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    bias: none
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - in_proj
+      - out_proj
+      - w1
+      - w2
+      - w3
+  paca:
+    enabled: true
+    upper_layers: 24
+  qlora:
+    quant_type: nf4
+    double_quant: true
+    compute_dtype: bfloat16
+    optimizer: adamw
+    prepare_kbit: false
+
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  epochs: 1
+  brier_weight: 1.0
+  max_grad_norm: 1.0
+  seed: 42
+
+optimizer:
+  lr: 0.00005
+  weight_decay: 0.01
+
+scheduler:
+  step_size: 1
+  gamma: 0.7
+

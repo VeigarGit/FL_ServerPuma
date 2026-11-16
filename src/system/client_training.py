@@ -219,11 +219,47 @@ def build_client_model(
                 )
 
             model, _ = setup_lfm_model(run_config, device, is_qlora=bool(args.qlora))
+        case "d1":
+            import yaml
+            from lora_d1.d1_setup import setup_d1_model
+
+            config_path = (
+                Path(args.config) if args.config else Path("src/system/lora_d1/train_config.yml")
+            )
+            if not config_path.exists():
+                config_path = Path("lora_d1/train_config.yml")
+            with config_path.open("r", encoding="utf-8") as f:
+                run_config = yaml.safe_load(f)
+
+            if args.rank:
+                run_config["model"]["lora"]["r"] = args.rank
+                run_config["model"]["lora"]["alpha"] = 2 * args.rank
+
+            if args.paca is not None and args.paca > 0:
+                run_config["model"]["paca"]["enabled"] = True
+                run_config["model"]["paca"]["upper_layers"] = args.paca
+            else:
+                run_config["model"]["paca"]["enabled"] = False
+                run_config["model"]["paca"]["upper_layers"] = None
+
+            run_config["is_qlora"] = bool(args.qlora)
+            if args.qlora:
+                logger.info(
+                    "QLoRA ATIVADO para d1-2B: backbone 4-bit NF4 + DoubleQuant, LoRA 16 bits."
+                )
+
+            model, _ = setup_d1_model(
+                run_config,
+                device,
+                is_qlora=bool(args.qlora),
+                dataset=args.dataset,
+                num_classes=args.num_classes,
+            )
         case _:
             logger.error(f"Modelo inválido: {args.model}")
             sys.exit(1)
 
-    if not args.qlora:  # QLoRA: backbone 4-bit já alocado via device_map
+    if not args.qlora and args.model != "d1":  # QLoRA: backbone 4-bit já alocado via device_map
         model = model.to(device)
     return model, run_config
 
@@ -251,6 +287,10 @@ def extract_trainable_model_state(
     model: nn.Module, model_type: str, run_config: dict | None = None
 ) -> dict:
     """Extrai o dicionário de pesos treináveis de acordo com a arquitetura e modo QLoRA."""
+    if model_type == "d1":
+        from lora_d1.d1_setup import get_d1_state_dict
+
+        return get_d1_state_dict(model, trainable_only=True)
     if model_type == "lfm":
         from lora_lfm.lfm_setup import get_lfm_state_dict
 
@@ -269,8 +309,12 @@ def extract_trainable_model_state(
 
 
 def load_trainable_model_state(model: nn.Module, state_dict: dict, model_type: str) -> None:
-    """Carrega pesos agregados no modelo local (suporta CNN, CLIP, SLM e LFM)."""
-    if model_type == "lfm":
+    """Carrega pesos agregados no modelo local (suporta CNN, CLIP, SLM, LFM e d1)."""
+    if model_type == "d1":
+        from lora_d1.d1_setup import set_d1_state_dict
+
+        set_d1_state_dict(model, state_dict)
+    elif model_type == "lfm":
         from lora_lfm.lfm_setup import set_lfm_state_dict
 
         set_lfm_state_dict(model, state_dict)
@@ -321,6 +365,43 @@ def local_training(
         state_dict = map_sequential_to_simplemodel(state_dict)
 
     device = next(model.parameters()).device
+
+    if model_type == "d1":
+        from lora_d1.d1_setup import set_d1_state_dict, update_paca_runtime
+        from lora_d1.qlora import build_d1_optimizer
+        from lora_d1.trainer import train_epoch_d1
+
+        if state_dict:
+            set_d1_state_dict(model, state_dict)
+
+        paca_cfg = run_config["model"].get("paca", {}) if run_config else {}
+        if paca_cfg.get("enabled"):
+            update_paca_runtime(model, paca_cfg.get("upper_layers"))
+
+        _log_trainable_param_count(model)
+
+        train_cfg = run_config.get("training", {}) if run_config else {}
+        brier_weight = float(train_cfg.get("brier_weight", 1.0))
+        grad_accum = int(train_cfg.get("gradient_accumulation_steps", 1))
+        max_grad_norm = float(train_cfg.get("max_grad_norm", 1.0))
+        epochs = int(train_cfg.get("epochs", 1))
+        is_qlora = bool(run_config.get("is_qlora", False)) if run_config else False
+        optimizer = build_d1_optimizer(model, run_config or {}, is_qlora=is_qlora)
+
+        loss, acc = 0.0, 0.0
+        for _ in range(max(1, epochs)):
+            loss, acc = train_epoch_d1(
+                model,
+                train_loader,
+                optimizer,
+                None,
+                device,
+                brier_weight=brier_weight,
+                grad_accum_steps=grad_accum,
+                max_grad_norm=max_grad_norm,
+            )
+        logger.info(f"d1-2B Treino Local - Loss (CE+Brier): {loss:.4f} | Acc: {acc:.2f}%")
+        return extract_trainable_model_state(model, model_type, run_config), personalized_acc
 
     if model_type == "lfm":
         from lora_lfm.lfm_setup import set_lfm_state_dict, update_paca_runtime

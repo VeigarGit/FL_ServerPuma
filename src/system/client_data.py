@@ -103,10 +103,70 @@ def load_data(
     slm_config=None,
     is_lfm=False,
     lfm_config=None,
+    is_d1=False,
+    d1_config=None,
+    num_classes=100,
     dataset_dir=None,
 ):
-    """Carrega a partição local .npz e prepara o DataLoader para CNN, CLIP, SLM ou LFM."""
+    """Carrega a partição local .npz e prepara o DataLoader para CNN, CLIP, SLM, LFM ou d1."""
     train_data = read_client_data(dataset, client_idx, is_train, dataset_dir=dataset_dir)
+
+    if is_d1:
+        from lora_d1.d1_setup import (
+            DEFAULT_QUESTION,
+            MODEL_NAME,
+            MODEL_REVISION,
+            D1Collator,
+            D1DecisionDataset,
+            configure_d1_tokenizer,
+            resolve_d1_options,
+        )
+        from transformers import AutoTokenizer
+
+        model_cfg = d1_config.get("model", {}) if d1_config else {}
+        model_name = model_cfg.get("name", MODEL_NAME)
+        revision = model_cfg.get("revision", MODEL_REVISION)
+        max_length = int(model_cfg.get("max_length", 2048))
+        question = model_cfg.get("question", DEFAULT_QUESTION)
+        attention_mode = model_cfg.get("attention", "set")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, revision=revision, trust_remote_code=True
+        )
+        configure_d1_tokenizer(tokenizer, model_name, revision)
+
+        ds_cfg = d1_config.get("dataset", {}) if d1_config else {}
+        classes_file = ds_cfg.get("classes_file")
+        if ds_cfg.get("name") and ds_cfg.get("name") != dataset:
+            classes_file = None
+        options = resolve_d1_options(dataset, num_classes, classes_file=classes_file)
+
+        normalized_data = [
+            (_tensor_to_pil_rgb(x) if isinstance(x, torch.Tensor) else x, int(y))
+            for x, y in train_data
+        ]
+        d1_dataset = D1DecisionDataset(
+            normalized_data,
+            tokenizer,
+            options,
+            question=question,
+            max_length=max_length,
+            attention_mode=attention_mode,
+            model_name=model_name,
+            revision=revision,
+        )
+        collate_fn = D1Collator(
+            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+            media_reader=d1_dataset.media_reader,
+        )
+        pin_mem = hasattr(device, "type") and device.type == "cuda"
+        return DataLoader(
+            d1_dataset,
+            batch_size=batch_size,
+            shuffle=is_train,
+            collate_fn=collate_fn,
+            pin_memory=pin_mem,
+        )
 
     if is_lfm:
         from lora_lfm.lfm_setup import LFMCollator, LFMDecisionDataset
@@ -198,8 +258,10 @@ def build_client_dataloaders(
         is_clip_flag = args.model == "clip"
         is_slm_flag = args.model == "slm"
         is_lfm_flag = args.model == "lfm"
+        is_d1_flag = args.model == "d1"
         slm_cfg = run_config if is_slm_flag else None
         lfm_cfg = run_config if is_lfm_flag else None
+        d1_cfg = run_config if is_d1_flag else None
         train_loader = load_data(
             args.dataset,
             args.client_idx,
@@ -211,6 +273,9 @@ def build_client_dataloaders(
             slm_config=slm_cfg,
             is_lfm=is_lfm_flag,
             lfm_config=lfm_cfg,
+            is_d1=is_d1_flag,
+            d1_config=d1_cfg,
+            num_classes=args.num_classes,
             dataset_dir=args.dataset_dir,
         )
         test_loader = load_data(
@@ -224,6 +289,9 @@ def build_client_dataloaders(
             slm_config=slm_cfg,
             is_lfm=is_lfm_flag,
             lfm_config=lfm_cfg,
+            is_d1=is_d1_flag,
+            d1_config=d1_cfg,
+            num_classes=args.num_classes,
             dataset_dir=args.dataset_dir,
         )
         test_majority_baseline = None
