@@ -72,3 +72,8 @@ docker-tc/
 !/src/v2v_fl/maps/marambaia_recorte.net.xml
 !/src/v2v_fl/maps/marambaia_recorte.rou.xml
 !/src/v2v_fl/maps/marambaia_recorte.sumocfg
+
+# =========================
+# Ferramentas e Agentes Locais
+# =========================
+.agents/
