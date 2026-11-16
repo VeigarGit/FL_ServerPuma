@@ -28,7 +28,10 @@ def read_data(dataset, idx, is_train=True, *, dataset_dir=None):
 
 
 def read_client_data(dataset, idx, is_train=True, *, dataset_dir=None):
-    if "News" in dataset:
+    if "Banking77" in dataset:
+        data = read_data(dataset, idx, is_train, dataset_dir=dataset_dir)
+        return [(str(x), int(y)) for x, y in zip(data["x"], data["y"])]
+    elif "News" in dataset:
         return read_client_data_text(dataset, idx, is_train, dataset_dir=dataset_dir)
     elif "Shakespeare" in dataset:
         return read_client_data_Shakespeare(dataset, idx, dataset_dir=dataset_dir)

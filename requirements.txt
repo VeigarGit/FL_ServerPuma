@@ -28,3 +28,4 @@ higher
 diffusers
 accelerate
 transformers
+bitsandbytes>=0.46

@@ -17,12 +17,14 @@ src/dataset/OxfordPets/
 src/dataset/Flowers102/
 src/dataset/DTD/
 src/dataset/FGVCAircraft/
+src/dataset/Banking77/
 src/system/DTD/
 src/system/Flowers102/
 src/system/OxfordPets/
 src/system/FGVCAircraft/
 Cifar100/
 *.npz
+BonsaiToClef/
 
 # =========================
 # Modelos e Resultados
@@ -45,6 +47,7 @@ src/system/dados_compartilhados/
 # =========================
 docker-tc/
 *.yml
+!**/train_config.yml
 
 # =========================
 # Arquivos Temporários
@@ -69,3 +72,8 @@ docker-tc/
 !/src/v2v_fl/maps/marambaia_recorte.net.xml
 !/src/v2v_fl/maps/marambaia_recorte.rou.xml
 !/src/v2v_fl/maps/marambaia_recorte.sumocfg
+
+# =========================
+# Ferramentas e Agentes Locais
+# =========================
+.agents/

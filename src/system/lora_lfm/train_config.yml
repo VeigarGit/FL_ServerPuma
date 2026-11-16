@@ -1,0 +1,47 @@
+dataset:
+  name: Banking77
+  classes_file: src/dataset/Banking77/classes.json
+
+model:
+  name: LiquidAI/LFM3-VL-2B
+  revision: f83d2b0a2296aaa277f394990a9b8b949ddf9691
+  head_size: 256
+  max_length: 2048
+  gradient_checkpointing: true
+  lora:
+    mode: with_lora
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    bias: none
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - in_proj
+      - out_proj
+      - w1
+      - w2
+      - w3
+
+  paca:
+    enabled: true
+    upper_layers: 4
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 2
+  epochs: 1
+  brier_weight: 1.0
+  seed: 42
+
+optimizer:
+  head_lr: 0.0003
+  lora_lr: 0.00003
+  weight_decay: 0.01
+
+scheduler:
+  step_size: 1
+  gamma: 0.7
+
