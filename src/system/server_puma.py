@@ -328,8 +328,10 @@ class PumaEngineMixin:
         except KeyError:
             return base_pruning_rate
 
-        training_time = client_info.get("training_time", 0)
-        last_training_time = client_info.get("last_training_time", training_time)
+        training_time = client_info.get("training_time")
+        if training_time is None:
+            return base_pruning_rate
+        last_training_time = client_info.get("last_training_time") or training_time
         client_info["last_training_time"] = training_time
 
         if training_time > last_training_time * 1.5:

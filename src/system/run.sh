@@ -42,6 +42,7 @@ SESSION_NAME="fl_puma"
 # Treinamento
 CLIENT_COUNT=2
 ROUNDS=5
+ROUND_TIMEOUT_FLAG=
 DATASET="MNIST"
 BATCH_SIZE=32
 CUSTOM_BATCH_SIZE=0
@@ -132,6 +133,7 @@ Opções de Sessão:
 Opções de Treinamento:
   -c, --clients <n>           Número de clientes (padrão: 2)
   -r, --rounds <n>            Número de rodadas (padrão: 5)
+  --timeout <segundos>        Prazo fixo de coleta por rodada
   -d, --dataset <nome>        Dataset: Nome do dataset (deve existir um generate_Nome.py) (padrão: MNIST)
   --batch-size <n>            Tamanho do batch (padrão: 32)
   --max-clients <n>           Máximo de clientes permitidos (padrão: 22)
@@ -214,6 +216,14 @@ while [ $# -gt 0 ]; do
         # Treinamento
         -c|--clients) CLIENT_COUNT="$2"; shift 2 ;;
         -r|--rounds) ROUNDS="$2"; shift 2 ;;
+        --timeout)
+            if [[ ! ${2-} =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]]; then
+                echo "[ERRO] Informe --timeout em segundos." >&2
+                exit 1
+            fi
+            ROUND_TIMEOUT_FLAG="--timeout $2"
+            shift 2
+            ;;
         -d|--dataset) DATASET="$2"; shift 2 ;;
         --batch-size) BATCH_SIZE="$2"; CUSTOM_BATCH_SIZE=1; shift 2 ;;
         --max-clients) MAX_CLIENTS="$2"; shift 2 ;;
@@ -525,6 +535,7 @@ for RUN in $(seq $START_RUN $END_RUN); do
         --port $PORT \
         --clients-per-round $CLIENT_COUNT \
         --rounds $ROUNDS \
+        $ROUND_TIMEOUT_FLAG \
         --dataset $DATASET \
         --test-client-idx $TEST_CLIENT_IDX \
         --in-features $IN_FEATURES \

@@ -36,8 +36,9 @@ class ServerAlignmentMixin:
         if local_val.shape == global_val.shape:
             return local_val
 
-        if client_idx in self.client_masks and key in self.client_masks[client_idx]:
-            return self._align_with_mask(local_val, global_val, self.client_masks[client_idx][key])
+        mask = self.client_masks.get(client_idx)
+        if isinstance(mask, dict) and key in mask:
+            return self._align_with_mask(local_val, global_val, mask[key])
 
         if "conv" in key and "weight" in key and local_val.ndim == 4:
             return self._align_conv_weights(local_val, global_val)

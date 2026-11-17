@@ -8,6 +8,7 @@ import argparse
 import sys
 import os
 import logging
+import math
 import json
 from contextlib import suppress
 from pathlib import Path
@@ -57,7 +58,10 @@ from size_mode import get_trainable_size_and_params
 from synexp import LayerComplexityCalculator
 from prunning_nisp import prune_fc1
 from prunning_snip import snip_pruning, apply_mask
-from utils.network_utils import send_data, recv_data
+from round_protocol import (
+    CONTROL_TIMEOUT, RoundInbox, RoundSender, is_round_message, round_message,
+)
+from utils.network_utils import prepare_frame, recv_data, send_data
 from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
 from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
 from server_puma import PumaEngineMixin
@@ -404,12 +408,14 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         from lora_d1.d1_setup import get_d1_state_dict
         return get_d1_state_dict(self.global_model, trainable_only=trainable_only)
 
-    def aggregate_models(self, model_list, global_model, client_weights=None):
+    def aggregate_models(self, model_list, global_model, client_weights=None, client_ids=None):
         agg_state = global_model.copy()
         
         if client_weights is None:
             client_weights = [1.0] * len(model_list)
         
+        if client_ids is None:
+            client_ids = range(len(model_list))
         total_weight = sum(client_weights)
         normalized_weights = [w / total_weight for w in client_weights]
         
@@ -432,7 +438,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                             local_val = local_val.to(global_val.device)
 
                         aligned_val = self._align_to_global_structure(
-                            local_val, global_val, key, model_state, idx
+                            local_val, global_val, key, model_state, client_ids[idx]
                         )
                         
                         weight = normalized_weights[idx]
@@ -505,6 +511,9 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         # Utilizada pelo PaCA e Rank adaptativos para identificar stragglers relativos
         self.target_latency = mean_time * 1.15
         
+        if self.args.timeout is not None:
+            return
+
         # Pisos físicos realistas por tipo de modelo para evitar colapso de timeout
         if self.args.model in ['slm', 'lfm', 'd1']:
             min_floor = 240.0
@@ -531,6 +540,165 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             f"target_latency={self.target_latency:.2f}s (mean_time={mean_time:.2f}s)"
         )
     
+    def prepare_client_model(self, round_num, client_id):
+        current_global_state = self.current_round_state.copy()
+
+        # --- PaCA DINÂMICO (para CLIP e SLM, a partir do round 2, se ativado) ---
+        if self.args.model in ("clip", "slm", "lfm", "d1") and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+            ideal_paca = self.calculate_adaptive_paca(client_id)
+            self.clients_info[client_id]['current_paca'] = ideal_paca
+
+            # Filtra: remove chaves de camadas fora do PaCA ideal
+            min_layer = self.total_encoder_layers - ideal_paca
+            if min_layer > 0:
+                keys_before = len(current_global_state)
+                current_global_state = {
+                    k: v for k, v in current_global_state.items()
+                    if not self._is_excluded_by_paca(k, min_layer)
+                }
+                keys_after = len(current_global_state)
+                if keys_before != keys_after:
+                    logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
+                                f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
+
+        # --- RANK ADAPTATIVO (para CLIP e SLM, a partir do round 2, se ativado) ---
+        if self.args.model in ("clip", "slm", "lfm", "d1") and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
+            ideal_rank = self.calculate_adaptive_rank(client_id)
+            self.clients_info[client_id]['current_rank'] = ideal_rank
+
+            # Slicing de Rank
+            for k, v in current_global_state.items():
+                if '.lora_A' in k:
+                    current_global_state[k] = v[:ideal_rank, :].clone()
+                elif '.lora_B' in k:
+                    current_global_state[k] = v[:, :ideal_rank].clone()
+                elif '.gate' in k:
+                    current_global_state[k] = v[:, :ideal_rank].clone()
+            logger.info(f"Rank filtro {client_id}: rank={ideal_rank}/{self.args.rank}")
+
+        info = self.clients_info[client_id]
+        client_paca = info['current_paca']
+        client_rank = info['current_rank']
+        max_amount = None
+
+        pruned = round_num >= 2 and self.prune == 1 and self.args.model == 'cnn'
+        if pruned:
+            logger.info("--- SERVER: PRUNING START (Round %s) ---", round_num)
+            cnn_prune_start = time.time()
+            if self.clients_info[client_id]['original_model_size'] is None:
+                max_amount = self.new_set_amount_prune(client_id)
+                self.clients_info[client_id]['pruning_rate'] = max_amount
+            else:
+                max_amount = self.clients_info[client_id]['pruning_rate']
+
+            self.clients_info[client_id]['original_model_size'] = get_state_dict_size_mb(self.global_model)
+            logger.info(f"--- SERVER: Calculated pruning rate: {max_amount:.4f}")
+
+            g_model_pruned = copy.deepcopy(self.global_model)
+            mask = None
+
+            if self.args.pm == 'OPALA':
+                g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=max_amount, size_fc=self.size_fc, data=self.args.dataset)
+            elif self.args.pm == 'NISP':
+                trainloader = self.load_test_data("Cifar10", client_id, 32)
+                g_model_pruned, _ = prune_fc1(model=g_model_pruned, dataloader=trainloader, pruning_ratio=max_amount, device=self.args.device)
+                g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=0.0, size_fc=self.size_fc, data=self.args.dataset)
+            elif self.args.pm == 'SNIP':
+                trainloader = self.load_test_data("Cifar10", client_id, 32)
+                self.mask = snip_pruning(model=g_model_pruned, dataloader=trainloader, criterion=nn.CrossEntropyLoss(), pruning_ratio=max_amount, device=self.args.device)
+                g_model_pruned = apply_mask(g_model_pruned, self.mask)
+                g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=0.0, size_fc=self.size_fc, data=self.args.dataset)
+
+            self.client_masks[client_id] = mask
+            current_global_state = g_model_pruned.state_dict()
+            cnn_prune_time = time.time() - cnn_prune_start
+            self.clients_info[client_id]['server_pruning_time'] = cnn_prune_time
+            logger.info(f"--- SERVER: PRUNING COMPLETE ({cnn_prune_time:.2f}s) ---")
+
+        started = time.monotonic()
+        if self.args.timeout is not None:
+            current_global_state = {key: tensor.cpu() for key, tensor in current_global_state.items()}
+        if pruned:
+            size_before = (len(pickle.dumps(current_global_state)) + 4) / (1024 * 1024)
+        else:
+            cache_key = (client_paca, client_rank)
+            with self.lock:
+                if cache_key not in self.size_before_cache:
+                    self.size_before_cache[cache_key] = (len(pickle.dumps(current_global_state)) + 4) / (1024 * 1024)
+                size_before = self.size_before_cache[cache_key]
+
+        if self.args.delta_coding:
+            previous = self.previous_sent_state.get(client_id)
+            if previous is not None and round_num >= 2:
+                current_global_state = lhdq_encode(current_global_state, previous)
+                reference = lhdq_decode(current_global_state, previous)
+            else:
+                reference = {key: tensor.clone() for key, tensor in current_global_state.items()}
+            self.previous_sent_state[client_id] = reference
+        else:
+            current_global_state = quantization(current_global_state)
+
+        elapsed = time.monotonic() - started
+        return current_global_state, client_paca, client_rank, max_amount, size_before, elapsed
+
+    def record_model_sent(self, size_before, sent_bytes):
+        with self.lock:
+            self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
+            self.sended_ammount.append(self.sended_ammount[-1] + sent_bytes / (1024 * 1024))
+
+    def process_client_update(
+        self, client_id, update, receive_bytes, quant_time, elapsed, *, validate=False,
+    ):
+        state, data, ala, training_time, accuracy, loss, overhead = update
+        decode_start = time.monotonic()
+        if is_lhdq_encoded(state):
+            state = lhdq_decode(state, self.previous_recv_state.get(client_id, {}))
+        elif not self.args.delta_coding:
+            state = dequantization(state)
+
+        if validate and (not state or any(
+            not isinstance(weight, torch.Tensor) or not weight.numel() or not torch.isfinite(weight).all()
+            for weight in state.values()
+        ) or not any(
+            key in self.global_state and self._are_compatible_with_pruning(weight, self.global_state[key], key)
+            for key, weight in state.items()
+        )):
+            raise ValueError("pesos inválidos ou incompatíveis")
+
+        if self.args.delta_coding:
+            self.previous_recv_state[client_id] = state.copy()
+        info = self.clients_info[client_id]
+        self.client_data[client_id] = data
+        dataset_size = data if isinstance(data, (int, float)) else 1.0
+        info["dataset_size"] = dataset_size
+        info["data"] = data
+        self.argalgo = ala
+        if accuracy is not None:
+            info["last_loss"] = loss
+            info["acc_history"].append(accuracy)
+
+        if self.args.model in ("clip", "slm", "lfm", "d1") and self.args.adaptive_paca:
+            min_layer = self.total_encoder_layers - info["current_paca"]
+            if min_layer > 0:
+                state = {key: value for key, value in state.items() if not self._is_excluded_by_paca(key, min_layer)}
+
+        processing_time = quant_time + (time.monotonic() - decode_start)
+        training_time = training_time if isinstance(training_time, (int, float)) else elapsed
+        overhead = overhead if isinstance(overhead, (int, float)) else 0.0
+        comm_time = max(0.001, elapsed - training_time - overhead - processing_time)
+        received_mb = receive_bytes / (1024 * 1024)
+        info.update(
+            training_time=training_time, bandwidth=received_mb / comm_time, comm_time=comm_time,
+            client_eval_time=overhead, server_processing_time=processing_time,
+        )
+        with self.lock:
+            self.received_ammount.append(self.received_ammount[-1] + received_mb)
+        logger.info(
+            "Client %s tempos: treino=%.2fs, comm_rede=%.2fs, client_overhead=%.2fs, server_proc=%.2fs",
+            client_id, training_time, comm_time, overhead, processing_time,
+        )
+        return state, dataset_size, accuracy, loss
+
     def handle_client(
         self,
         conn,
@@ -543,12 +711,8 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         round_closed_event=None,
         round_cancel_event=None,
         completed_clients=None,
+        contributing_ids=None,
     ):
-        bit_rate = []
-        masks = []
-        if 'socket_lock' not in self.clients_info[client_id]:
-            self.clients_info[client_id]['socket_lock'] = threading.Lock()
-            
         lock_timeout = max(5.0, self.time_threshold if self.time_threshold > 0 else 60.0)
         acquired = self.clients_info[client_id]['socket_lock'].acquire(timeout=lock_timeout)
         if not acquired:
@@ -568,302 +732,165 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             start_time = time.time()
             logger.info(f"Round {round_num}: Handling client {client_id}")
             
-            if hasattr(self, 'current_round_state') and self.current_round_state is not None:
-                current_global_state = self.current_round_state.copy()
-            else:
-                with self.lock:
-                    if self.args.model == 'clip':
-                        current_global_state = get_trainable_state_dict(self.global_model)
-                    elif self.args.model == 'slm':
-                        current_global_state = self._slm_trainable_state()
-                    elif self.args.model == 'lfm':
-                        current_global_state = self._lfm_trainable_state()
-                    elif self.args.model == 'd1':
-                        current_global_state = self._d1_trainable_state()
-                    else:
-                        current_global_state = self.global_state.copy()
-            
-            # --- PaCA DINÂMICO (para CLIP, SLM, LFM e d1, a partir do round 2, se ativado) ---
-            if self.args.model in ['clip', 'slm', 'lfm', 'd1'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
-                ideal_paca = self.calculate_adaptive_paca(client_id)
-                self.clients_info[client_id]['current_paca'] = ideal_paca
-                
-                # Filtra: remove chaves de camadas fora do PaCA ideal
-                min_layer = self.total_encoder_layers - ideal_paca
-                if min_layer > 0:
-                    keys_before = len(current_global_state)
-                    current_global_state = {
-                        k: v for k, v in current_global_state.items()
-                        if not self._is_excluded_by_paca(k, min_layer)
-                    }
-                    keys_after = len(current_global_state)
-                    if keys_before != keys_after:
-                        logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
-                                    f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
+            model, paca, rank, amount, size_before, quant_time = self.prepare_client_model(round_num, client_id)
+            if self.args.model != "cnn":
+                send_data(conn, paca, deadline=deadline, cancelled=cancelled_fn)
+                send_data(conn, rank, deadline=deadline, cancelled=cancelled_fn)
+            size = send_data(conn, model, deadline=deadline, cancelled=cancelled_fn)
+            send_data(conn, self.prune, deadline=deadline, cancelled=cancelled_fn)
+            if amount is not None:
+                send_data(conn, amount, deadline=deadline, cancelled=cancelled_fn)
+            self.record_model_sent(size_before, size)
 
-            # --- RANK ADAPTATIVO (para CLIP, SLM, LFM e d1, a partir do round 2, se ativado) ---
-            if self.args.model in ['clip', 'slm', 'lfm', 'd1'] and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
-                ideal_rank = self.calculate_adaptive_rank(client_id)
-                self.clients_info[client_id]['current_rank'] = ideal_rank
-                
-                # Slicing de Rank
-                for k, v in current_global_state.items():
-                    if '.lora_A' in k:
-                        current_global_state[k] = v[:ideal_rank, :].clone()
-                    elif '.lora_B' in k:
-                        current_global_state[k] = v[:, :ideal_rank].clone()
-                    elif '.gate' in k:
-                        current_global_state[k] = v[:, :ideal_rank].clone()
-                logger.info(f"Rank filtro {client_id}: rank={ideal_rank}/{self.args.rank}")
-
-            
-            # --- Problema #4: Envia PaCA dinâmico para que o cliente treine apenas as camadas necessárias ---
-            if self.args.model in ['clip', 'slm', 'lfm', 'd1']:
-                client_paca = self.clients_info[client_id].get('current_paca', self.args.paca) if getattr(self.args, 'adaptive_paca', False) else self.args.paca
-                send_data(conn, client_paca)
-
-                client_rank = self.clients_info[client_id].get('current_rank', self.args.rank) if getattr(self.args, 'adaptive_rank', False) else self.args.rank
-                send_data(conn, client_rank)
-
-            if round_num >= 2 and self.prune == 1 and self.args.model == 'cnn':
-                logger.info("--- SERVER: PRUNING START (Round 2) ---")
-                cnn_prune_start = time.time()
-                if self.clients_info[client_id]['original_model_size'] is None:
-                    max_amount = self.new_set_amount_prune(client_id)
-                    self.clients_info[client_id]['pruning_rate'] = max_amount
-                else:
-                    max_amount = self.clients_info[client_id]['pruning_rate']
-                
-                self.clients_info[client_id]['original_model_size'] = get_state_dict_size_mb(self.global_model)
-                logger.info(f"--- SERVER: Calculated pruning rate: {max_amount:.4f}")
-                
-                g_model_pruned = copy.deepcopy(self.global_model)
-                mask = None
-                
-                if self.args.pm == 'OPALA':
-                    g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=max_amount, size_fc=self.size_fc, data=self.args.dataset)
-                elif self.args.pm == 'NISP':
-                    trainloader = self.load_test_data("Cifar10", client_id, 32)
-                    g_model_pruned, _ = prune_fc1(model=g_model_pruned, dataloader=trainloader, pruning_ratio=max_amount, device=self.args.device)
-                    g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=0.0, size_fc=self.size_fc, data=self.args.dataset)
-                elif self.args.pm == 'SNIP':
-                    trainloader = self.load_test_data("Cifar10", client_id, 32)
-                    self.mask = snip_pruning(model=g_model_pruned, dataloader=trainloader, criterion=nn.CrossEntropyLoss(), pruning_ratio=max_amount, device=self.args.device)
-                    g_model_pruned = apply_mask(g_model_pruned, self.mask)
-                    g_model_pruned, mask = prune_and_restructure(model=g_model_pruned, pruning_rate=0.0, size_fc=self.size_fc, data=self.args.dataset)
-                
-                masks.append(mask)
-                self.client_masks[client_id] = mask
-                g_model_pruned = g_model_pruned.state_dict()
-                cnn_prune_time = time.time() - cnn_prune_start
-                self.clients_info[client_id]['server_pruning_time'] = cnn_prune_time
-                logger.info(f"--- SERVER: PRUNING COMPLETE ({cnn_prune_time:.2f}s) ---")
-
-            # --- Medição granular: quantização do servidor ---
-            server_quant_start = time.time()
-            comm_start = time.time()
-            
-            # Decide se usa LHDQ ou int8
-            use_lhdq = (getattr(self.args, 'delta_coding', False) 
-                        and round_num >= 2 
-                        and client_id in self.previous_sent_state)
-            
-            if round_num >= 2 and self.prune == 1 and self.args.model == 'cnn':
-                size_before = (len(pickle.dumps(g_model_pruned)) + 4) / (1024 * 1024)
-                if use_lhdq:
-                    prev_state = self.previous_sent_state.get(client_id, {})
-                    g_model_pruned = lhdq_encode(g_model_pruned, prev_state)
-                    # Re-decode to ensure identical reference state with the client.
-                    # This guarantees both sides use the same base reference for future deltas.
-                    self.previous_sent_state[client_id] = lhdq_decode(g_model_pruned, prev_state)
-                else:
-                    if getattr(self.args, 'delta_coding', False):
-                        self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in g_model_pruned.items()}
-                    if not getattr(self.args, 'delta_coding', False):
-                        g_model_pruned = quantization(g_model_pruned)
-                server_quant_time = time.time() - server_quant_start
-                
-                bytes_sent = send_data(conn, g_model_pruned)
-                send_data(conn, self.prune)
-                send_data(conn, max_amount)
-                size_after = bytes_sent / (1024 * 1024)
-                with self.lock:
-                    self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
-                    self.sended_ammount.append(self.sended_ammount[-1] + size_after)
-            else:
-                ideal_paca = self.clients_info[client_id].get('current_paca', self.args.paca)
-                ideal_rank = self.clients_info[client_id].get('current_rank', self.args.rank)
-                cache_key = (ideal_paca, ideal_rank)
-                with self.lock:
-                    if not hasattr(self, 'size_before_cache'):
-                        self.size_before_cache = {}
-                    if cache_key not in self.size_before_cache:
-                        self.size_before_cache[cache_key] = (len(pickle.dumps(current_global_state)) + 4) / (1024 * 1024)
-                    size_before = self.size_before_cache[cache_key]
-                if use_lhdq:
-                    prev_state = self.previous_sent_state.get(client_id, {})
-                    current_global_state = lhdq_encode(current_global_state, prev_state)
-                    # Re-decode to ensure identical reference state with the client.
-                    # This guarantees both sides use the same base reference for future deltas.
-                    self.previous_sent_state[client_id] = lhdq_decode(current_global_state, prev_state)
-                else:
-                    if getattr(self.args, 'delta_coding', False):
-                        self.previous_sent_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in current_global_state.items()}
-                    if not getattr(self.args, 'delta_coding', False):
-                        current_global_state = quantization(current_global_state)
-                server_quant_time = time.time() - server_quant_start
-                
-                bytes_sent = send_data(conn, current_global_state)
-                send_data(conn, self.prune)
-                size_after = bytes_sent / (1024 * 1024)
-                with self.lock:
-                    self.sended_withouquant.append(self.sended_withouquant[-1] + size_before)
-                    self.sended_ammount.append(self.sended_ammount[-1] + size_after)
-
-            size_saved = size_before - size_after
-            logger.debug(f"Tamanho antes: {size_before:.2f} MB | Tamanho depois: {size_after:.2f} MB | Economia: {size_saved:.2f} MB")
-            logger.info(f"Round {round_num}: Sent global model to client {client_id}")
-            
-            updated_state, rate, recv_bytes = recv_data(
-                conn, return_bytes=True, deadline=deadline, cancelled=cancelled_fn
+            state, _, received_bytes = recv_data(
+                conn, return_bytes=True, deadline=deadline, cancelled=cancelled_fn,
             )
-            bit_rate.append(rate)
-            if updated_state is not None:
-                recv_size_mb = recv_bytes / (1024 * 1024)
-                with self.lock:
-                    self.received_ammount.append(self.received_ammount[-1] + recv_size_mb)
-            
-            if updated_state is None:
-                logger.warning(
-                    f"Round {round_num}: Cliente {client_id} falhou/desconectou. Abortando thread."
-                )
-                self.clients_info[client_id]['training_time'] = time.time() - start_time
-                self._deactivate_client(client_id, conn)
-                return
-            
-            # --- Medição granular: dequantização do servidor ---
-            server_dequant_start = time.time()
-            if is_lhdq_encoded(updated_state):
-                prev_recv = self.previous_recv_state.get(client_id, {})
-                updated_state = lhdq_decode(updated_state, prev_recv)
-            else:
-                if not getattr(self.args, 'delta_coding', False):
-                    updated_state = dequantization(updated_state)
-            server_dequant_time = time.time() - server_dequant_start
-            
-            # LHDQ: cachear o update recebido para a próxima rodada
-            if getattr(self.args, 'delta_coding', False) and updated_state is not None:
-                self.previous_recv_state[client_id] = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in updated_state.items()}
-            
-            data, rate = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
-            self.client_data[client_id] = data
-            
-            dataset_size = data if isinstance(data, (int, float)) else 1.0
-            self.clients_info[client_id]['dataset_size'] = dataset_size
-            
-            logger.debug(f"Client {client_id} dataset size: {dataset_size}")
-            
-            self.argalgo, rate = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
-            
-            # Recebe tempo de treino puro medido pelo cliente
-            client_training_time, rate = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
-            
-            client_test_acc, _ = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
-            client_test_loss, _ = recv_data(conn, deadline=deadline, cancelled=cancelled_fn)
-            
-            # Recebe overhead de processamento do cliente (eval + quant + dequant)
-            client_processing_overhead, _ = recv_data(
-                conn, deadline=deadline, cancelled=cancelled_fn
+            metadata = [recv_data(conn, deadline=deadline, cancelled=cancelled_fn)[0] for _ in range(6)]
+            with self.lock:
+                if round_closed_event is not None and round_closed_event.is_set():
+                    return
+            update = self.process_client_update(
+                client_id, (state, *metadata), received_bytes, quant_time, time.time() - start_time,
             )
-            if not isinstance(client_processing_overhead, (int, float)):
-                client_processing_overhead = 0.0
-            
-            is_round_open = (
-                (round_closed_event is None or not round_closed_event.is_set())
-                and getattr(self, 'current_server_round', round_num) == round_num
-            )
-
-            if client_test_acc is not None and is_round_open:
-                with self.lock:
-                    client_accuracies.append(client_test_acc)
-                    client_losses.append(client_test_loss)
-                self.clients_info[client_id]['last_loss'] = client_test_loss
-                if 'acc_history' not in self.clients_info[client_id]:
-                    self.clients_info[client_id]['acc_history'] = []
-                self.clients_info[client_id]['acc_history'].append(client_test_acc)
-            
-            media_rate = (sum(bit_rate) / len(bit_rate)) / 8 / (1024 * 1024)
-            self.clients_info[client_id]['bandwidth'] = media_rate
-            self.clients_info[client_id]['data'] = self.client_data[client_id]
-            
-            # --- PaCA DINÂMICO: Remove chaves devolvidas que o cliente NÃO treinou ---
-            if self.args.model in ['clip', 'slm', 'lfm', 'd1'] and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
-                ideal_paca = self.clients_info[client_id].get('current_paca', self.args.paca)
-                min_layer = self.total_encoder_layers - ideal_paca
-                if min_layer > 0 and updated_state is not None:
-                    updated_state = {
-                        k: v for k, v in updated_state.items()
-                        if not self._is_excluded_by_paca(k, min_layer)
-                    }
-
-            handle_time = time.time() - start_time
-            # Usa o tempo de treino reportado pelo cliente (mais preciso, exclui overhead de rede)
-            training_time = client_training_time if isinstance(client_training_time, (int, float)) else handle_time
-            
-            # --- Cálculo CORRETO do comm_time ---
-            # Tempo total desde comm_start até agora, menos:
-            #   - treinamento do cliente (medido pelo cliente)
-            #   - processamento do cliente (eval + quant + dequant, medido pelo cliente)
-            #   - quantização do servidor (medido aqui)
-            #   - dequantização do servidor (medido aqui)
-            # O que sobra é o tempo real de rede (serialização + transferência)
-            total_comm_window = time.time() - comm_start
-            server_processing_time = server_quant_time + server_dequant_time
-            comm_time = total_comm_window - training_time - client_processing_overhead - server_processing_time
-            comm_time = max(0.001, comm_time)
-            self.clients_info[client_id]['comm_time'] = comm_time
-            self.clients_info[client_id]['client_eval_time'] = client_processing_overhead
-            self.clients_info[client_id]['server_processing_time'] = server_processing_time
-            
-            # Banda de rede real (MB/s) calculada exclusivamente sobre o tempo puro de transmissão
-            if 'recv_size_mb' in locals() and recv_size_mb > 0:
-                self.clients_info[client_id]['bandwidth'] = recv_size_mb / comm_time
-            
-            logger.info(f"Round {round_num}: Client {client_id} tempos: "
-                        f"treino={training_time:.2f}s, "
-                        f"comm_rede={max(0.0, comm_time):.2f}s, "
-                        f"client_overhead={client_processing_overhead:.2f}s, "
-                        f"server_proc={server_processing_time:.2f}s")
-            
-            if updated_state is not None:
-                if is_round_open:
-                    with self.lock:
-                        client_updates.append(updated_state)
-                        client_weights.append(dataset_size)
-                else:
-                    logger.warning(
-                        f"Round {round_num}: Update tardio do cliente {client_id} recebido após o "
-                        f"fechamento da janela de agregação (descartado da agregação)."
-                    )
-                if completed_clients is not None:
-                    with self.lock:
-                        completed_clients.add(client_id)
-                self.clients_info[client_id]['training_time'] = training_time
-            else:
-                logger.warning(f"Round {round_num}: No update received from client {client_id}")
-                self.clients_info[client_id]['training_time'] = training_time
-                
-        # Tratamento Exato de Exceções de Rede e Pickle 
+            with self.lock:
+                if round_closed_event is not None and round_closed_event.is_set():
+                    return
+                updated_state, weight, accuracy, loss = update
+                client_updates.append(updated_state)
+                client_weights.append(weight)
+                client_accuracies.append(accuracy)
+                client_losses.append(loss)
+                contributing_ids.append(client_id)
+                completed_clients.add(client_id)
         except (OSError, pickle.PickleError, struct.error) as e:
             logger.warning(
                 f"Round {round_num}: Cliente {client_id} excedeu o timeout "
                 f"ou desconectou ({type(e).__name__})."
             )
             self._deactivate_client(client_id, conn)
-        except Exception as e:
+        except Exception:
             logger.exception(f"Round {round_num}: Critical error handling client {client_id}")
         finally:
             self.clients_info[client_id]['socket_lock'].release()
+
+    def collect_fixed_round(self, round_id, model_version, inbox, senders):
+        quant_times = {}
+        frames = {}
+        reuse_result = (
+            round_id > 1 and not self.args.adaptive_paca and not self.args.adaptive_rank
+            and not (self.args.model == "cnn" and self.prune == 1)
+        )
+        for client_id in senders:
+            if reuse_result:
+                model, paca, rank, size_before, quant_time = None, self.args.paca, self.args.rank, 0.0, 0.0
+            else:
+                model, paca, rank, _, size_before, quant_time = self.prepare_client_model(round_id, client_id)
+            frame = prepare_frame(round_message(
+                "start", round_id, timeout=self.args.timeout, version=model_version,
+                model=model, paca=paca, rank=rank, prune=self.prune,
+            ))
+            self.record_model_sent(size_before, len(frame))
+            frames[client_id] = frame
+            quant_times[client_id] = quant_time
+
+        started = time.monotonic()
+        deadline = started + self.args.timeout
+        logger.info(
+            "Round %s: start t=%.6f deadline=%.6f timeout=%.6fs model=v%s",
+            round_id, started, deadline, self.args.timeout, model_version,
+        )
+        for client_id, frame in frames.items():
+            senders[client_id].send(frame)
+        frames.clear()
+
+        updates = {}
+        expected = set(senders)
+        while updates.keys() != expected:
+            incoming = inbox.get(deadline, expected - updates.keys())
+            if incoming is None:
+                break
+            received, client_id, message, size = incoming
+            if not is_round_message(message, "update"):
+                continue
+            if message["round"] != round_id or message.get("version") != model_version or client_id in updates:
+                logger.warning(
+                    "Round %s: discarded client %s update from round %s t=%.6f",
+                    round_id, client_id, message["round"], received,
+                )
+                continue
+            update = message.get("update")
+            if not self.valid_update_metadata(update):
+                logger.warning("Round %s: invalid update from client %s", round_id, client_id)
+                continue
+            try:
+                updates[client_id] = self.process_client_update(
+                    client_id, update, size, quant_times[client_id], received - started, validate=True,
+                )
+            except (ValueError, TypeError, KeyError, RuntimeError):
+                logger.warning("Round %s: invalid weights from client %s", round_id, client_id)
+                continue
+            logger.info("Round %s: accepted client %s t=%.6f", round_id, client_id, received)
+
+        missing = expected - updates.keys()
+        if missing:
+            logger.info(
+                "Round %s: cutoff t=%.6f deadline=%.6f pending=%s",
+                round_id, time.monotonic(), deadline, sorted(missing),
+            )
+            cancel = prepare_frame(round_message("cancel", round_id))
+            for client_id in missing:
+                senders[client_id].send(cancel)
+        return updates, started
+
+    @staticmethod
+    def valid_update_metadata(update):
+        return (
+            isinstance(update, (tuple, list)) and len(update) == 7 and isinstance(update[0], dict)
+            and type(update[1]) is int and update[1] > 0
+            and type(update[2]) is int and update[2] in (0, 1)
+            and all(type(value) in (int, float) and math.isfinite(value) for value in update[3:])
+        )
+
+    def round_model_state(self):
+        if self.args.model == "clip":
+            return get_trainable_state_dict(self.global_model)
+        if self.args.model == "slm":
+            return self._slm_trainable_state()
+        if self.args.model == "lfm":
+            return self._lfm_trainable_state()
+        if self.args.model == "d1":
+            return self._d1_trainable_state()
+        return self.global_state.copy()
+
+    def publish_round_model(self, round_id, model_version, updates, inbox, senders):
+        state = self.round_model_state()
+        if self.args.model == "cnn":
+            state = {key: tensor.cpu() for key, tensor in state.items()}
+        frame = prepare_frame(round_message(
+            "result", round_id, version=model_version, model=state, accepted=sorted(updates),
+        ))
+        for sender in senders.values():
+            sender.send(frame)
+        result_size = len(frame) * len(senders)
+        self.record_model_sent(result_size / (1024 * 1024), result_size)
+
+        pending = set(senders)
+        deadline = time.monotonic() + CONTROL_TIMEOUT
+        while pending:
+            incoming = inbox.get(deadline, pending)
+            if incoming is None:
+                break
+            received, client_id, message, _ = incoming
+            if is_round_message(message, "applied") and message["round"] == round_id and message.get("version") == model_version:
+                pending.discard(client_id)
+                logger.info("Round %s: client %s applied v%s t=%.6f", round_id, client_id, model_version, received)
+            elif is_round_message(message, "update"):
+                logger.warning(
+                    "Round %s: discarded late/duplicate update from client %s for round %s t=%.6f",
+                    round_id, client_id, message["round"], received,
+                )
+        if pending:
+            logger.warning("Round %s: clients without result confirmation: %s", round_id, sorted(pending))
 
     def run_server(self, times):
         logger.info("=== Federated Learning Server ===")
@@ -873,7 +900,9 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         logger.info(f"Total rounds: {self.args.rounds}")
         logger.info("=======================================")
         
-        if self.args.model in ['slm', 'lfm', 'd1']:
+        if self.args.timeout is not None:
+            self.time_threshold = self.args.timeout
+        elif self.args.model in ['slm', 'lfm', 'd1']:
             self.time_threshold = 600.0
         elif self.args.model == 'clip':
             self.time_threshold = 180.0
@@ -926,82 +955,91 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             
             logger.info(f"All {self.args.clients_per_round} clients connected. Starting training...")
             
+            inbox = RoundInbox() if self.args.timeout is not None else None
+            senders = {}
+            model_version = 0
+            if inbox is not None:
+                for client_id, conn in zip(clientsid, self.client_connections, strict=True):
+                    conn.settimeout(CONTROL_TIMEOUT)
+                    senders[client_id] = RoundSender(conn, client_id)
+                    threading.Thread(target=inbox.receive, args=(conn, client_id), daemon=True).start()
+
             for round_num in range(self.args.rounds):
-                time.sleep(5)
+                if inbox is None:
+                    time.sleep(5)
                 self.bit = []
                 logger.info(f"\n--- Round {round_num + 1}/{self.args.rounds} ---")
                 
-                client_updates = []
-                client_weights = []
-                client_accuracies = []
-                client_losses = []
-                threads = []
-                self.stop_event = threading.Event()
-                self.current_server_round = round_num + 1
-                round_closed_event = threading.Event()
-                round_cancel_event = threading.Event()
-                completed_clients = set()
-                active_round_threads = []
+                round_id = round_num + 1
                 round_pruning_time = 0.0
-                
-                # Extrai o estado global treinável UMA ÚNICA VEZ para todas as threads deste round,
-                # eliminando a contenção de lock e execução redundante de get_trainable_state_dict.
-                with self.lock:
-                    if self.args.model == 'clip':
-                        self.current_round_state = get_trainable_state_dict(self.global_model)
-                    elif self.args.model == 'slm':
-                        self.current_round_state = self._slm_trainable_state()
-                    elif self.args.model == 'lfm':
-                        self.current_round_state = self._lfm_trainable_state()
-                    elif self.args.model == 'd1':
-                        self.current_round_state = self._d1_trainable_state()
-                    else:
-                        self.current_round_state = self.global_state.copy()
+                sent_before, received_before = self.sended_ammount[-1], self.received_ammount[-1]
+                self.current_round_state = self.round_model_state()
                 self.size_before_cache = {}
-                
-                for i, conn in enumerate(self.client_connections):
-                    cid = clientsid[i]
-                    if not self.clients_info[cid].get('active', True):
-                        continue
-                    t = threading.Thread(
-                        target=self.handle_client, 
-                        daemon=True, 
-                        args=(
-                            conn,
-                            client_updates,
-                            client_weights,
-                            round_num + 1,
-                            cid,
-                            client_accuracies,
-                            client_losses,
-                            round_closed_event,
-                            round_cancel_event,
-                            completed_clients,
-                        ),
-                    )
-                    t.start()
-                    threads.append(t)
-                    active_round_threads.append((cid, conn, t))
-                
-                init_time = time.time()
-                for _, _, t in active_round_threads:
-                    remaining_time = max(0.0, self.time_threshold - (time.time() - init_time))
-                    t.join(timeout=remaining_time)
-                
-                # Fecha a janela de agregação desta rodada (bloqueia updates tardios)
-                round_closed_event.set()
-                
+                if inbox is not None:
+                    updates, init_time = self.collect_fixed_round(round_id, model_version, inbox, senders)
+                    contributing_ids = sorted(updates)
+                    client_updates = [updates[cid][0] for cid in contributing_ids]
+                    client_weights = [updates[cid][1] for cid in contributing_ids]
+                    client_accuracies = [updates[cid][2] for cid in contributing_ids]
+                    client_losses = [updates[cid][3] for cid in contributing_ids]
+                    round_duration = time.monotonic() - init_time
+                else:
+                    client_updates, client_weights = [], []
+                    client_accuracies, client_losses = [], []
+                    contributing_ids = []
+                    self.current_server_round = round_id
+                    round_closed_event = threading.Event()
+                    round_cancel_event = threading.Event()
+                    completed_clients = set()
+                    active_round_threads = []
+                    for i, conn in enumerate(self.client_connections):
+                        cid = clientsid[i]
+                        if not self.clients_info[cid].get('active', True):
+                            continue
+                        t = threading.Thread(
+                            target=self.handle_client,
+                            daemon=True,
+                            args=(
+                                conn,
+                                client_updates,
+                                client_weights,
+                                round_num + 1,
+                                cid,
+                                client_accuracies,
+                                client_losses,
+                                round_closed_event,
+                                round_cancel_event,
+                                completed_clients,
+                                contributing_ids,
+                            ),
+                        )
+                        t.start()
+                        active_round_threads.append((cid, conn, t))
+
+                    init_time = time.time()
+                    for _, _, t in active_round_threads:
+                        remaining_time = max(0.0, self.time_threshold - (time.time() - init_time))
+                        t.join(timeout=remaining_time)
+
+                    # Fecha a janela de agregação desta rodada (bloqueia updates tardios)
+                    with self.lock:
+                        round_closed_event.set()
+
+                    round_duration = time.time() - init_time
+
                 if round_num <= 2 or client_updates:
                     self.set_threshold()
                     
-                round_duration = time.time() - init_time
                 self.round_time.append(round_duration)
                 
                 logger.info(f"Round {round_num + 1} duration: {round_duration:.2f} seconds")
                 logger.debug(f"Client updates length: {len(client_updates)}")
                 
                 if client_updates:
-                    logger.info(f"Round {round_num + 1}: Aggregating {len(client_updates)} updates")
+                    logger.info(
+                        "Round %s: Aggregating %s updates clients=%s t=%.6f",
+                        round_id, len(client_updates), sorted(contributing_ids), time.monotonic(),
+                    )
                     self.aggregated_clients.append(len(client_updates))
                     
                     # Garantir acesso seguro no momento de ler os updates!
@@ -1009,7 +1047,9 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         safe_client_updates = list(client_updates)
                         safe_client_weights = list(client_weights)
                     
-                    aggregated_state = self.aggregate_models(safe_client_updates, self.global_state, safe_client_weights)
+                    aggregated_state = self.aggregate_models(
+                        safe_client_updates, self.global_state, safe_client_weights, contributing_ids,
+                    )
                     
                     if self.args.model in ['clip', 'slm', 'lfm', 'd1'] and 'sora' in self.args.strategy and self.args.prune_freq > 0:
                         # Verifica se a rodada atual é múltipla da frequência desejada
@@ -1066,6 +1106,10 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         else:
                             self.global_model.load_state_dict(self.global_state, strict=False)
                     
+                    if inbox is not None:
+                        model_version += 1
+                        self.publish_round_model(round_id, model_version, contributing_ids, inbox, senders)
+
                     if self.args.model in ['slm', 'lfm', 'd1']:
                         # Avaliação Federada Canônica: Média ponderada reportada pelos clientes
                         if client_accuracies and safe_client_weights and len(client_accuracies) == len(safe_client_weights):
@@ -1129,11 +1173,52 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                     self.model_size_per_round.append(size_trainable_mb)
                     self.trainable_params_per_round.append(num_trainable_params)
                     
-                    # Total transmitido neste round: (server→clients) + (clients→server)
-                    sent_this_round = self.sended_ammount[-1] - (self.sended_ammount[-len(client_updates)-1] if len(self.sended_ammount) > len(client_updates) else 0)
-                    recv_this_round = self.received_ammount[-1] - (self.received_ammount[-len(client_updates)-1] if len(self.received_ammount) > len(client_updates) else 0)
-                    self.total_transmitted_per_round.append(sent_this_round + recv_this_round)
-                    
+                    if inbox is None:
+                        # Cancela e limpa qualquer thread de cliente bloqueada no socket
+                        self._cleanup_pending_round_threads(
+                            round_num + 1, active_round_threads, round_cancel_event
+                        )
+
+                        successful_notifications = 0
+                        for cid, conn, _ in active_round_threads:
+                            if (
+                                cid not in completed_clients
+                                or not self.clients_info[cid].get('active', True)
+                            ):
+                                continue
+                            try:
+                                if self.args.model in ['slm', 'lfm', 'd1']:
+                                    send_data(conn, "end")
+                                else:
+                                    conn.send('end'.encode('utf-8'))
+                                successful_notifications += 1
+                            except (OSError, BrokenPipeError, ConnectionResetError) as e:
+                                logger.error(f"Error notifying client {cid}: {e}")
+                                self._deactivate_client(cid, conn, shutdown=False)
+
+                        logger.info(
+                            f"Round {round_num + 1}: Notified {successful_notifications} clients."
+                        )
+                elif inbox is not None:
+                    logger.warning("Round %s: no valid updates, retaining v%s", round_id, model_version)
+                    self.aggregated_clients.append(0)
+                    self.rs_test_acc.append(self.rs_test_acc[-1] if self.rs_test_acc else float("nan"))
+                    self.rs_test_loss.append(self.rs_test_loss[-1] if self.rs_test_loss else float("nan"))
+                    self.rs_aux_simple_avg_acc.append(0.0)
+                    size, params = get_trainable_size_and_params(self.global_model)
+                    self.model_size_per_round.append(size)
+                    self.trainable_params_per_round.append(params)
+                    self.publish_round_model(round_id, model_version, contributing_ids, inbox, senders)
+                else:
+                    logger.warning("Round %s: nenhuma atualização recebida.", round_id)
+                    self._cleanup_pending_round_threads(
+                        round_id, active_round_threads, round_cancel_event, log_timeout=False,
+                    )
+                    if not any(info.get('active', True) for info in self.clients_info.values()):
+                        logger.error("Nenhum cliente ativo restante. Encerrando treinamento.")
+                        break
+
+                if client_updates or inbox is not None:
                     paca_list = [self.clients_info[cid].get('current_paca', self.args.paca) for cid in sorted(self.clients_info.keys())]
                     self.rs_client_paca.append(paca_list)
                     if getattr(self.args, 'adaptive_paca', False) and paca_list:
@@ -1152,57 +1237,26 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                     if gamma_list:
                         logger.info(f"Round {round_num + 1}: γ distribution: min={min(gamma_list):.3f}, max={max(gamma_list):.3f}, avg={sum(gamma_list)/len(gamma_list):.3f}")
                     
-                    training_time_list = [self.clients_info[cid].get('training_time', 0.0) for cid in sorted(self.clients_info.keys())]
-                    self.rs_client_training_time.append(training_time_list)
-                    
-                    comm_time_list = [self.clients_info[cid].get('comm_time', 0.0) for cid in sorted(self.clients_info.keys())]
-                    self.rs_client_comm_time.append(comm_time_list)
-                    
-                    eval_time_list = [self.clients_info[cid].get('client_eval_time', 0.0) for cid in sorted(self.clients_info.keys())]
-                    self.rs_client_eval_time.append(eval_time_list)
-                    
-                    server_proc_list = [self.clients_info[cid].get('server_processing_time', 0.0) for cid in sorted(self.clients_info.keys())]
-                    self.rs_server_processing_time.append(server_proc_list)
-                    
+                    for field, history in (
+                        ("training_time", self.rs_client_training_time),
+                        ("comm_time", self.rs_client_comm_time),
+                        ("client_eval_time", self.rs_client_eval_time),
+                        ("server_processing_time", self.rs_server_processing_time),
+                    ):
+                        history.append([
+                            float(self.clients_info[cid].get(field) or 0.0)
+                            if cid in contributing_ids else float("nan")
+                            for cid in sorted(self.clients_info)
+                        ])
                     self.server_pruning_time.append(round_pruning_time)
-                    
-                    # Cancela e limpa qualquer thread de cliente bloqueada no socket
-                    self._cleanup_pending_round_threads(
-                        round_num + 1, active_round_threads, round_cancel_event
+                    self.total_transmitted_per_round.append(
+                        self.sended_ammount[-1] - sent_before
+                        + self.received_ammount[-1] - received_before
                     )
 
-                    successful_notifications = 0
-                    for cid, conn, _ in active_round_threads:
-                        if (
-                            cid not in completed_clients
-                            or not self.clients_info[cid].get('active', True)
-                        ):
-                            continue
-                        try:
-                            if self.args.model in ['slm', 'lfm', 'd1']:
-                                send_data(conn, "end")
-                            else:
-                                conn.send('end'.encode('utf-8'))
-                            successful_notifications += 1
-                        except (OSError, BrokenPipeError, ConnectionResetError) as e:
-                            logger.error(f"Error notifying client {cid}: {e}")
-                            self._deactivate_client(cid, conn, shutdown=False)
+            for sender in senders.values():
+                sender.close()
 
-                    logger.info(
-                        f"Round {round_num + 1}: Notified {successful_notifications} clients."
-                    )
-                else:
-                    logger.warning(
-                        f"Round {round_num + 1}: No client updates received "
-                        "(timeout or client failure)."
-                    )
-                    self._cleanup_pending_round_threads(
-                        round_num + 1, active_round_threads, round_cancel_event, log_timeout=False
-                    )
-                    if not any(info.get('active', True) for info in self.clients_info.values()):
-                        logger.error("Nenhum cliente ativo restante. Encerrando treinamento.")
-                        break
-            
             logger.info(f"\nTraining completed after {self.args.rounds} rounds!")
             
             # Tratamento tolerante para fechamento residual dos soquetes TCP 
@@ -1241,6 +1295,7 @@ def parse_args():
     parser.add_argument('--port', type=int, default=9000)
     parser.add_argument('--clients-per-round', type=int, default=8)
     parser.add_argument('--rounds', type=int, default=5)
+    parser.add_argument('--timeout', type=float, help='Prazo fixo de coleta por rodada, em segundos')
     parser.add_argument('--dataset', type=str, default='Cifar10')
     parser.add_argument('--test-client-idx', type=int, default=0)
     parser.add_argument('--in-features', type=int, default=3)
@@ -1281,8 +1336,11 @@ def parse_args():
     parser.add_argument('--gamma-delta', type=float, default=0.5, help='Expoente de sensibilidade da acurácia no índice de capacidade γ (default: 0.5)')
     parser.add_argument('--plateau-phi-min', type=float, default=0.45, help='Piso mínimo de capacidade no platô (default: 0.45)')
     parser.add_argument('--plateau-decay-rate', type=float, default=0.025, help='Taxa de decaimento por rodada no platô (default: 0.025)')
-    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA/QSoRA (slm com lora ou sora_*, lfm/d1 com lora): backbone 4-bit NF4, agrega só adaptadores 16 bits')
-    return parser.parse_args()
+    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA/QSoRA (slm/lfm/d1 com lora ou sora_*): backbone 4-bit NF4, agrega só adaptadores 16 bits')
+    args = parser.parse_args()
+    if args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0):
+        parser.error('--timeout deve ser positivo e finito (segundos).')
+    return args
 
 def main():
     args = parse_args()

@@ -181,7 +181,8 @@ def send_frame(
 
 
 def recvall(
-    conn: socket.socket, n: int, *, deadline: float | None = None, cancelled=None
+    conn: socket.socket, n: int, *, deadline: float | None = None, cancelled=None,
+    retry_timeout: bool = False,
 ) -> bytes | None:
     """Recebe exatamente n bytes, inclusive quando chegam em fragmentos.
 
@@ -199,7 +200,7 @@ def recvall(
             try:
                 packet = conn.recv(n - len(data))
             except TimeoutError:
-                if controlled:
+                if controlled or retry_timeout:
                     continue
                 logger.warning("Socket timeout durante recebimento de dados.")
                 return None
@@ -217,6 +218,30 @@ def recvall(
                 conn.settimeout(previous_timeout)
 
 
+def recv_payload(
+    conn: socket.socket, *, deadline: float | None = None, cancelled=None,
+    timings: dict | None = None, retry_timeout: bool = False,
+) -> tuple[bytes | None, float, int]:
+    """Recebe um frame completo para permitir a triagem antes da desserialização."""
+    started = time.monotonic()
+    try:
+        raw_msglen = recvall(conn, 4, deadline=deadline, cancelled=cancelled, retry_timeout=retry_timeout)
+        if not raw_msglen:
+            return None, 0, 0
+        msglen = struct.unpack("!I", raw_msglen)[0]
+        data_bytes = recvall(conn, msglen, deadline=deadline, cancelled=cancelled, retry_timeout=retry_timeout)
+    finally:
+        record_elapsed(timings, "receive_time", started)
+    elapsed = time.monotonic() - started
+
+    if data_bytes is None:
+        return None, 0, 0
+
+    total_bytes = msglen + 4
+    bit_rate = total_bytes * 8 / elapsed if elapsed > 0 else 0
+    return data_bytes, bit_rate, total_bytes
+
+
 def recv_data(
     conn: socket.socket,
     return_bytes: bool = False,
@@ -232,28 +257,12 @@ def recv_data(
     O mesmo deadline e cancelled são usados para o cabeçalho e o conteúdo.
     Sem esses argumentos, preserva os retornos antigos em caso de falha.
     """
+    data_bytes, bit_rate, total_bytes = recv_payload(
+        conn, deadline=deadline, cancelled=cancelled, timings=timings,
+    )
     controlled = deadline is not None or cancelled is not None
-    clock = time.monotonic if controlled else time.time
-    start_time = clock()
-
-    receive_started = time.monotonic()
-    try:
-        raw_msglen = recvall(conn, 4, deadline=deadline, cancelled=cancelled)
-        if not raw_msglen:
-            return (None, 0, 0) if return_bytes else (None, 0)
-        msglen = struct.unpack("!I", raw_msglen)[0]
-        data_bytes = recvall(conn, msglen, deadline=deadline, cancelled=cancelled)
-    finally:
-        record_elapsed(timings, "receive_time", receive_started)
-    end_time = clock()
-
-    if not data_bytes and not controlled:
+    if data_bytes is None or (not data_bytes and not controlled):
         return (None, 0, 0) if return_bytes else (None, 0)
-
-    total_bytes = msglen + 4
-    total_bits = total_bytes * 8
-    total_time = end_time - start_time
-    bit_rate = total_bits / total_time if total_time > 0 else 0
 
     deserialize_started = time.monotonic()
     try:

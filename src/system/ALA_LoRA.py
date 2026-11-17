@@ -47,7 +47,7 @@ class ALA_LoRA:
     def adaptive_local_aggregation(self, 
                                    global_model: nn.Module,
                                    local_model: nn.Module,
-                                   mask = None) -> None:
+                                   mask=None, checkpoint=None) -> None:
         """
         Adapts the global model dynamically locally without doing full deepcopy
         to avoid OOM in large models. It targets explicitly trainable tensors.
@@ -105,16 +105,6 @@ class ALA_LoRA:
         local_backup = {n: params_dict[n].data.clone() for n in trainable_names}
         global_backup = {n: params_g_dict[n].data.clone() for n in trainable_names}
         
-        # Backup the requires_grad state to restore later
-        requires_grad_backup = {n: p.requires_grad for n, p in params_dict.items()}
-        
-        # Ensure only trainable parameters compute gradients for ALA optimization
-        for n, p in params_dict.items():
-            if n in trainable_names:
-                p.requires_grad = True
-            else:
-                p.requires_grad = False
-
         # Initialize the higher layers in the temporary local model simulation
         for n in trainable_names:
             params_dict[n].data = local_backup[n] + (global_backup[n] - local_backup[n]) * self.weights[n]
@@ -124,6 +114,8 @@ class ALA_LoRA:
         cnt = 0  
         while True:
             for x, y in rand_loader:
+                if checkpoint is not None:
+                    checkpoint()
                 if type(x) == type([]):
                     x[0] = x[0].to(self.device)
                 else:
@@ -175,8 +167,3 @@ class ALA_LoRA:
                 break
 
         self.start_phase = False
-
-        # The local model is now correctly set with the optimized combination.
-        # Restore the original requires_grad statuses so the main train loop behaves correctly
-        for n, p in params_dict.items():
-            p.requires_grad = requires_grad_backup[n]

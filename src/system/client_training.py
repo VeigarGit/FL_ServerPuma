@@ -32,6 +32,7 @@ from lora_slm.qlora import (  # noqa: E402
     set_qlora_state_dict,
 )
 from model import SimpleModel  # noqa: E402
+from round_protocol import CheckedBatches  # noqa: E402
 
 from utils.fl_math import (  # noqa: E402
     dequantization,
@@ -365,9 +366,9 @@ def load_trainable_model_state(model: nn.Module, state_dict: dict, model_type: s
         model.load_state_dict(state_dict)
 
 
-def local_initialization(ala, received_global_model, model, mask=None):
+def local_initialization(ala, received_global_model, model, mask=None, checkpoint=None):
     """Aplica Adaptive Local Aggregation (FedALA / FedALA_LoRA) no modelo local."""
-    ala.adaptive_local_aggregation(received_global_model, model, mask=mask)
+    ala.adaptive_local_aggregation(received_global_model, model, mask=mask, checkpoint=checkpoint)
 
 
 def _log_trainable_param_count(model: nn.Module) -> None:
@@ -389,8 +390,14 @@ def local_training(
     ala=None,
     model_type="cnn",
     run_config=None,
+    checkpoint=None,
 ):
     """Executa sincronização de pesos globais, FedALA e uma época de treino local."""
+    if checkpoint is not None:
+        checkpoint()
+        train_loader = CheckedBatches(train_loader, checkpoint)
+        test_loader = CheckedBatches(test_loader, checkpoint)
+
     if state_dict and not isinstance(next(iter(state_dict.values())), torch.Tensor):
         state_dict = dequantization(state_dict)
 
@@ -491,7 +498,7 @@ def local_training(
             global_model = copy.deepcopy(model)
             global_model = resize_model_to_pruned(global_model, state_dict)
             logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
-            local_initialization(ala, global_model, model)
+            local_initialization(ala, global_model, model, checkpoint=checkpoint)
             personalized_acc, _ = evaluate_model(model, test_loader)
             logger.info(f"Client {ala.cid}: Post-ALA Test Accuracy: {personalized_acc:.2f}%")
             del global_model
@@ -506,7 +513,7 @@ def local_training(
 
         if alaarg == 0 and round_num == 2:
             logger.info(f"Client {ala.cid}: Applying FedALA (Adaptive Local Aggregation)...")
-            local_initialization(ala, state, model)
+            local_initialization(ala, state, model, checkpoint=checkpoint)
 
         set_parameters(model, state)
 

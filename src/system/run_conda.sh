@@ -13,6 +13,7 @@ PORT=9000
 DATASET=Cifar100
 SESSION_NAME=myapp
 ROUNDS=5
+ROUND_TIMEOUT=
 TEST_CLIENT_IDX=0
 IN_FEATURES=3
 NUM_CLASSES=
@@ -60,6 +61,7 @@ Uso: conda activate puma && ./run_conda.sh [opções]
 
   -c, --clients N              Clientes por rodada (2)
   -r, --rounds N               Rodadas por simulação (5)
+  --timeout SEGUNDOS           Prazo fixo de coleta por rodada
   -d, --dataset NOME           Dataset com gerador em src/dataset (Cifar100)
   -h, --host HOST              Endereço do servidor (localhost)
   -p, --port PORTA             Porta TCP (9000)
@@ -116,6 +118,7 @@ while (( $# )); do
         -d|--dataset) option=DATASET ;;
         -s|--session) option=SESSION_NAME ;;
         -r|--rounds) option=ROUNDS ;;
+        --timeout) option=ROUND_TIMEOUT ;;
         -t|--test-client-idx) option=TEST_CLIENT_IDX ;;
         --in-features) option=IN_FEATURES ;;
         --num-classes) option=NUM_CLASSES ;;
@@ -220,6 +223,8 @@ done
 [[ $SESSION_NAME =~ ^[[:alnum:]_-]+$ ]] || die "Nome de sessão inválido."
 [[ -z $EXP_NAME || $EXP_NAME =~ ^[[:alnum:]_.-]+$ ]] && [[ $EXP_NAME != . && $EXP_NAME != .. ]] \
     || die "--exp-name deve ser um nome de diretório simples."
+
+if [[ -n $ROUND_TIMEOUT ]]; then SERVER_FLAGS+=(--timeout "$ROUND_TIMEOUT"); fi
 
 # Selecionar PaCA e rank antes de iniciar o servidor.
 SERVER_PACA=$PACA

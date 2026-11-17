@@ -7,6 +7,8 @@ import random
 import socket
 import sys
 import time
+from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -52,6 +54,14 @@ from client_v2x import (  # noqa: E402
     write_v2i_failure,
 )
 from lora_slm.qlora import set_qlora_state_dict  # noqa: E402
+from round_protocol import (  # noqa: E402
+    CONTROL_TIMEOUT,
+    CheckedBatches,
+    RoundCancelled,
+    RoundControl,
+    is_round_message,
+    round_message,
+)
 
 from utils.fl_math import (  # noqa: E402
     dequantization,
@@ -210,7 +220,7 @@ def parse_args():
     parser.add_argument(
         "--qlora",
         action="store_true",
-        help="Ativa QLoRA/QSoRA (slm com lora ou sora_*, lfm/d1 com lora, modo centralizado)",
+        help="Ativa QLoRA/QSoRA (slm/lfm/d1 com lora ou sora_*, modo centralizado)",
     )
 
     # --- Simulação de Straggler (Cliente Lento / Timeout) ---
@@ -284,6 +294,21 @@ def _encode_client_payload(
     return updated_state, previous_sent_state, time.time() - start
 
 
+def _load_server_model(model, global_state, model_type, qlora):
+    if model_type == "d1":
+        from lora_d1.d1_setup import set_d1_state_dict
+
+        set_d1_state_dict(model, global_state)
+    elif model_type == "lfm":
+        from lora_lfm.lfm_setup import set_lfm_state_dict
+
+        set_lfm_state_dict(model, global_state)
+    elif qlora:
+        set_qlora_state_dict(model, global_state)
+    else:
+        resize_model_to_pruned(model, global_state)
+
+
 def _evaluate_global_before_training(
     model: nn.Module,
     global_state: dict,
@@ -291,31 +316,20 @@ def _evaluate_global_before_training(
     round_num: int,
     model_type: str,
     qlora: bool,
+    *,
+    fixed_timeout: bool = False,
+    local_weights: dict | None = None,
 ) -> tuple[float, float, float]:
     """Avalia o modelo global recebido antes do treino local, preservando pesos locais."""
     eval_start = time.time()
-    if round_num + 1 >= 2:
-        old_local_weights = None
-        if model_type in ["clip", "slm", "lfm", "d1"]:
+    if fixed_timeout or round_num + 1 >= 2:
+        old_local_weights = local_weights
+        if old_local_weights is None and model_type in ["clip", "slm", "lfm", "d1"]:
             old_local_weights = {
                 n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad
             }
-        if model_type == "d1":
-            from lora_d1.d1_setup import set_d1_state_dict
-
-            set_d1_state_dict(model, global_state)
-            local = model
-        elif model_type == "lfm":
-            from lora_lfm.lfm_setup import set_lfm_state_dict
-
-            set_lfm_state_dict(model, global_state)
-            local = model
-        elif qlora:
-            set_qlora_state_dict(model, global_state)
-            local = model
-        else:
-            local = resize_model_to_pruned(model, global_state)
-        test_accuracy, test_loss = evaluate_model(local, test_loader)
+        _load_server_model(model, global_state, model_type, qlora)
+        test_accuracy, test_loss = evaluate_model(model, test_loader)
         if old_local_weights is not None:
             for n, p in model.named_parameters():
                 if (
@@ -389,132 +403,211 @@ def run_centralized_client(
     history: ClientHistory,
 ) -> None:
     """Executa o ciclo completo de treinamento federado centralizado via TCP."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s, ExitStack() as cleanup:
         _connect_to_central_server(args, s)
         previous_recv_state: dict = {}
         previous_sent_state: dict = {}
 
+        control = None
+        model_version = 0
+        result_state = None
+        fedala_weights = None
+        preserve_fedala = args.model == "clip" and args.ala == 0
+
         for round_num in range(args.rounds):
-            logger.info(f"\n--- Round {round_num + 1}/{args.rounds} ---")
-            if args.model in ["clip", "slm", "lfm", "d1"]:
-                server_paca, _ = recv_data(s)
-                if server_paca is None or server_paca == "end":
-                    break
-                if (
-                    isinstance(server_paca, int)
-                    and not isinstance(server_paca, bool)
-                    and server_paca != args.paca
-                ):
-                    args.paca = server_paca
-                    if run_config and "paca" in run_config.get("model", {}):
-                        run_config["model"]["paca"]["upper_layers"] = server_paca
+            round_id = round_num + 1
+            logger.info("\n--- Round %s/%s ---", round_id, args.rounds)
+            if control is None:
+                message, _ = recv_data(s)
+                if is_round_message(message, "start"):
+                    wait = max(message["timeout"] + CONTROL_TIMEOUT, s.gettimeout())
+                    s.settimeout(CONTROL_TIMEOUT)
+                    control = RoundControl(s, wait)
+                    cleanup.callback(control.close)
+            else:
+                message = control.expect("start", round_id)
 
-                server_r, _ = recv_data(s)
-                if server_r is None or server_r == "end":
-                    break
-                if (
-                    isinstance(server_r, int)
-                    and not isinstance(server_r, bool)
-                    and server_r != args.rank
-                ):
-                    args.rank = server_r
-                    if run_config and "lora" in run_config.get("model", {}):
-                        run_config["model"]["lora"]["r"] = server_r
+            checkpoint = None
+            if control is not None:
+                if message["round"] != round_id or message["version"] != model_version:
+                    raise ConnectionError(f"Modelo inesperado na rodada {round_id}.")
+                round_deadline = time.monotonic() + message["timeout"]
 
-            global_state, _ = recv_data(s)
-            if global_state is None or global_state == "end" or not isinstance(global_state, dict):
-                break
-            prune, _ = recv_data(s)
-            if prune is None or prune == "end":
-                break
-            logger.info("Received global model.")
+                checkpoint = partial(control.checkpoint, round_id, round_deadline)
 
-            global_state, previous_recv_state, client_dequant_time = _decode_server_payload(
-                global_state, previous_recv_state, args.delta_coding
-            )
-
-            if round_num + 1 >= 2 and prune == 1 and args.model == "cnn":
-                _amount, _ = recv_data(s)
-
-            test_accuracy, test_loss, client_pre_eval_time = _evaluate_global_before_training(
-                model, global_state, test_loader, round_num, args.model, args.qlora
-            )
-            logger.info(
-                f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | "
-                f"Test Loss: {test_loss:.4f}"
-            )
-            history.global_acc.append(test_accuracy)
-            history.global_loss.append(test_loss)
-
-            train_start = time.time()
-            updated_state, personalized_acc = local_training(
-                model=model,
-                state_dict=global_state,
-                prune=prune,
-                train_loader=train_loader,
-                test_loader=test_loader,
-                learning_rate=args.learning_rate,
-                round_num=round_num + 1,
-                alaarg=args.ala,
-                ala=ala,
-                model_type=args.model,
-                run_config=run_config if args.model in ["clip", "slm", "lfm", "d1"] else None,
-            )
-            client_training_time = time.time() - train_start
-            history.ala_acc.append(
-                personalized_acc if personalized_acc is not None else test_accuracy
-            )
-            logger.info(f"Local training completed in {client_training_time:.2f}s.")
-
-            client_post_eval_time = _evaluate_post_training(
-                args, model, train_loader, test_loader, test_accuracy, history
-            )
-            updated_state, previous_sent_state, client_quant_time = _encode_client_payload(
-                updated_state, previous_sent_state, round_num, args.delta_coding
-            )
-
-            client_eval_time = client_pre_eval_time + client_post_eval_time
-            client_processing_overhead = client_eval_time + client_quant_time + client_dequant_time
-            logger.info(
-                f"Client {args.client_idx}: Tempos - treino={client_training_time:.2f}s, "
-                f"eval={client_eval_time:.2f}s, quant={client_quant_time:.2f}s, "
-                f"dequant={client_dequant_time:.2f}s"
-            )
-
-            # Injeção de atraso para teste de straggler/timeout
-            if (
-                args.straggler_idx >= 0
-                and args.client_idx == args.straggler_idx
-                and (round_num + 1) == args.straggler_round
-                and args.straggler_delay > 0
-            ):
-                logger.warning(
-                    f"⚠️ [STRAGGLER TEST] Cliente {args.client_idx} dormindo "
-                    f"{args.straggler_delay:.1f}s na Rodada {round_num + 1}..."
-                )
-                time.sleep(args.straggler_delay)
-                logger.warning(
-                    f"⚠️ [STRAGGLER TEST] Cliente {args.client_idx} acordou do atraso simulado."
-                )
-
-            try:
-                send_data(s, updated_state)
-                send_data(s, len(train_loader))
-                send_data(s, args.ala)
-                send_data(s, client_training_time)
-                send_data(s, test_accuracy)
-                send_data(s, test_loss)
-                send_data(s, client_processing_overhead)
-                logger.info("Client update sent.")
-                if args.model in ["slm", "lfm", "d1"]:
-                    round_ack, _ = recv_data(s)
-                    if round_ack is None:
+                global_state, prune = message["model"], message["prune"]
+                server_paca, server_rank = message["paca"], message["rank"]
+                logger.info("Round %s: client %s received start v%s t=%.6f",
+                            round_id, args.client_idx, model_version, time.monotonic())
+            else:
+                if args.model != "cnn":
+                    server_paca = message
+                    if type(server_paca) is not int:
                         break
+                    server_rank, _ = recv_data(s)
+                    if type(server_rank) is not int:
+                        break
+                    message, _ = recv_data(s)
+                global_state = message
+                if not isinstance(global_state, dict):
+                    break
+                prune, _ = recv_data(s)
+                if type(prune) is not int:
+                    break
+                if round_id >= 2 and prune == 1 and args.model == "cnn":
+                    recv_data(s)  # Taxa de poda no protocolo legado.
+
+            if args.model != "cnn":
+                args.paca, args.rank = server_paca, server_rank
+                model_config = (run_config or {}).get("model", {})
+                if "paca" in model_config:
+                    model_config["paca"]["upper_layers"] = args.paca
+                if "lora" in model_config:
+                    model_config["lora"]["r"] = args.rank
+
+            client_dequant_time = 0.0
+            if global_state is None:
+                global_state = result_state
+            else:
+                global_state, previous_recv_state, client_dequant_time = _decode_server_payload(
+                    global_state, previous_recv_state, args.delta_coding,
+                )
+            evaluation_loader = (
+                CheckedBatches(test_loader, checkpoint) if checkpoint else test_loader
+            )
+            candidate = None
+            local_weights = None
+            try:
+                eval_state = global_state
+                if control is not None and args.model == "cnn" and round_id >= 2 and prune == 1:
+                    eval_state = map_sequential_to_simplemodel(global_state)
+                test_accuracy, test_loss, client_pre_eval_time = _evaluate_global_before_training(
+                    model, eval_state, evaluation_loader, round_num, args.model, args.qlora,
+                    fixed_timeout=control is not None, local_weights=fedala_weights,
+                )
+                logger.info(
+                    f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | "
+                    f"Test Loss: {test_loss:.4f}"
+                )
+                history.global_acc.append(test_accuracy)
+                history.global_loss.append(test_loss)
+
+                if checkpoint is not None:
+                    checkpoint()
+                train_start = time.time()
+                logger.info("Round %s: client %s training start t=%.6f",
+                            round_id, args.client_idx, time.monotonic())
+                updated_state, personalized_acc = local_training(
+                    model=model,
+                    state_dict=global_state,
+                    prune=prune,
+                    train_loader=train_loader,
+                    test_loader=test_loader,
+                    learning_rate=args.learning_rate,
+                    round_num=round_num + 1,
+                    alaarg=args.ala,
+                    ala=ala,
+                    model_type=args.model,
+                    run_config=run_config if args.model != "cnn" else None,
+                    checkpoint=checkpoint,
+                )
+                client_training_time = time.time() - train_start
+                history.ala_acc.append(
+                    personalized_acc if personalized_acc is not None else test_accuracy
+                )
+                logger.info(f"Local training completed in {client_training_time:.2f}s.")
+
+                train_eval_loader = (
+                    CheckedBatches(train_loader, checkpoint) if checkpoint else train_loader
+                )
+                client_post_eval_time = _evaluate_post_training(
+                    args, model, train_eval_loader, evaluation_loader, test_accuracy, history,
+                )
+                if checkpoint is not None:
+                    checkpoint()
+                    updated_state = {
+                        key: tensor.detach().cpu() for key, tensor in updated_state.items()
+                    }
+                    if preserve_fedala:
+                        local_weights = updated_state
+                updated_state, candidate, client_quant_time = _encode_client_payload(
+                    updated_state, previous_sent_state, round_num, args.delta_coding
+                )
+
+                client_eval_time = client_pre_eval_time + client_post_eval_time
+                client_processing_overhead = client_eval_time + client_quant_time + client_dequant_time
+                logger.info(
+                    f"Client {args.client_idx}: Tempos - treino={client_training_time:.2f}s, "
+                    f"eval={client_eval_time:.2f}s, quant={client_quant_time:.2f}s, "
+                    f"dequant={client_dequant_time:.2f}s"
+                )
+
+                # Injeção de atraso para teste de straggler/timeout
+                if (
+                    args.straggler_idx >= 0
+                    and args.client_idx == args.straggler_idx
+                    and (round_num + 1) == args.straggler_round
+                    and args.straggler_delay > 0
+                ):
+                    logger.warning(
+                        f"⚠️ [STRAGGLER TEST] Cliente {args.client_idx} dormindo "
+                        f"{args.straggler_delay:.1f}s na Rodada {round_num + 1}..."
+                    )
+                    time.sleep(args.straggler_delay)
+                    logger.warning(
+                        f"⚠️ [STRAGGLER TEST] Cliente {args.client_idx} acordou do atraso simulado."
+                    )
+
+                update = (updated_state, len(train_loader), args.ala, client_training_time,
+                          test_accuracy, test_loss, client_processing_overhead)
+                if control is not None:
+                    checkpoint()
+                    send_data(
+                        s, round_message("update", round_id, version=model_version, update=update),
+                    )
+                    logger.info("Round %s: client %s update sent t=%.6f",
+                                round_id, args.client_idx, time.monotonic())
                 else:
-                    s.recv(3)
-                logger.info("Ready for next round...")
-            except (OSError, BrokenPipeError, ConnectionResetError, TimeoutError):
+                    for value in update:
+                        send_data(s, value)
+                    previous_sent_state = candidate
+                    if args.model in ("slm", "lfm", "d1"):
+                        round_ack, _ = recv_data(s)
+                        if round_ack is None:
+                            break
+                    elif not s.recv(3):
+                        break
+            except RoundCancelled:
+                logger.info("Round %s: client %s training cancelled t=%.6f",
+                            round_id, args.client_idx, time.monotonic())
+                for series in (history.global_acc, history.global_loss, history.ala_acc,
+                               history.local_acc, history.train_acc):
+                    if len(series) < round_id:
+                        series.append(float("nan"))
+            except OSError:
+                if control is not None:
+                    raise
                 break
+
+            if control is not None:
+                result = control.expect("result", round_id)
+                version = result["version"]
+                if version != model_version + bool(result["accepted"]):
+                    raise ConnectionError(f"Versão agregada inválida na rodada {round_id}.")
+                if args.client_idx not in result["accepted"]:
+                    ala.weights = None
+                    ala.start_phase = True
+                    fedala_weights = None
+                else:
+                    fedala_weights = local_weights
+                    if args.delta_coding:
+                        previous_sent_state = candidate
+                result_state = result["model"]
+                _load_server_model(model, result_state, args.model, args.qlora)
+                model_version = version
+                logger.info("Round %s: client %s loaded v%s t=%.6f",
+                            round_id, args.client_idx, model_version, time.monotonic())
+                send_data(s, round_message("applied", round_id, version=model_version))
 
     history.save(args)
     logger.info("\nTraining completed!")
