@@ -366,7 +366,9 @@ def _release_unused_vision_modules(backbone: nn.Module) -> None:
 def setup_lfm_model(
     run_config: dict, device: torch.device, is_qlora: bool = False
 ) -> tuple[DecisionLFM, AutoTokenizer]:
-    """Instancia o modelo DecisionLFM em BF16 ou 4-bit NF4 com LoRA e DecisionHead."""
+    """Instancia o modelo DecisionLFM em BF16 ou 4-bit NF4 com LoRA/SoRA e DecisionHead."""
+    from lora_slm.sora import SORA_MODES, apply_sora_modules
+
     torch.set_float32_matmul_precision("high")
     model_cfg = run_config.get("model", {})
     name = model_cfg.get("name", MODEL_NAME)
@@ -374,6 +376,7 @@ def setup_lfm_model(
     head_size = model_cfg.get("head_size", 256)
     max_length = model_cfg.get("max_length", 2048)
     lora_cfg = model_cfg.get("lora", {})
+    is_sora = lora_cfg.get("mode", "with_lora") in SORA_MODES
 
     logger.info(f"Carregando tokenizer oficial de {name}...")
     tokenizer = AutoTokenizer.from_pretrained(name, revision=revision, trust_remote_code=True)
@@ -381,15 +384,29 @@ def setup_lfm_model(
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if is_qlora:
-        from lora_lfm.qlora import apply_qlora, load_quantized_lfm_backbone, verify_qlora_freezing
+        from lora_lfm.qlora import (
+            apply_qlora,
+            apply_qsora,
+            load_quantized_lfm_backbone,
+            verify_qlora_freezing,
+        )
 
-        logger.info("Carregando backbone LFM3 em 4-bit NF4 (QLoRA)...")
+        tag = "QSoRA" if is_sora else "QLoRA"
+        logger.info(f"Carregando backbone LFM3 em 4-bit NF4 ({tag})...")
         backbone = load_quantized_lfm_backbone(name, revision=revision, device=device)
         _release_unused_vision_modules(backbone)
-        backbone = apply_qlora(backbone, lora_cfg)
+        if is_sora:
+            compute_dtype = (
+                torch.bfloat16
+                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+            backbone = apply_qsora(backbone, lora_cfg, compute_dtype=compute_dtype)
+        else:
+            backbone = apply_qlora(backbone, lora_cfg)
         model = DecisionLFM(backbone, tokenizer, head_size=head_size, max_length=max_length)
         model.has_lora = True
-        model.to(device)
+        model.head.to(device)
         verify_qlora_freezing(model)
     else:
         logger.info("Carregando backbone LFM3 em bfloat16...")
@@ -411,20 +428,31 @@ def setup_lfm_model(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
 
-        # Injeta adaptadores LoRA estritamente no language_model
+        # Injeta adaptadores LoRA/SoRA estritamente no language_model
         rank = lora_cfg.get("r", 8)
         alpha = lora_cfg.get("alpha", 16)
         dropout = lora_cfg.get("dropout", 0.05)
         targets = _resolve_lora_targets(lora_cfg.get("target_modules", LORA_TARGETS))
 
-        peft_config = LoraConfig(
-            r=rank,
-            lora_alpha=alpha,
-            lora_dropout=dropout,
-            bias="none",
-            target_modules=targets,
-        )
-        backbone = get_peft_model(backbone, peft_config)
+        if is_sora:
+            n_wrapped = apply_sora_modules(
+                backbone,
+                target_pattern=targets,
+                r=int(rank),
+                lora_alpha=int(alpha),
+                lora_dropout=float(dropout),
+                adapter_dtype=torch.bfloat16,
+            )
+            logger.info(f"[LFM SoRA] SoRA aplicado a {n_wrapped} módulos.")
+        else:
+            peft_config = LoraConfig(
+                r=rank,
+                lora_alpha=alpha,
+                lora_dropout=dropout,
+                bias="none",
+                target_modules=targets,
+            )
+            backbone = get_peft_model(backbone, peft_config)
 
         model = DecisionLFM(backbone, tokenizer, head_size=head_size, max_length=max_length)
         model.has_lora = True

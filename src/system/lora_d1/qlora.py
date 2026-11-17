@@ -81,14 +81,13 @@ def load_quantized_d1_backbone(
     return backbone
 
 
-def apply_qlora(
+def _prepare_kbit_backbone(
     backbone: nn.Module,
-    lora_config: dict[str, Any],
     *,
     gradient_checkpointing: bool = True,
     prepare_kbit: bool = False,
 ) -> nn.Module:
-    """Congela o backbone 4-bit e injeta adaptadores LoRA evitando cast FP32 desnecessário."""
+    """Congela o backbone 4-bit e habilita gradient checkpointing sem cast FP32 desnecessário."""
     for param in backbone.parameters():
         param.requires_grad = False
 
@@ -107,7 +106,20 @@ def apply_qlora(
             )
         if hasattr(backbone, "config"):
             backbone.config.use_cache = False
+    return backbone
 
+
+def apply_qlora(
+    backbone: nn.Module,
+    lora_config: dict[str, Any],
+    *,
+    gradient_checkpointing: bool = True,
+    prepare_kbit: bool = False,
+) -> nn.Module:
+    """Congela o backbone 4-bit e injeta adaptadores LoRA evitando cast FP32 desnecessário."""
+    backbone = _prepare_kbit_backbone(
+        backbone, gradient_checkpointing=gradient_checkpointing, prepare_kbit=prepare_kbit
+    )
     targets = _resolve_lora_targets(lora_config.get("target_modules", LORA_TARGETS))
     peft_config = LoraConfig(
         r=int(lora_config.get("r", 8)),
@@ -119,11 +131,39 @@ def apply_qlora(
     return get_peft_model(backbone, peft_config)
 
 
+def apply_qsora(
+    backbone: nn.Module,
+    lora_config: dict[str, Any],
+    *,
+    gradient_checkpointing: bool = True,
+    prepare_kbit: bool = False,
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> nn.Module:
+    """Congela o backbone 4-bit e injeta adaptadores SoRA em 16 bits (QSoRA) no d1-2B."""
+    from lora_slm.sora import apply_sora_modules
+
+    backbone = _prepare_kbit_backbone(
+        backbone, gradient_checkpointing=gradient_checkpointing, prepare_kbit=prepare_kbit
+    )
+    targets = _resolve_lora_targets(lora_config.get("target_modules", LORA_TARGETS))
+    n_wrapped = apply_sora_modules(
+        backbone,
+        target_pattern=targets,
+        r=int(lora_config.get("r", 8)),
+        lora_alpha=int(lora_config.get("alpha", 16)),
+        lora_dropout=float(lora_config.get("dropout", 0.05)),
+        adapter_dtype=compute_dtype,
+    )
+    logger.info(f"[d1 QSoRA] SoRA aplicado a {n_wrapped} módulos Linear4bit.")
+    return backbone
+
+
 def verify_qlora_freezing(model: nn.Module) -> None:
-    """Garante que nenhum tensor 4-bit possua gradiente ativo no d1-2B."""
+    """Garante que nenhum tensor 4-bit ou peso base possua gradiente ativo no d1-2B."""
     trainable_count = 0
     params4bit_trainable = 0
     params4bit_total = 0
+    offenders = []
 
     for name, param in model.named_parameters():
         param_type = type(param).__name__
@@ -134,15 +174,18 @@ def verify_qlora_freezing(model: nn.Module) -> None:
                 params4bit_trainable += 1
                 logger.error(f"[d1 QLoRA] Parâmetro 4-bit com gradiente ativo: {name}")
         elif param.requires_grad:
+            if not ("lora_" in name or ".sora." in name):
+                offenders.append(name)
             trainable_count += param.numel()
 
-    if params4bit_trainable > 0:
+    if params4bit_trainable > 0 or offenders:
         raise RuntimeError(
-            f"Falha de isolamento QLoRA d1: {params4bit_trainable} tensores 4-bit treináveis!"
+            f"Falha de isolamento QLoRA/QSoRA d1: {params4bit_trainable} tensores 4-bit e "
+            f"{len(offenders)} tensores de backbone treináveis ({offenders[:5]})!"
         )
 
     logger.info(
-        f"[d1 QLoRA] Freezing OK: {params4bit_total} tensores 4-bit congelados | "
+        f"[d1 QLoRA/QSoRA] Freezing OK: {params4bit_total} tensores 4-bit congelados | "
         f"Treináveis: {trainable_count:,}"
     )
 
@@ -152,11 +195,28 @@ def build_d1_optimizer(
     run_config: dict[str, Any],
     is_qlora: bool = False,
 ) -> torch.optim.Optimizer:
-    """Constrói AdamW FP32 (estável para Non-IID) ou PagedAdamW8bit se configurado."""
+    """Constrói AdamW FP32 (estável para Non-IID) ou PagedAdamW8bit com suporte a gates SoRA."""
     opt_cfg = run_config.get("optimizer", {})
+    sora_cfg = run_config.get("model", {}).get("sora", {})
     lr = float(opt_cfg.get("lr", opt_cfg.get("lora_lr", 5e-5)))
+    sparse_lr = float(sora_cfg.get("sparse_lr") or lr)
     weight_decay = float(opt_cfg.get("weight_decay", 0.01))
-    params = [p for p in model.parameters() if p.requires_grad]
+
+    gate_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "sora" in name and "gate" in name:
+            gate_params.append(param)
+        else:
+            other_params.append(param)
+
+    param_groups = []
+    if other_params:
+        param_groups.append({"params": other_params, "lr": lr, "weight_decay": weight_decay})
+    if gate_params:
+        param_groups.append({"params": gate_params, "lr": sparse_lr, "weight_decay": 0.0})
 
     if is_qlora:
         qopt = (
@@ -167,17 +227,20 @@ def build_d1_optimizer(
         if qopt == "paged_adamw_8bit":
             import bitsandbytes as bnb
 
-            return bnb.optim.PagedAdamW8bit(params, lr=lr, weight_decay=weight_decay)
+            return bnb.optim.PagedAdamW8bit(param_groups)
 
-    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    return torch.optim.AdamW(param_groups)
 
 
 def assert_adapter_only_payload(payload: dict[str, Any]) -> None:
     """Assegura que somente adaptadores LoRA/SoRA trafeguem pela rede federada."""
-    allowed_pattern = re.compile(r".*(lora|sora)_.*")
+    allowed_pattern = re.compile(r".*(?:lora_|sora\.(?:lora_A|lora_B|gate)).*")
     violations = [k for k in payload if not allowed_pattern.search(k)]
     if violations:
         raise ValueError(
             f"Violação de isolamento de rede d1! {len(violations)} tensores não-PEFT "
             f"encontrados no payload: {violations[:5]}"
         )
+    for key, val in payload.items():
+        if isinstance(val, torch.Tensor) and val.dtype == torch.uint8:
+            raise ValueError(f"Tensor quantizado 4-bit detectado no payload d1: {key}")

@@ -394,9 +394,16 @@ if [ "$MODEL" = "clip" ] || [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ] || [ "$
     fi
 fi
 
-if [ "$QLORA" -eq 1 ] && { { [ "$MODEL" != "slm" ] && [ "$MODEL" != "lfm" ] && [ "$MODEL" != "d1" ]; } || [ "$STRATEGY" != "lora" ]; }; then
-    echo "❌ [ERRO] --qlora requer --model slm|lfm|d1 e --strategy lora (atual: model=$MODEL, strategy=$STRATEGY)"
-    exit 1
+if [ "$QLORA" -eq 1 ]; then
+    if [ "$MODEL" = "slm" ] || [ "$MODEL" = "lfm" ] || [ "$MODEL" = "d1" ]; then
+        if [ "$STRATEGY" != "lora" ] && [ "$STRATEGY" != "sora_with_schedule" ] && [ "$STRATEGY" != "sora_no_schedule" ]; then
+            echo "❌ [ERRO] --qlora com --model $MODEL requer --strategy lora|sora_with_schedule|sora_no_schedule (atual: $STRATEGY)"
+            exit 1
+        fi
+    else
+        echo "❌ [ERRO] --qlora requer --model slm|lfm|d1 (atual: model=$MODEL, strategy=$STRATEGY)"
+        exit 1
+    fi
 fi
 
 # ---- Exibição da Configuração ----

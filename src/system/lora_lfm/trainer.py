@@ -47,12 +47,16 @@ def train_epoch_lfm(
     device: torch.device,
     brier_weight: float = 1.0,
     grad_accum_steps: int = 1,
+    sparse_optimizer: object | None = None,
 ) -> tuple[float, float]:
-    """Loop de treino local de 1 época do DecisionLFM."""
+    """Loop de treino local de 1 época do DecisionLFM (suporta LoRA/QLoRA e SoRA/QSoRA)."""
     model.train()
     total_loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
     correct_tensor = torch.zeros((), device=device, dtype=torch.long)
     total_samples = 0
+
+    if sparse_optimizer is not None and hasattr(sparse_optimizer, "step_lambda"):
+        sparse_optimizer.step_lambda()
 
     optimizer.zero_grad(set_to_none=True)
     use_autocast = device.type == "cuda"
@@ -81,6 +85,8 @@ def train_epoch_lfm(
 
         if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(train_loader):
             optimizer.step()
+            if sparse_optimizer is not None:
+                sparse_optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
     if scheduler is not None:

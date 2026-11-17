@@ -1,22 +1,28 @@
 """
-QLoRA (Quantized Low-Rank Adaptation) para o pipeline federado de SLM.
+QLoRA / QSoRA (Quantized Low-Rank / Sparse Low-Rank Adaptation) para o pipeline federado de SLM.
 
 Resumo da teoria aplicada ao FL:
   * Backbone: carregado em 4 bits NF4 + Dupla Quantização (BitsAndBytes), com
     computação em 16 bits (bf16, ou fp16 se a GPU não suportar bf16).
-  * O backbone fica 100% congelado. Apenas os adaptadores LoRA (16 bits) e a head
-    de classificação recebem gradiente.
-  * Comunicação: SOMENTE o state_dict dos adaptadores (get/set_peft_model_state_dict)
-    + a head trafegam pela rede. O backbone de 4 bits nunca é transmitido nem agregado.
+  * O backbone fica 100% congelado. Apenas os adaptadores LoRA/SoRA (16 bits) e
+    a head de classificação recebem gradiente.
+  * Comunicação: SOMENTE o state_dict dos adaptadores (PEFT no QLoRA, ou
+    SoRAWrappedLinear no QSoRA) + a head trafegam pela rede. O backbone de 4 bits
+    nunca é transmitido nem agregado.
 
 Formato das chaves trafegadas (wire format):
-  * Adaptadores: "slm_model." + chave canônica do PEFT (sem o nome do adapter),
-    ex.: "slm_model.base_model.model.language_model.layers.3.self_attn.q_proj.lora_A.weight"
-  * Head:       "classifier.weight", "classifier.bias"
-  Os padrões ".layers.N." e ".lora_A"/".lora_B" são mantidos, então o PaCA e o
-  rank adaptativo do servidor funcionam sem alteração.
+  * QLoRA (PEFT):
+    - Adaptadores: "slm_model." + chave canônica do PEFT (sem o nome do adapter),
+      ex.: "slm_model.base_model.model.language_model.layers.3.self_attn.q_proj.lora_A.weight"
+    - Head:        "classifier.weight", "classifier.bias"
+  * QSoRA (SoRAWrappedLinear):
+    - Adaptadores: "slm_model.language_model.layers.3.self_attn.q_proj.sora.{lora_A,lora_B,gate}"
+    - Head:        "classifier.weight", "classifier.bias"
+  Os padrões ".layers.N.", ".lora_A"/".lora_B" e ".gate" são mantidos, então o
+  PaCA, o rank adaptativo e a poda iterativa SoRA do servidor funcionam sem alteração.
 
-Ativação: flag `--qlora` (run.sh / client.py / server.py), apenas com `--strategy lora`.
+Ativação: flag `--qlora` (run.sh / client.py / server.py) com `--strategy lora`,
+`sora_with_schedule` ou `sora_no_schedule`.
 """
 import logging
 
@@ -27,6 +33,7 @@ logger = logging.getLogger(__name__)
 HEAD_PREFIX = "classifier."
 PEFT_PREFIX = "slm_model."
 ADAPTER_NAME = "default"
+SUPPORTED_QLORA_STRATEGIES = ("lora", "sora_with_schedule", "sora_no_schedule")
 DEFAULT_QLORA_CONFIG = {
     "quant_type": "nf4",
     "double_quant": True,
@@ -45,12 +52,17 @@ def is_qlora_enabled(config) -> bool:
     return bool(config and config.get("model", {}).get("qlora", {}).get("enabled", False))
 
 
+def is_qsora_model(model) -> bool:
+    """Identifica se o modelo quantizado utiliza adaptadores SoRAWrappedLinear (QSoRA)."""
+    return any(".sora." in name for name, _ in model.named_parameters())
+
+
 def enable_qlora_in_config(config, strategy: str) -> None:
-    """Liga o QLoRA no dicionário de config (chamado por client/server a partir da flag --qlora)."""
-    if strategy != "lora":
+    """Liga o QLoRA/QSoRA no dicionário de config (chamado por client/server a partir da flag --qlora)."""
+    if strategy not in SUPPORTED_QLORA_STRATEGIES:
         raise ValueError(
-            f"--qlora só é suportado com --strategy lora (recebido: '{strategy}'). "
-            "SoRA/AdaLoRA sobre backbone 4-bit não estão implementados."
+            f"--qlora é suportado apenas com --strategy em {SUPPORTED_QLORA_STRATEGIES} "
+            f"(recebido: '{strategy}')."
         )
     qcfg = {**DEFAULT_QLORA_CONFIG, **config["model"].get("qlora", {})}
     qcfg["enabled"] = True
@@ -105,9 +117,9 @@ def load_quantized_backbone(model_name: str, qcfg, device):
     return backbone, compute_dtype
 
 
-def apply_qlora(model, lora_config, qcfg, compute_dtype):
-    """Congela o backbone 4-bit e injeta adaptadores LoRA em 16 bits (in-place em model.slm_model)."""
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+def _prepare_4bit_backbone(model, qcfg, compute_dtype) -> None:
+    """Habilita gradient checkpointing e congela 100% do backbone 4-bit antes dos adaptadores."""
+    from peft import prepare_model_for_kbit_training
 
     # Nota: prepare_model_for_kbit_training do PEFT converte embeddings/LayerNorms (311M params no Qwen3-VL)
     # para fp32, o que foi pensado para evitar underflow em fp16 mas desperdiça ~600 MB/cliente em bf16.
@@ -126,9 +138,27 @@ def apply_qlora(model, lora_config, qcfg, compute_dtype):
         if hasattr(model.slm_model, "enable_input_require_grads"):
             model.slm_model.enable_input_require_grads()
 
-    # Congelamento explícito de 100% do backbone (antes da injeção PEFT)
+    # Congelamento explícito de 100% do backbone (antes da injeção dos adaptadores)
     for param in model.slm_model.parameters():
         param.requires_grad = False
+
+
+def _finalize_4bit_model(model, compute_dtype) -> None:
+    """Configura a head treinável em 16 bits no device do backbone e valida o congelamento 4-bit."""
+    device = next(p.device for p in model.slm_model.parameters())
+    model.classifier.to(device=device, dtype=compute_dtype)
+    for param in model.classifier.parameters():
+        param.requires_grad = True
+
+    model.compute_dtype = compute_dtype
+    verify_qlora_freezing(model)
+
+
+def apply_qlora(model, lora_config, qcfg, compute_dtype):
+    """Congela o backbone 4-bit e injeta adaptadores LoRA em 16 bits (in-place em model.slm_model)."""
+    from peft import LoraConfig, get_peft_model
+
+    _prepare_4bit_backbone(model, qcfg, compute_dtype)
 
     peft_config = LoraConfig(
         r=lora_config["r"],
@@ -143,42 +173,51 @@ def apply_qlora(model, lora_config, qcfg, compute_dtype):
         if "lora_" in name:
             param.data = param.data.to(compute_dtype)
 
-    # Head de classificação em 16 bits, treinável, no mesmo device do backbone
-    device = next(p.device for p in model.slm_model.parameters())
-    model.classifier.to(device=device, dtype=compute_dtype)
-    for param in model.classifier.parameters():
-        param.requires_grad = True
+    _finalize_4bit_model(model, compute_dtype)
+    return model
 
-    model.compute_dtype = compute_dtype
-    verify_qlora_freezing(model)
+
+def apply_qsora(model, lora_config, qcfg, compute_dtype, apply_sora_fn):
+    """Congela o backbone 4-bit e injeta adaptadores SoRA em 16 bits (QSoRA)."""
+    _prepare_4bit_backbone(model, qcfg, compute_dtype)
+    apply_sora_fn(model, lora_config, upper_k=None, adapter_dtype=compute_dtype)
+    _finalize_4bit_model(model, compute_dtype)
     return model
 
 
 def verify_qlora_freezing(model) -> None:
-    """Garante que apenas LoRA/head são treináveis e que nenhum peso 4-bit recebe gradiente."""
+    """Garante que apenas LoRA/SoRA/head são treináveis e que nenhum peso 4-bit recebe gradiente."""
     offenders = [
         n for n, p in model.named_parameters()
-        if p.requires_grad and "lora_" not in n and not n.startswith(HEAD_PREFIX)
+        if p.requires_grad
+        and "lora_" not in n
+        and ".sora." not in n
+        and not n.startswith(HEAD_PREFIX)
     ]
     quantized_trainable = [
         n for n, p in model.named_parameters()
-        if p.requires_grad and p.__class__.__name__ == "Params4bit"
+        if p.requires_grad
+        and (p.__class__.__name__ == "Params4bit" or "int4" in p.__class__.__name__.lower())
     ]
     if offenders or quantized_trainable:
-        raise RuntimeError(f"[QLoRA] Parâmetros do backbone treináveis: {(offenders + quantized_trainable)[:5]}")
+        raise RuntimeError(f"[QLoRA/QSoRA] Parâmetros do backbone treináveis: {(offenders + quantized_trainable)[:5]}")
 
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_4bit = sum(1 for p in model.parameters() if p.__class__.__name__ == "Params4bit")
-    lora_dtypes = {p.dtype for n, p in model.named_parameters() if "lora_" in n}
-    logger.info(f"[QLoRA] Treináveis: {n_train:,} | Tensores 4-bit congelados: {n_4bit} | dtype LoRA: {lora_dtypes}")
+    n_4bit = sum(
+        1 for p in model.parameters()
+        if p.__class__.__name__ == "Params4bit" or "int4" in p.__class__.__name__.lower()
+    )
+    adapter_dtypes = {p.dtype for n, p in model.named_parameters() if "lora_" in n or ".sora." in n}
+    tag = "QSoRA" if is_qsora_model(model) else "QLoRA"
+    logger.info(f"[{tag}] Treináveis: {n_train:,} | Tensores 4-bit congelados: {n_4bit} | dtype adaptadores: {adapter_dtypes}")
 
 
 # ---------------------------------------------------------------------------
 # Otimizador
 # ---------------------------------------------------------------------------
-def build_qlora_optimizer(model, config):
+def build_qlora_optimizer(model, config, param_groups=None):
     optimizer_config = config["optimizer"]
-    params = [p for p in model.parameters() if p.requires_grad]
+    params = param_groups if param_groups is not None else [p for p in model.parameters() if p.requires_grad]
     name = config["model"].get("qlora", {}).get("optimizer", "paged_adamw_8bit")
     if name == "paged_adamw_8bit":
         import bitsandbytes as bnb
@@ -199,14 +238,39 @@ def _canonical_to_param_name(canonical_key: str) -> str:
     return canonical_key
 
 
+def _import_resize_model_to_pruned():
+    try:
+        from utils.fl_math import resize_model_to_pruned
+    except ImportError:
+        import sys
+        from pathlib import Path
+
+        sys.path.append(str(Path(__file__).resolve().parents[2]))
+        from utils.fl_math import resize_model_to_pruned
+    return resize_model_to_pruned
+
+
 def get_qlora_state_dict(model, trainable_only: bool = True) -> dict:
     """
-    Extrai SOMENTE os adaptadores LoRA (via get_peft_model_state_dict) + head, em 16 bits na CPU.
+    Extrai SOMENTE os adaptadores LoRA/SoRA + head, em 16 bits na CPU.
     trainable_only=True respeita o PaCA (não envia adaptadores de camadas congeladas no round).
     """
+    compute_dtype = getattr(model, "compute_dtype", torch.bfloat16)
+
+    if is_qsora_model(model):
+        state = {
+            name: param.detach().to("cpu", dtype=compute_dtype).clone()
+            for name, param in model.named_parameters()
+            if (
+                (".sora." in name and (not trainable_only or param.requires_grad))
+                or name.startswith(HEAD_PREFIX)
+            )
+        }
+        assert_adapter_only_payload(state)
+        return state
+
     from peft import get_peft_model_state_dict
 
-    compute_dtype = getattr(model, "compute_dtype", torch.bfloat16)
     params = dict(model.slm_model.named_parameters())
     state = {}
     for key, tensor in get_peft_model_state_dict(model.slm_model, adapter_name=ADAPTER_NAME).items():
@@ -222,18 +286,16 @@ def get_qlora_state_dict(model, trainable_only: bool = True) -> dict:
 
 
 def set_qlora_state_dict(model, state: dict) -> None:
-    """Injeta adaptadores (set_peft_model_state_dict) + head. Suporta mudança de rank (rank adaptativo)."""
+    """Injeta adaptadores (PEFT no QLoRA, ou SoRAWrappedLinear no QSoRA) + head, com suporte a rank dinâmico."""
+    assert_adapter_only_payload(state)
+    resize_model_to_pruned = _import_resize_model_to_pruned()
+
+    if is_qsora_model(model):
+        resize_model_to_pruned(model, state)
+        return
+
     from peft import set_peft_model_state_dict
 
-    try:
-        from utils.fl_math import resize_model_to_pruned
-    except ImportError:
-        import sys
-        from pathlib import Path
-        sys.path.append(str(Path(__file__).resolve().parents[2]))
-        from utils.fl_math import resize_model_to_pruned
-
-    assert_adapter_only_payload(state)
     peft_state = {k[len(PEFT_PREFIX):]: v for k, v in state.items() if k.startswith(PEFT_PREFIX)}
     head_state = {k[len(HEAD_PREFIX):]: v for k, v in state.items() if k.startswith(HEAD_PREFIX)}
 
@@ -265,9 +327,9 @@ def set_qlora_state_dict(model, state: dict) -> None:
 def assert_adapter_only_payload(state: dict) -> None:
     """Proteção: o backbone 4-bit NUNCA pode ir para a rede."""
     for key, value in state.items():
-        is_adapter = key.startswith(PEFT_PREFIX) and "lora_" in key
+        is_adapter = key.startswith(PEFT_PREFIX) and ("lora_" in key or ".sora." in key)
         if not (is_adapter or key.startswith(HEAD_PREFIX)):
-            raise RuntimeError(f"[QLoRA] Chave fora dos adaptadores no payload: {key}")
+            raise RuntimeError(f"[QLoRA/QSoRA] Chave fora dos adaptadores no payload: {key}")
         if isinstance(value, torch.Tensor) and value.dtype == torch.uint8:
-            raise RuntimeError(f"[QLoRA] Tensor quantizado 4-bit detectado no payload: {key}")
+            raise RuntimeError(f"[QLoRA/QSoRA] Tensor quantizado 4-bit detectado no payload: {key}")
 

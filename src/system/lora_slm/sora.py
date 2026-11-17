@@ -1,7 +1,11 @@
 import math
+import re
+
 import numpy as np
 import torch
 import torch.nn as nn
+
+SORA_MODES = ("with_sora_no_schedule", "with_sora_schedule")
 
 
 class SoRALinear(nn.Module):
@@ -15,6 +19,7 @@ class SoRALinear(nn.Module):
     def __init__(self, in_features, out_features, r=8, lora_alpha=16, lora_dropout=0.0):
         super().__init__()
         self.r = r
+        self.base_r = r
         self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / r
 
@@ -32,17 +37,19 @@ class SoRALinear(nn.Module):
 
     def forward(self, x):
         """Calcula a saída do adaptador: (x * A * gate) * B."""
-        return ((self.lora_dropout(x) @ self.lora_A.T).mul(self.gate) @ self.lora_B.T) * self.scaling
+        x_in = x.to(self.lora_A.dtype) if x.dtype != self.lora_A.dtype else x
+        return ((self.lora_dropout(x_in) @ self.lora_A.T).mul(self.gate) @ self.lora_B.T) * self.scaling
 
 
 class SoRAWrappedLinear(nn.Module):
     """
     Integração não-invasiva de adaptadores.
-    Envolve uma camada linear original (congelada) e adiciona o SoRALinear em paralelo. 
-    A saída final é a soma da projeção original com a correção de rank baixo.
+    Envolve uma camada linear original (congelada, inclusive Linear4bit no QSoRA) e
+    adiciona o SoRALinear em paralelo. A saída final é a soma da projeção original
+    com a correção de rank baixo.
     """
 
-    def __init__(self, original_linear, r=8, lora_alpha=16, lora_dropout=0.0):
+    def __init__(self, original_linear, r=8, lora_alpha=16, lora_dropout=0.0, adapter_dtype=None):
         super().__init__()
         self.original = original_linear
         self.sora = SoRALinear(
@@ -52,18 +59,34 @@ class SoRAWrappedLinear(nn.Module):
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
         )
-        
-        self.sora.to(original_linear.weight.dtype)
-        
+
+        # Em backbones 4-bit (bnb.nn.Linear4bit), original_linear.weight é uint8 empacotado.
+        # Evita converter os adaptadores para uint8 usando adapter_dtype (bf16/fp16) e o mesmo device.
+        if adapter_dtype is not None:
+            target_dtype = adapter_dtype
+        elif original_linear.weight.is_floating_point():
+            target_dtype = original_linear.weight.dtype
+        else:
+            target_dtype = (
+                torch.bfloat16
+                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+        self.sora.to(device=original_linear.weight.device, dtype=target_dtype)
+
         # Congela os pesos originais para garantir que apenas o adaptador aprenda
         for p in self.original.parameters():
             p.requires_grad = False
 
     def forward(self, x):
+        orig_out = self.original(x)
         # Proteção: se o SoRA for removido (em versões futuras ou poda radical), retorna apenas o original
         if self.sora is None:
-            return self.original(x)
-        return self.original(x) + self.sora(x)
+            return orig_out
+        sora_out = self.sora(x)
+        if sora_out.dtype != orig_out.dtype:
+            sora_out = sora_out.to(orig_out.dtype)
+        return orig_out + sora_out
 
 @torch.no_grad()
 def prune_sora_to_lora_and_report(model, min_rank=2):
@@ -119,7 +142,8 @@ def prune_sora_to_lora_and_report(model, min_rank=2):
                 self.scaling = scaling
 
             def forward(self, x):
-                return (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+                x_in = x.to(self.lora_A.dtype) if x.dtype != self.lora_A.dtype else x
+                return (x_in @ self.lora_A.T @ self.lora_B.T) * self.scaling
 
         module.sora = PrunedLoRA(A_pruned, new_B, sora.scaling)
         sora_modules += 1
@@ -391,3 +415,72 @@ class GateSparsifier:
             return
         for p in self.gate_params:
             p.data = torch.nn.functional.softshrink(p.data, threshold)
+
+
+def apply_sora_modules(
+    root_module: nn.Module,
+    target_pattern: str | list[str],
+    r: int = 8,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.0,
+    adapter_dtype: torch.dtype | None = None,
+) -> int:
+    """Substitui camadas nn.Linear/Linear4bit correspondentes por SoRAWrappedLinear."""
+    regex = re.compile(target_pattern) if isinstance(target_pattern, str) else None
+    modules_map = dict(root_module.named_modules())
+    replacements = []
+
+    for name in list(modules_map.keys()):
+        if regex is not None:
+            if not regex.match(name):
+                continue
+        elif not any(name.endswith(t) for t in target_pattern):
+            continue
+
+        parts = name.rsplit(".", 1)
+        parent = modules_map[parts[0]] if len(parts) == 2 else root_module
+        child_name = parts[1] if len(parts) == 2 else parts[0]
+        original_linear = getattr(parent, child_name)
+        if isinstance(original_linear, nn.Linear):
+            replacements.append((parent, child_name, original_linear))
+
+    for parent, child_name, original_linear in replacements:
+        wrapped = SoRAWrappedLinear(
+            original_linear,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            adapter_dtype=adapter_dtype,
+        )
+        setattr(parent, child_name, wrapped)
+    return len(replacements)
+
+
+def build_sora_gate_sparsifier(model: nn.Module, run_config: dict) -> GateSparsifier | None:
+    """Constrói GateSparsifier para modelos com estratégia SoRA/QSoRA ativa."""
+    model_cfg = run_config.get("model", {})
+    mode = model_cfg.get("lora", {}).get("mode", "with_lora")
+    if mode not in SORA_MODES:
+        return None
+
+    gate_params = [
+        p
+        for n, p in model.named_parameters()
+        if p.requires_grad and "sora" in n and "gate" in n
+    ]
+    if not gate_params:
+        return None
+
+    sora_cfg = model_cfg.get("sora", {})
+    opt_cfg = run_config.get("optimizer", {})
+    default_lr = float(opt_cfg.get("lr", opt_cfg.get("lora_lr", 0.01)))
+    sparse_lr = float(sora_cfg.get("sparse_lr") or default_lr)
+    is_schedule = mode == "with_sora_schedule"
+    return GateSparsifier(
+        gate_params=gate_params,
+        sparse_lambda=float(sora_cfg.get("sparse_lambda_2", 0.10)),
+        gate_lr=sparse_lr,
+        lambda_schedule=sora_cfg.get("lambda_schedule", "linear") if is_schedule else None,
+        max_lambda=sora_cfg.get("max_lambda", 0.20) if is_schedule else None,
+        lambda_num=sora_cfg.get("lambda_num", 10) if is_schedule else None,
+    )

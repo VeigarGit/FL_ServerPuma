@@ -19,9 +19,21 @@ except ImportError:
     from lora_slm.sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
 
 try:
-    from qlora import is_qlora_enabled, load_quantized_backbone, apply_qlora, build_qlora_optimizer
+    from qlora import (
+        is_qlora_enabled,
+        load_quantized_backbone,
+        apply_qlora,
+        apply_qsora,
+        build_qlora_optimizer,
+    )
 except ImportError:
-    from lora_slm.qlora import is_qlora_enabled, load_quantized_backbone, apply_qlora, build_qlora_optimizer
+    from lora_slm.qlora import (
+        is_qlora_enabled,
+        load_quantized_backbone,
+        apply_qlora,
+        apply_qsora,
+        build_qlora_optimizer,
+    )
 
 DEFAULT_CONFIG_PATH = Path("train_config.yml")
 VALID_LORA_MODES = {
@@ -205,7 +217,7 @@ def build_dataloaders(config, processor, device):
     eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0, pin_memory=True)
     return train_loader, eval_loader, class_names
 
-def apply_sora(model, lora_config, upper_k=None):
+def apply_sora(model, lora_config, upper_k=None, adapter_dtype=None):
     target_modules = lora_config["target_modules"]
     r = lora_config["r"]
     alpha = lora_config["alpha"]
@@ -242,7 +254,13 @@ def apply_sora(model, lora_config, upper_k=None):
                 replacements.append((parent, child_name, original_linear))
 
     for parent, child_name, original_linear in replacements:
-        wrapped = SoRAWrappedLinear(original_linear, r=r, lora_alpha=alpha, lora_dropout=dropout)
+        wrapped = SoRAWrappedLinear(
+            original_linear,
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            adapter_dtype=adapter_dtype,
+        )
         setattr(parent, child_name, wrapped)
 
     print(f"SoRA aplicado a {len(replacements)} módulos (Últimas {upper_k or 'todas'} camadas)")
@@ -341,12 +359,16 @@ def build_model(config, num_classes, device):
 
 
 def _build_qlora_model(config, num_classes, device):
-    """Backbone 4-bit NF4 congelado + adaptadores LoRA 16 bits (ver lora_slm/qlora.py)."""
+    """Backbone 4-bit NF4 congelado + adaptadores LoRA/SoRA 16 bits (ver lora_slm/qlora.py)."""
     model_config = config["model"]
     qcfg = model_config["qlora"]
+    mode = model_config["lora"]["mode"]
     slm_base, compute_dtype = load_quantized_backbone(model_config["name"], qcfg, device)
     model = SLMForClassification(slm_base, num_classes)
-    apply_qlora(model, model_config["lora"], qcfg, compute_dtype)
+    if mode in SORA_MODES:
+        apply_qsora(model, model_config["lora"], qcfg, compute_dtype, apply_sora_fn=apply_sora)
+    else:
+        apply_qlora(model, model_config["lora"], qcfg, compute_dtype)
 
     paca_config = model_config.get("paca", {})
     upper_k = paca_config.get("upper_layers") if paca_config.get("enabled") else None
@@ -357,13 +379,11 @@ def _build_qlora_model(config, num_classes, device):
 
 
 def build_optimizer(model, config):
-    if is_qlora_enabled(config):
-        return build_qlora_optimizer(model, config), None
-
     optimizer_config = config["optimizer"]
     sora_config = config["model"].get("sora", {})
     mode = config["model"]["lora"]["mode"]
     is_sora = mode in SORA_MODES
+    use_qlora = is_qlora_enabled(config)
 
     if is_sora:
         gate_params = []
@@ -373,15 +393,20 @@ def build_optimizer(model, config):
             if "sora" in name and "gate" in name: gate_params.append(param)
             else: other_params.append(param)
         sparse_lr = sora_config.get("sparse_lr") or optimizer_config["lr"]
-        unified_optimizer = AdamW([
+        param_groups = [
             {'params': other_params, 'lr': optimizer_config["lr"], 'weight_decay': optimizer_config["weight_decay"]},
             {'params': gate_params, 'lr': sparse_lr, 'weight_decay': 0.0},
-        ])
-        
+        ]
+        unified_optimizer = (
+            build_qlora_optimizer(model, config, param_groups=param_groups)
+            if use_qlora
+            else AdamW(param_groups)
+        )
+
         lambda_schedule = sora_config.get("lambda_schedule") if mode == "with_sora_schedule" else None
         max_lambda = sora_config.get("max_lambda") if mode == "with_sora_schedule" else None
         lambda_num = sora_config.get("lambda_num") if mode == "with_sora_schedule" else None
-        
+
         gate_sparsifier = GateSparsifier(
             gate_params=gate_params,
             sparse_lambda=sora_config.get("sparse_lambda_2", 3e-4),
@@ -391,6 +416,9 @@ def build_optimizer(model, config):
             lambda_num=lambda_num,
         )
         return unified_optimizer, gate_sparsifier
+
+    if use_qlora:
+        return build_qlora_optimizer(model, config), None
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     return AdamW(trainable_params, lr=optimizer_config["lr"], weight_decay=optimizer_config["weight_decay"]), None

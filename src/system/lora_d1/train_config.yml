@@ -34,6 +34,14 @@ model:
     compute_dtype: bfloat16
     optimizer: adamw
     prepare_kbit: false
+  sora:
+    sparse_lambda: 0.001
+    sparse_lambda_2: 0.10
+    sparse_lr: 0.01
+    lambda_schedule: linear
+    max_lambda: 0.20
+    lambda_num: 10
+    min_rank: 2
 
 training:
   batch_size: 8

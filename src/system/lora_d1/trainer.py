@@ -59,12 +59,16 @@ def train_epoch_d1(
     brier_weight: float = 1.0,
     grad_accum_steps: int = 1,
     max_grad_norm: float = 1.0,
+    sparse_optimizer: object | None = None,
 ) -> tuple[float, float]:
-    """Executa 1 época de fine-tuning local para o LiquidAI/d1-2B."""
+    """Executa 1 época de fine-tuning local para o LiquidAI/d1-2B (LoRA/QLoRA e SoRA/QSoRA)."""
     model.train()
     total_loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
     correct_tensor = torch.zeros((), device=device, dtype=torch.long)
     total_samples = 0
+
+    if sparse_optimizer is not None and hasattr(sparse_optimizer, "step_lambda"):
+        sparse_optimizer.step_lambda()
 
     optimizer.zero_grad(set_to_none=True)
     use_autocast = device.type == "cuda"
@@ -93,6 +97,8 @@ def train_epoch_d1(
             if trainable_params and max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
+            if sparse_optimizer is not None:
+                sparse_optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
     if scheduler is not None:
