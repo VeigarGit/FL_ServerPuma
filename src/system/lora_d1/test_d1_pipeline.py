@@ -69,7 +69,8 @@ def test_loss_and_payload_isolation():
         "backbone.base_model.model.model.language_model.layers.23"
         ".self_attn.q_proj.lora_A.default.weight"
     )
-    valid_payload = {lora_key: torch.randn(8, 2048)}
+    sora_gate_key = "backbone.model.language_model.layers.23.feed_forward.w1.sora.gate"
+    valid_payload = {lora_key: torch.randn(8, 2048), sora_gate_key: torch.ones(1, 8)}
     assert_adapter_only_payload(valid_payload)
 
     invalid_payload = {

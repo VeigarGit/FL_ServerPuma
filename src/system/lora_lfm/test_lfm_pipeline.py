@@ -68,11 +68,13 @@ def test_loss_backward():
 
 def test_payload_isolation():
     lora_key = "base_model.model.language_model.layers.23.self_attn.q_proj.lora_A.default.weight"
+    sora_gate_key = "backbone.language_model.layers.23.feed_forward.w1.sora.gate"
     valid_payload = {
         "head.query.weight": torch.randn(256, 2048),
         "head.option.weight": torch.randn(256, 2048),
         "head.norm.weight": torch.randn(2048),
         lora_key: torch.randn(8, 2048),
+        sora_gate_key: torch.ones(1, 8),
     }
     assert_adapter_only_payload(valid_payload)
 
