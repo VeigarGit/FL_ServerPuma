@@ -23,6 +23,9 @@ import random
 from torch.utils.data import DataLoader
 from typing import List, Tuple
 from torch.utils.data import Subset
+
+from prunning_snip import apply_mask
+
 class ALA:
     def __init__(self,
                 cid: int,
@@ -72,7 +75,7 @@ class ALA:
     def adaptive_local_aggregation(self, 
                             global_model: nn.Module,
                             local_model: nn.Module,
-                            mask = None) -> None:
+                            mask=None, checkpoint=None) -> None:
         """
         Generates the Dataloader for the randomly sampled local training data and 
         preserves the lower layers of the update. 
@@ -138,6 +141,8 @@ class ALA:
         cnt = 0  # weight training iteration counter
         while True:
             for x, y in rand_loader:
+                if checkpoint is not None:
+                    checkpoint()
                 if type(x) == type([]):
                     x[0] = x[0].to(self.device)
                 else:
