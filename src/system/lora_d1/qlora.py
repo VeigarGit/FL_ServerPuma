@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, prepare_model_for_kbit_training
 from transformers import AutoModel, BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
@@ -115,11 +115,21 @@ def apply_qlora(
     *,
     gradient_checkpointing: bool = True,
     prepare_kbit: bool = False,
+    compute_dtype: torch.dtype | None = None,
 ) -> nn.Module:
-    """Congela o backbone 4-bit e injeta adaptadores LoRA evitando cast FP32 desnecessário."""
+    """Congela o backbone 4-bit e injeta adaptadores LoRA no compute_dtype de 16 bits."""
+    from lora_slm.sora import apply_peft_lora_modules
+
     backbone = _prepare_kbit_backbone(
         backbone, gradient_checkpointing=gradient_checkpointing, prepare_kbit=prepare_kbit
     )
+    target_dtype = compute_dtype
+    if target_dtype is None:
+        target_dtype = (
+            torch.bfloat16
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        )
     targets = _resolve_lora_targets(lora_config.get("target_modules", LORA_TARGETS))
     peft_config = LoraConfig(
         r=int(lora_config.get("r", 8)),
@@ -128,7 +138,7 @@ def apply_qlora(
         bias=str(lora_config.get("bias", "none")),
         target_modules=targets,
     )
-    return get_peft_model(backbone, peft_config)
+    return apply_peft_lora_modules(backbone, peft_config, adapter_dtype=target_dtype)
 
 
 def apply_qsora(
@@ -184,9 +194,12 @@ def verify_qlora_freezing(model: nn.Module) -> None:
             f"{len(offenders)} tensores de backbone treináveis ({offenders[:5]})!"
         )
 
+    adapter_dtypes = sorted(
+        {str(p.dtype) for n, p in model.named_parameters() if "lora_" in n or ".sora." in n}
+    )
     logger.info(
         f"[d1 QLoRA/QSoRA] Freezing OK: {params4bit_total} tensores 4-bit congelados | "
-        f"Treináveis: {trainable_count:,}"
+        f"Treináveis: {trainable_count:,} | dtype adaptadores: {adapter_dtypes}"
     )
 
 
@@ -229,7 +242,12 @@ def build_d1_optimizer(
 
             return bnb.optim.PagedAdamW8bit(param_groups)
 
-    return torch.optim.AdamW(param_groups)
+    use_fused = bool(param_groups) and all(
+        p.is_cuda and p.is_floating_point()
+        for group in param_groups
+        for p in group["params"]
+    )
+    return torch.optim.AdamW(param_groups, fused=use_fused)
 
 
 def assert_adapter_only_payload(payload: dict[str, Any]) -> None:

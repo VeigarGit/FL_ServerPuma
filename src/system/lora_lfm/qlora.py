@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, prepare_model_for_kbit_training
 from transformers import AutoModel, BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
@@ -71,9 +71,22 @@ def _prepare_kbit_backbone(backbone: nn.Module) -> nn.Module:
     )
 
 
-def apply_qlora(backbone: nn.Module, lora_config: dict[str, Any]) -> nn.Module:
-    """Prepara o backbone 4-bit e injeta adaptadores LoRA com gradient checkpointing seguro."""
+def apply_qlora(
+    backbone: nn.Module,
+    lora_config: dict[str, Any],
+    compute_dtype: torch.dtype | None = None,
+) -> nn.Module:
+    """Prepara o backbone 4-bit e injeta adaptadores LoRA em 16 bits (sem cast para fp32)."""
+    from lora_slm.sora import apply_peft_lora_modules
+
     backbone = _prepare_kbit_backbone(backbone)
+    target_dtype = compute_dtype
+    if target_dtype is None:
+        target_dtype = (
+            torch.bfloat16
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        )
 
     rank = lora_config.get("r", 8)
     alpha = lora_config.get("alpha", 16)
@@ -87,7 +100,7 @@ def apply_qlora(backbone: nn.Module, lora_config: dict[str, Any]) -> nn.Module:
         bias="none",
         target_modules=targets,
     )
-    return get_peft_model(backbone, peft_config)
+    return apply_peft_lora_modules(backbone, peft_config, adapter_dtype=target_dtype)
 
 
 def apply_qsora(
@@ -141,9 +154,13 @@ def verify_qlora_freezing(model: nn.Module) -> None:
             f"{len(offenders)} tensores de backbone treináveis ({offenders[:5]})!"
         )
 
+    adapter_dtypes = sorted(
+        {str(p.dtype) for n, p in model.named_parameters() if "lora_" in n or ".sora." in n}
+    )
     logger.info(
         f"[QLoRA/QSoRA Freezing Check] Aprovado! {params4bit_total} tensores 4-bit congelados. "
-        f"Total de parâmetros treináveis (Adaptadores + Head): {trainable_count:,}"
+        f"Total de parâmetros treináveis (Adaptadores + Head): {trainable_count:,} | "
+        f"dtype adaptadores: {adapter_dtypes}"
     )
 
 

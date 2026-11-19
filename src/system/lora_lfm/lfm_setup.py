@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig
 from torch.utils.data import Dataset
 from transformers import AutoModel, AutoTokenizer
 
@@ -367,7 +367,7 @@ def setup_lfm_model(
     run_config: dict, device: torch.device, is_qlora: bool = False
 ) -> tuple[DecisionLFM, AutoTokenizer]:
     """Instancia o modelo DecisionLFM em BF16 ou 4-bit NF4 com LoRA/SoRA e DecisionHead."""
-    from lora_slm.sora import SORA_MODES, apply_sora_modules
+    from lora_slm.sora import SORA_MODES, apply_peft_lora_modules, apply_sora_modules
 
     torch.set_float32_matmul_precision("high")
     model_cfg = run_config.get("model", {})
@@ -395,15 +395,15 @@ def setup_lfm_model(
         logger.info(f"Carregando backbone LFM3 em 4-bit NF4 ({tag})...")
         backbone = load_quantized_lfm_backbone(name, revision=revision, device=device)
         _release_unused_vision_modules(backbone)
+        compute_dtype = (
+            torch.bfloat16
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
         if is_sora:
-            compute_dtype = (
-                torch.bfloat16
-                if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-                else torch.float16
-            )
             backbone = apply_qsora(backbone, lora_cfg, compute_dtype=compute_dtype)
         else:
-            backbone = apply_qlora(backbone, lora_cfg)
+            backbone = apply_qlora(backbone, lora_cfg, compute_dtype=compute_dtype)
         model = DecisionLFM(backbone, tokenizer, head_size=head_size, max_length=max_length)
         model.has_lora = True
         model.head.to(device)
@@ -452,7 +452,7 @@ def setup_lfm_model(
                 bias="none",
                 target_modules=targets,
             )
-            backbone = get_peft_model(backbone, peft_config)
+            backbone = apply_peft_lora_modules(backbone, peft_config, adapter_dtype=torch.bfloat16)
 
         model = DecisionLFM(backbone, tokenizer, head_size=head_size, max_length=max_length)
         model.has_lora = True

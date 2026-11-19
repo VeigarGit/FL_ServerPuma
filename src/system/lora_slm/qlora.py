@@ -28,6 +28,11 @@ import logging
 
 import torch
 
+try:
+    from sora import apply_peft_lora_modules
+except ImportError:
+    from lora_slm.sora import apply_peft_lora_modules
+
 logger = logging.getLogger(__name__)
 
 HEAD_PREFIX = "classifier."
@@ -156,7 +161,7 @@ def _finalize_4bit_model(model, compute_dtype) -> None:
 
 def apply_qlora(model, lora_config, qcfg, compute_dtype):
     """Congela o backbone 4-bit e injeta adaptadores LoRA em 16 bits (in-place em model.slm_model)."""
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig
 
     _prepare_4bit_backbone(model, qcfg, compute_dtype)
 
@@ -167,11 +172,9 @@ def apply_qlora(model, lora_config, qcfg, compute_dtype):
         lora_dropout=lora_config["dropout"],
         bias=lora_config["bias"],
     )
-    # autocast_adapter_dtype=False: impede o upcast automático para fp32 -> adaptadores em 16 bits
-    model.slm_model = get_peft_model(model.slm_model, peft_config, autocast_adapter_dtype=False)
-    for name, param in model.slm_model.named_parameters():
-        if "lora_" in name:
-            param.data = param.data.to(compute_dtype)
+    model.slm_model = apply_peft_lora_modules(
+        model.slm_model, peft_config, adapter_dtype=compute_dtype
+    )
 
     _finalize_4bit_model(model, compute_dtype)
     return model

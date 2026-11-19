@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import yaml
 from datasets import ClassLabel, load_dataset
-from peft import LoraConfig, AdaLoraConfig, get_peft_model
+from peft import AdaLoraConfig, LoraConfig
 from sklearn.metrics import accuracy_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
@@ -14,9 +14,14 @@ from transformers import AutoProcessor, AutoModel
 from PIL import Image
 
 try:
-    from sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
+    from sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier, apply_peft_lora_modules
 except ImportError:
-    from lora_slm.sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
+    from lora_slm.sora import (
+        SoRAWrappedLinear,
+        SparseAdamW,
+        GateSparsifier,
+        apply_peft_lora_modules,
+    )
 
 try:
     from qlora import (
@@ -347,9 +352,12 @@ def build_model(config, num_classes, device):
             layers_to_transform=layers_to_transform,
             layers_pattern="layers" if layers_to_transform is not None else None,
         )
-        model.slm_model = get_peft_model(model.slm_model, peft_config)
+        model.slm_model = apply_peft_lora_modules(
+            model.slm_model, peft_config, adapter_dtype=model_dtype
+        )
     elif mode in SORA_MODES:
-        apply_sora(model, lora_config, upper_k=None)  # Allows dynamic expansion of PaCA in runtime
+        # Allows dynamic expansion of PaCA in runtime
+        apply_sora(model, lora_config, upper_k=None, adapter_dtype=model_dtype)
 
     if upper_k is not None:
         _apply_paca_gradient_boundary(model, upper_k)

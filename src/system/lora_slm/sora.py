@@ -36,9 +36,11 @@ class SoRALinear(nn.Module):
         nn.init.zeros_(self.lora_B)
 
     def forward(self, x):
-        """Calcula a saída do adaptador: (x * A * gate) * B."""
+        """Calcula a saída do adaptador: ((x @ A^T) * (gate * scaling)) @ B^T."""
         x_in = x.to(self.lora_A.dtype) if x.dtype != self.lora_A.dtype else x
-        return ((self.lora_dropout(x_in) @ self.lora_A.T).mul(self.gate) @ self.lora_B.T) * self.scaling
+        h = nn.functional.linear(self.lora_dropout(x_in), self.lora_A)
+        h = h.mul(self.gate * self.scaling)
+        return nn.functional.linear(h, self.lora_B)
 
 
 class SoRAWrappedLinear(nn.Module):
@@ -404,17 +406,24 @@ class GateSparsifier:
     def step(self):
         """
         Proximal step: aplica soft-thresholding (operador proximal do L1) nos gates.
-        
+
         Matematicamente: gate ← S_λ(gate), onde S_λ é o operador de soft-shrinkage
         com threshold = sparse_lambda × learning_rate.
-        
-        Este é o segundo passo do Proximal Gradient Descent usado no SoRA.
+        Usa operações multi-tensor (_foreach_*) agrupadas por (device, dtype) para
+        reduzir o overhead de lançamentos CUDA sem alterar a matemática do SoRA.
         """
-        threshold = self.sparse_lambda * self.gate_lr
-        if threshold <= 0:
+        threshold = float(self.sparse_lambda * self.gate_lr)
+        if threshold <= 0 or not self.gate_params:
             return
+        groups = {}
         for p in self.gate_params:
-            p.data = torch.nn.functional.softshrink(p.data, threshold)
+            groups.setdefault((p.device, p.dtype), []).append(p.data)
+        for tensors in groups.values():
+            signs = torch._foreach_sign(tensors)
+            torch._foreach_abs_(tensors)
+            torch._foreach_sub_(tensors, threshold)
+            torch._foreach_clamp_min_(tensors, 0.0)
+            torch._foreach_mul_(tensors, signs)
 
 
 def apply_sora_modules(
@@ -454,6 +463,25 @@ def apply_sora_modules(
         )
         setattr(parent, child_name, wrapped)
     return len(replacements)
+
+
+def apply_peft_lora_modules(
+    root_module: nn.Module,
+    peft_config,
+    adapter_dtype: torch.dtype | None = None,
+):
+    """Aplica PEFT LoRA mantendo os pesos no dtype alvo (evita upcast para float32)."""
+    from peft import get_peft_model
+
+    if adapter_dtype is None:
+        return get_peft_model(root_module, peft_config)
+
+    # autocast_adapter_dtype=False impede o upcast automático para fp32 feito pelo peft.
+    wrapped = get_peft_model(root_module, peft_config, autocast_adapter_dtype=False)
+    for name, param in wrapped.named_parameters():
+        if "lora_" in name and param.is_floating_point() and param.dtype != adapter_dtype:
+            param.data = param.data.to(adapter_dtype)
+    return wrapped
 
 
 def build_sora_gate_sparsifier(model: nn.Module, run_config: dict) -> GateSparsifier | None:

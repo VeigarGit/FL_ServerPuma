@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import AutoConfig, AutoModel, AutoTokenizer
@@ -394,7 +394,7 @@ def setup_d1_model(
     release_vision: bool = False,
 ) -> tuple[DecisionD1, Any]:
     """Instancia o LiquidAI/d1-2B em BF16 ou 4-bit NF4 com LoRA/SoRA e PaCA."""
-    from lora_slm.sora import SORA_MODES, apply_sora_modules
+    from lora_slm.sora import SORA_MODES, apply_peft_lora_modules, apply_sora_modules
 
     torch.set_float32_matmul_precision("high")
     model_cfg = run_config.get("model", {})
@@ -409,6 +409,7 @@ def setup_d1_model(
         torch.bfloat16
         if target_device.type == "cuda"
         and getattr(torch, qcfg.get("compute_dtype", "bfloat16")) == torch.bfloat16
+        and torch.cuda.is_bf16_supported()
         else (torch.float16 if target_device.type == "cuda" else torch.float32)
     )
 
@@ -440,6 +441,7 @@ def setup_d1_model(
                 lora_cfg,
                 gradient_checkpointing=bool(model_cfg.get("gradient_checkpointing", True)),
                 prepare_kbit=bool(qcfg.get("prepare_kbit", False)),
+                compute_dtype=compute_dtype,
             )
         configure_d1_tokenizer(tokenizer, name, revision, config=backbone.config)
         verify_qlora_freezing(backbone)
@@ -482,7 +484,7 @@ def setup_d1_model(
                 bias=str(lora_cfg.get("bias", "none")),
                 target_modules=targets,
             )
-            backbone = get_peft_model(backbone, peft_config)
+            backbone = apply_peft_lora_modules(backbone, peft_config, adapter_dtype=compute_dtype)
         configure_d1_tokenizer(tokenizer, name, revision, config=backbone.config)
 
     ds_name = dataset or run_config.get("dataset", {}).get("name", "Banking77")
