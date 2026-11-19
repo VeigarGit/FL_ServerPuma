@@ -52,6 +52,10 @@ EXPERIMENTS = [
      ("fl_pumagt_plus_slm_OxfordPets_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "fl_pumagt_plus_OxfordPets_clip_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "OxfordPets__PUMA-GT_Plus_Cientifico_083"),
      "server_OxfordPets_*_run*.h5"),
 
+    ("OxfordPets", "PUMA-GT E + Delta",
+     "fl_pumagt_plus_slm_OxfordPets_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank_deltacoding",
+     "server_OxfordPets_*_run*.h5"),
+
     ("OxfordPets", "PUMA-GT",
      "fl_pumagt_plus_slm_OxfordPets_ONLYPACA_norank",
      "server_OxfordPets_*_run*.h5"),
@@ -69,6 +73,10 @@ EXPERIMENTS = [
      ("fl_pumagt_plus_slm_DTD_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "DTD__PUMA-GT_Plus_Desacoplado"),
      "server_DTD_*_run*.h5"),
 
+    ("DTD", "PUMA-GT E + Delta",
+     "fl_pumagt_plus_slm_DTD_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank_deltacoding",
+     "server_DTD_*_run*.h5"),
+
     # --- FGVCAircraft ---
     ("FGVCAircraft", "LoRA Padrão",
      ("fl_lora_slm_FGVCAircraft_slm_lora_prune1_ala1_paca28", "FGVCAircraft__LoRA_Padrao_paca12"),
@@ -82,6 +90,10 @@ EXPERIMENTS = [
      ("fl_pumagt_plus_slm_FGVCAircraft_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "FGVCAircraft__PUMA-GT_Plus_Desacoplado"),
      "server_FGVCAircraft_*_run*.h5"),
 
+    ("FGVCAircraft", "PUMA-GT E + Delta",
+     "fl_pumagt_plus_slm_FGVCAircraft_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank_deltacoding",
+     "server_FGVCAircraft_*_run*.h5"),
+
     # --- Flowers102 ---
     ("Flowers102", "LoRA Padrão",
      ("fl_lora_slm_Flowers102_slm_lora_prune1_ala1_paca28", "Flowers102__LoRA_Padrao_paca12"),
@@ -93,6 +105,10 @@ EXPERIMENTS = [
 
     ("Flowers102", "PUMA-GT Evolution",
      ("fl_pumagt_plus_slm_Flowers102_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank", "Flowers102__PUMA-GT_Plus_Desacoplado"),
+     "server_Flowers102_*_run*.h5"),
+
+    ("Flowers102", "PUMA-GT E + Delta",
+     "fl_pumagt_plus_slm_Flowers102_slm_sora_with_schedule_prune1_ala1_adaptpaca_adaptrank_deltacoding",
      "server_Flowers102_*_run*.h5"),
 ]
 
@@ -325,6 +341,14 @@ def main():
         '--improvement', action='store_true',
         help='Adiciona linha de improvement PUMA-GT vs LoRA Padrão (em %%) para cada dataset'
     )
+    parser.add_argument(
+        '--exclude-onlypaca', action='store_true',
+        help='Exclui entradas PUMA-GT (OnlyPaCA), mantendo apenas as 4 estratégias completas'
+    )
+    parser.add_argument(
+        '--out-csv', type=str, default=None,
+        help='Caminho opcional para salvar o CSV comparativo'
+    )
     args = parser.parse_args()
 
     # Caminho base dos resultados
@@ -350,6 +374,8 @@ def main():
     all_results = []
 
     for dataset, strategy, folder, h5_glob in EXPERIMENTS:
+        if args.exclude_onlypaca and strategy == "PUMA-GT":
+            continue
         print(f"Processando: {dataset} / {strategy} ...", end=" ")
         result = analyze_experiment(results_dir, folder, h5_glob)
 
@@ -541,7 +567,7 @@ def main():
     # ======================================================================
     # SALVAR CSV
     # ======================================================================
-    csv_path = os.path.join(results_dir, 'analise_comparativa_estrategias.csv')
+    csv_path = args.out_csv or os.path.join(results_dir, 'analise_comparativa_estrategias.csv')
     csv_columns = [
         'Dataset', 'Estrategia', 'N_Runs',
         'Acuracia_Final_Mean', 'Acuracia_Final_Std',

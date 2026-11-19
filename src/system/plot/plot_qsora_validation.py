@@ -439,6 +439,379 @@ def _plot_long_pruning(entry: dict[str, Any], out_dir: Path) -> None:
     _save_fig(fig, out_dir, "04_qsora_pruning_15_rodadas")
 
 
+def _plot_qlora_vs_qsora_vram(
+    bench_items: list[dict[str, Any]],
+    post_prune_mb: dict[str, float],
+    out_dir: Path,
+) -> None:
+    """Painel 1x3 comparando BF16 LoRA, 4-bit QLoRA e 4-bit QSoRA em VRAM e parâmetros."""
+    models = ["SLM (OxfordPets)", "d1-2B (Banking77)", "LFM3-VL-2B (Banking77)"]
+    short_names = ["SLM\n(Qwen3-VL-2B)", "d1-2B\n(LiquidAI)", "LFM3-VL-2B\n(LiquidAI)"]
+    variants = ["BF16 LoRA", "4-bit QLoRA", "4-bit QSoRA"]
+    v_colors = {"BF16 LoRA": "#d62728", "4-bit QLoRA": "#ff7f0e", "4-bit QSoRA": "#1f77b4"}
+
+    lookup = {(item["model_label"], item["variant"]): item for item in bench_items}
+    fig, axes = plt.subplots(1, 3, figsize=(16.0, 5.0))
+    ax_static, ax_train, ax_peak = axes
+    x = np.arange(len(models))
+    w = 0.25
+
+    for idx_v, var in enumerate(variants):
+        offset = (idx_v - 1) * w
+        statics = [lookup[(m, var)]["static_model_mb"] for m in models]
+        trains = [lookup[(m, var)]["trainable_params_mb"] for m in models]
+        peaks = [lookup[(m, var)]["peak_train_mb"] for m in models]
+
+        ax_static.bar(x + offset, statics, w, label=var, color=v_colors[var])
+        ax_train.bar(x + offset, trains, w, label=var, color=v_colors[var])
+        ax_peak.bar(x + offset, peaks, w, label=var, color=v_colors[var])
+
+        for i in range(len(models)):
+            ax_static.text(
+                x[i] + offset,
+                statics[i] + 60,
+                f"{statics[i]:.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+            ax_train.text(
+                x[i] + offset,
+                trains[i] + 0.6,
+                f"{trains[i]:.1f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+            ax_peak.text(
+                x[i] + offset,
+                peaks[i] + 80,
+                f"{peaks[i]:.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+    # Sobrepõe barras do pós-poda QSoRA observados nas execuções FL
+    pruned_vals = [post_prune_mb.get(m, 0.0) for m in models]
+    if any(v > 0 for v in pruned_vals):
+        ax_train.bar(
+            x + w * 1.95,
+            pruned_vals,
+            w * 0.8,
+            label="QSoRA Pós-Poda (FL)",
+            color="#2ca02c",
+        )
+        for i, pv in enumerate(pruned_vals):
+            if pv > 0:
+                ax_train.text(
+                    x[i] + w * 1.95,
+                    pv + 0.6,
+                    f"{pv:.1f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    color="#1b6e1b",
+                    fontweight="bold",
+                )
+
+    ax_static.set_title("Armazenamento do Modelo na GPU (MB)")
+    ax_static.set_ylabel("VRAM Estática (MB)")
+    ax_static.set_xticks(x)
+    ax_static.set_xticklabels(short_names)
+    ax_static.set_ylim(0, max(i["static_model_mb"] for i in bench_items) * 1.18)
+    ax_static.legend(loc="upper right", fontsize=8.5)
+
+    ax_train.set_title("Memória dos Parâmetros Treináveis (MB)")
+    ax_train.set_ylabel("Parâmetros na GPU (MB)")
+    ax_train.set_xticks(x + 0.1)
+    ax_train.set_xticklabels(short_names)
+    ax_train.set_ylim(0, max(i["trainable_params_mb"] for i in bench_items) * 1.45)
+    ax_train.legend(loc="upper center", ncol=2, fontsize=8)
+
+    ax_peak.set_title("Pico Total de VRAM no Treino (bs=4, MB)")
+    ax_peak.set_ylabel("Pico de VRAM (MB)")
+    ax_peak.set_xticks(x)
+    ax_peak.set_xticklabels(short_names)
+    ax_peak.set_ylim(0, max(i["peak_train_mb"] for i in bench_items) * 1.18)
+    ax_peak.legend(loc="upper right", fontsize=8.5)
+
+    fig.suptitle(
+        "Comparação Direta de Gasto de Memória (GPU 0 isolada): BF16 LoRA vs QLoRA vs QSoRA",
+        y=1.02,
+    )
+    _save_fig(fig, out_dir, "06_qlora_vs_qsora_consumo_vram")
+
+
+def _gpu0_energy_wh(csv_path: Path) -> float:
+    if not csv_path.exists():
+        return 0.0
+    ts, pwrs = [], []
+    with csv_path.open("r", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if int(row["gpu_id"]) == 0:
+                ts.append(float(row["elapsed_s"]))
+                pwrs.append(float(row["power_draw_w"]))
+    if len(ts) < 2:
+        return 0.0
+    trapz_fn = getattr(np, "trapezoid", None) or np.trapz
+    return float(trapz_fn(pwrs, ts) / 3600.0)
+
+
+def _plot_qlora_vs_qsora_fl_cost(
+    slm_qlora: dict[str, Any],
+    slm_qsora: dict[str, Any],
+    out_dir: Path,
+) -> None:
+    """Painel 2x2 comparando custo real em FL (SLM QLoRA vs SLM QSoRA, OxfordPets, 5 rodadas)."""
+    fig, axes = plt.subplots(2, 2, figsize=(13.2, 9.0))
+    ax_p, ax_rt, ax_comm, ax_bar = axes.ravel()
+
+    pairs = [
+        ("SLM QLoRA", slm_qlora, "#ff7f0e", "s", "--"),
+        ("SLM QSoRA", slm_qsora, "#1f77b4", "o", "-"),
+    ]
+    for lbl, rec, col, mk, ls in pairs:
+        h5 = rec["h5"]
+        params = h5.get("Trainable_params", np.array([]))
+        rt = h5.get("Round_time", np.array([]))
+        comm = h5.get("total_transmitted_per_round_Mb", np.array([]))
+        rounds = np.arange(1, len(params) + 1)
+        ax_p.plot(rounds, params / 1e6, color=col, marker=mk, ls=ls, lw=2.2, label=lbl)
+        ax_rt.plot(
+            rounds,
+            rt,
+            color=col,
+            marker=mk,
+            ls=ls,
+            lw=2.2,
+            label=f"{lbl} (média={rt.mean():.1f}s)",
+        )
+        ax_comm.plot(
+            rounds,
+            comm,
+            color=col,
+            marker=mk,
+            ls=ls,
+            lw=2.2,
+            label=f"{lbl} (total={comm.sum():.1f} MB)",
+        )
+
+    ax_p.set_title("Parâmetros Treináveis ao Longo das Rodadas")
+    ax_p.set_xlabel("Rodada")
+    ax_p.set_ylabel("Milhões de Parâmetros")
+    ax_p.legend(loc="best")
+
+    ax_rt.set_title("Tempo por Rodada (s)")
+    ax_rt.set_xlabel("Rodada")
+    ax_rt.set_ylabel("Segundos")
+    ax_rt.legend(loc="best")
+
+    ax_comm.set_title("Tráfego de Rede por Rodada (LHDQ)")
+    ax_comm.set_xlabel("Rodada")
+    ax_comm.set_ylabel("MB / Rodada")
+    ax_comm.legend(loc="best")
+
+    # Resumo comparativo de gasto total (Tempo min, Energia Wh, Tráfego MB, Acurácia %)
+    metrics_lbls = [
+        "Tempo Total\n(min)",
+        "Energia GPU0\n(Wh)",
+        "Tráfego Total\n(MB)",
+        "Acurácia Final\n(%)",
+    ]
+    q_vals = [
+        float(slm_qlora["wall_seconds"]) / 60.0,
+        _gpu0_energy_wh(Path(slm_qlora["telemetry_dir"]) / "gpu_metrics.csv"),
+        float(slm_qlora["h5"]["total_transmitted_per_round_Mb"].sum()),
+        float(slm_qlora["h5"]["rs_test_acc"][-1]),
+    ]
+    s_vals = [
+        float(slm_qsora["wall_seconds"]) / 60.0,
+        _gpu0_energy_wh(Path(slm_qsora["telemetry_dir"]) / "gpu_metrics.csv"),
+        float(slm_qsora["h5"]["total_transmitted_per_round_Mb"].sum()),
+        float(slm_qsora["h5"]["rs_test_acc"][-1]),
+    ]
+    xb = np.arange(len(metrics_lbls))
+    wb = 0.35
+    # Normaliza cada métrica pelo maior valor do par para exibir na mesma escala
+    q_norm = [q / max(q, s, 1e-6) * 100.0 for q, s in zip(q_vals, s_vals, strict=False)]
+    s_norm = [s / max(q, s, 1e-6) * 100.0 for q, s in zip(q_vals, s_vals, strict=False)]
+    ax_bar.bar(xb - wb / 2, q_norm, wb, label="SLM QLoRA", color="#ff7f0e")
+    ax_bar.bar(xb + wb / 2, s_norm, wb, label="SLM QSoRA", color="#1f77b4")
+    for i, (qn, sn, qv, sv) in enumerate(zip(q_norm, s_norm, q_vals, s_vals, strict=False)):
+        ax_bar.text(i - wb / 2, qn + 2, f"{qv:.1f}", ha="center", va="bottom", fontsize=8.5)
+        ax_bar.text(i + wb / 2, sn + 2, f"{sv:.1f}", ha="center", va="bottom", fontsize=8.5)
+    ax_bar.set_ylim(0, 140)
+    ax_bar.set_xticks(xb)
+    ax_bar.set_xticklabels(metrics_lbls, fontsize=9)
+    ax_bar.set_ylabel("Escala Relativa (% do maior)")
+    ax_bar.set_title("Resumo de Custo FL (Valores Absolutos no Topo)")
+    ax_bar.legend(loc="upper right")
+
+    fig.suptitle(
+        "Custo Real em Aprendizado Federado (OxfordPets, 5 rodadas, 2 clientes): QLoRA vs QSoRA",
+        y=1.01,
+    )
+    _save_fig(fig, out_dir, "07_qlora_vs_qsora_custo_fl")
+
+
+def _plot_qlora_vs_qsora_aux_accuracy(results_root: Path, out_dir: Path) -> None:
+    """Compara a acurácia auxiliar média (rs_aux_simple_avg_acc) dos modelos da fig. 06."""
+    specs = [
+        (
+            "SLM (OxfordPets)",
+            [
+                (
+                    "BF16 LoRA (4c, 15r)",
+                    "qlora_validation_suite/runs/val_slm_lora_bf16",
+                    "#d62728",
+                    "o",
+                    "-",
+                ),
+                (
+                    "4-bit QLoRA (4c, 15r)",
+                    "qlora_validation_suite/runs/val_slm_qlora_nf4",
+                    "#ff7f0e",
+                    "s",
+                    "-",
+                ),
+                (
+                    "4-bit QSoRA (2c, 15r)",
+                    "qsora_validation_suite/runs/val_slm_qsora_15r",
+                    "#1f77b4",
+                    "^",
+                    "-",
+                ),
+            ],
+        ),
+        (
+            "d1-2B (Banking77)",
+            [
+                (
+                    "BF16 LoRA (4c, 5r)",
+                    "qlora_validation_suite/runs/val_d1_lora_bf16",
+                    "#d62728",
+                    "o",
+                    "-",
+                ),
+                (
+                    "4-bit QLoRA (4c, 5r)",
+                    "qlora_validation_suite/runs/val_d1_qlora_nf4",
+                    "#ff7f0e",
+                    "s",
+                    "-",
+                ),
+                (
+                    "4-bit QSoRA (4c, 6r)",
+                    "qsora_validation_suite/runs/val_d1_qsora_robust_4c6r",
+                    "#1f77b4",
+                    "^",
+                    "-",
+                ),
+            ],
+        ),
+        (
+            "LFM3-VL-2B (Banking77)",
+            [
+                (
+                    "BF16 LoRA (4c, 3r, PaCA=8*)",
+                    "legados/testes_exploratorios/fl_puma_Banking77_lfm_lora_prune1_ala1_adaptpaca_adaptrank",
+                    "#d62728",
+                    "o",
+                    "--",
+                ),
+                (
+                    "4-bit QLoRA (4c, 3r*)",
+                    "legados/testes_exploratorios/fl_lfm_qlora_test",
+                    "#ff7f0e",
+                    "s",
+                    "--",
+                ),
+                (
+                    "4-bit QSoRA (4c, 6r)",
+                    "qsora_validation_suite/runs/val_lfm_qsora_robust_4c6r",
+                    "#1f77b4",
+                    "^",
+                    "-",
+                ),
+            ],
+        ),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14.5, 9.0))
+    curve_axes = [axes[0, 0], axes[0, 1], axes[1, 0]]
+    ax_bar = axes[1, 1]
+
+    variant_labels = ["BF16 LoRA", "4-bit QLoRA", "4-bit QSoRA"]
+    variant_colors = ["#d62728", "#ff7f0e", "#1f77b4"]
+    final_matrix: list[list[float]] = []
+    round_tags: list[list[str]] = []
+
+    for ax, (group_title, items) in zip(curve_axes, specs, strict=False):
+        group_vals: list[float] = []
+        group_tags: list[str] = []
+        for label, rel_dir, color, marker, ls in items:
+            h5 = _load_h5_bundle(results_root / rel_dir)
+            aux = h5.get("rs_aux_simple_avg_acc")
+            if aux is None or len(aux) == 0:
+                group_vals.append(0.0)
+                group_tags.append("N/A")
+                continue
+            rounds = np.arange(1, len(aux) + 1)
+            ax.plot(
+                rounds,
+                aux,
+                label=f"{label}: {aux[-1]:.2f}%",
+                color=color,
+                marker=marker,
+                linestyle=ls,
+                linewidth=2.0,
+                markersize=5.5,
+            )
+            group_vals.append(float(aux[-1]))
+            group_tags.append(f"{len(aux)}r")
+        final_matrix.append(group_vals)
+        round_tags.append(group_tags)
+
+        ax.set_title(f"{group_title} — Aux Accuracy por Rodada")
+        ax.set_xlabel("Rodada")
+        ax.set_ylabel("Aux Accuracy Média (%)")
+        ax.set_ylim(-2, 106)
+        ax.legend(loc="lower right", fontsize=8.5, framealpha=0.92)
+
+    x = np.arange(len(specs))
+    w = 0.24
+    for v_idx, (v_label, color) in enumerate(zip(variant_labels, variant_colors, strict=False)):
+        vals = [row[v_idx] for row in final_matrix]
+        tags = [row[v_idx] for row in round_tags]
+        bars = ax_bar.bar(x + (v_idx - 1) * w, vals, w, label=v_label, color=color)
+        for idx, (bar, val, rtag) in enumerate(zip(bars, vals, tags, strict=False)):
+            suffix = "*" if (idx == 2 and v_idx < 2) else ""
+            ax_bar.text(
+                bar.get_x() + bar.get_width() / 2,
+                val + 1.5,
+                f"{val:.1f}%\n({rtag}{suffix})",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                fontweight="bold",
+            )
+
+    ax_bar.set_title("Aux Accuracy Final por Estratégia")
+    ax_bar.set_ylabel("Aux Accuracy Média (%)")
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels([s[0].replace(" (", "\n(") for s in specs])
+    ax_bar.set_ylim(0, 122)
+    ax_bar.legend(loc="upper right", ncol=3, fontsize=8.5)
+
+    fig.suptitle(
+        "Acurácia Auxiliar Média (rs_aux_simple_avg_acc): BF16 LoRA vs QLoRA vs QSoRA\n"
+        "(* LFM BF16 LoRA e QLoRA possuem apenas 3 rodadas nos logs exploratórios)",
+        y=1.01,
+    )
+    _save_fig(fig, out_dir, "08_qlora_vs_qsora_aux_accuracy")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Gera gráficos da suíte de validação QSoRA por dataset."
@@ -459,15 +832,20 @@ def main() -> None:
         default=Path("src/results/qsora_validation_suite/robust_lfm_d1_manifest.json"),
     )
     parser.add_argument(
+        "--bench-json",
+        type=Path,
+        default=Path("src/results/qsora_validation_suite/qlora_vs_qsora_gpu_benchmark.json"),
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         default=Path("src/results/qsora_validation_suite/plots"),
     )
     args = parser.parse_args()
 
+    by_id: dict[str, dict[str, Any]] = {}
     if args.manifest.exists():
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        by_id: dict[str, dict[str, Any]] = {}
         for item in manifest["experiments"]:
             h5 = _load_h5_bundle(Path(item["results_dir"]))
             gpu = _load_gpu_csv(Path(item["telemetry_dir"]) / "gpu_metrics.csv")
@@ -493,10 +871,16 @@ def main() -> None:
         if pets_records or bank_records:
             _plot_efficiency_bars(pets_records, bank_records, args.out_dir)
             _write_summary(pets_records, bank_records, args.out_dir.parent)
+        if "slm_qlora" in by_id and "slm_qsora" in by_id:
+            _plot_qlora_vs_qsora_fl_cost(by_id["slm_qlora"], by_id["slm_qsora"], args.out_dir)
 
+    post_prune_mb: dict[str, float] = {}
     if args.long_manifest.exists():
         long_entry = json.loads(args.long_manifest.read_text(encoding="utf-8"))
         _plot_long_pruning(long_entry, args.out_dir)
+        long_h5 = _load_h5_bundle(Path(long_entry["results_dir"]))
+        if "Model_size_per_round_Mb" in long_h5 and len(long_h5["Model_size_per_round_Mb"]) > 0:
+            post_prune_mb["SLM (OxfordPets)"] = float(long_h5["Model_size_per_round_Mb"][-1])
 
     if args.robust_manifest.exists():
         robust = json.loads(args.robust_manifest.read_text(encoding="utf-8"))
@@ -505,6 +889,13 @@ def main() -> None:
             h5 = _load_h5_bundle(Path(item["results_dir"]))
             gpu = _load_gpu_csv(Path(item["telemetry_dir"]) / "gpu_metrics.csv")
             robust_records.append({**item, "h5": h5, "gpu": gpu})
+            if "Model_size_per_round_Mb" in h5 and len(h5["Model_size_per_round_Mb"]) > 0:
+                if item["id"] == "d1_qsora_robust":
+                    post_prune_mb["d1-2B (Banking77)"] = float(h5["Model_size_per_round_Mb"][-1])
+                elif item["id"] == "lfm_qsora_robust":
+                    post_prune_mb["LFM3-VL-2B (Banking77)"] = float(
+                        h5["Model_size_per_round_Mb"][-1]
+                    )
         if robust_records:
             _plot_suite(
                 robust_records,
@@ -512,6 +903,14 @@ def main() -> None:
                 "05_banking77_robust_4c_6r",
                 args.out_dir,
             )
+
+    if args.bench_json.exists():
+        bench_items = json.loads(args.bench_json.read_text(encoding="utf-8"))
+        _plot_qlora_vs_qsora_vram(bench_items, post_prune_mb, args.out_dir)
+
+    results_root = args.out_dir.parent.parent
+    if results_root.exists():
+        _plot_qlora_vs_qsora_aux_accuracy(results_root, args.out_dir)
 
 
 if __name__ == "__main__":
