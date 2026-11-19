@@ -129,7 +129,12 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                     if args.model != 'slm':
                         raise ValueError("--qlora é suportado apenas com --model slm")
                     enable_qlora_in_config(config, args.strategy)
-                    logger.info("QLoRA ATIVADO: backbone 4-bit NF4 (não agregado), FedAvg só nos adaptadores LoRA 16 bits.")
+                    mode_tag = "QSoRA" if "sora" in args.strategy else "QLoRA"
+                    adapter_tag = "SoRA" if "sora" in args.strategy else "LoRA"
+                    logger.info(
+                        f"{mode_tag} ATIVADO: backbone 4-bit NF4 (não agregado), "
+                        f"FedAvg só nos adaptadores {adapter_tag} 16 bits."
+                    )
                     
                 if "paca" not in config["model"]:
                     config["model"]["paca"] = {}
@@ -188,6 +193,18 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                     config = yaml.safe_load(f)
                 self.config = config
 
+                lfm_strategy_to_mode = {
+                    "lora": "with_lora",
+                    "sora_with_schedule": "with_sora_schedule",
+                    "sora_no_schedule": "with_sora_no_schedule",
+                }
+                if args.strategy not in lfm_strategy_to_mode:
+                    raise ValueError(
+                        f"--model lfm suporta apenas --strategy em {tuple(lfm_strategy_to_mode)} "
+                        f"(recebido: '{args.strategy}')."
+                    )
+                config["model"]["lora"]["mode"] = lfm_strategy_to_mode[args.strategy]
+
                 if args.rank:
                     config["model"]["lora"]["r"] = args.rank
                     config["model"]["lora"]["alpha"] = 2 * args.rank
@@ -218,6 +235,18 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 with config_path.open("r", encoding="utf-8") as f:
                     config = yaml.safe_load(f)
                 self.config = config
+
+                d1_strategy_to_mode = {
+                    "lora": "with_lora",
+                    "sora_with_schedule": "with_sora_schedule",
+                    "sora_no_schedule": "with_sora_no_schedule",
+                }
+                if args.strategy not in d1_strategy_to_mode:
+                    raise ValueError(
+                        f"--model d1 suporta apenas --strategy em {tuple(d1_strategy_to_mode)} "
+                        f"(recebido: '{args.strategy}')."
+                    )
+                config["model"]["lora"]["mode"] = d1_strategy_to_mode[args.strategy]
 
                 if args.rank:
                     config["model"]["lora"]["r"] = args.rank
@@ -1022,7 +1051,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         safe_client_updates, self.global_state, safe_client_weights, contributing_ids,
                     )
                     
-                    if self.args.model in ['clip', 'slm'] and 'sora' in self.args.strategy and self.args.prune_freq > 0:
+                    if self.args.model in ['clip', 'slm', 'lfm', 'd1'] and 'sora' in self.args.strategy and self.args.prune_freq > 0:
                         # Verifica se a rodada atual é múltipla da frequência desejada
                         # Poda permanece ativa durante todas as rodadas (sem congelamento na reta final)
                         if (round_num + 1) % self.args.prune_freq == 0:
@@ -1036,7 +1065,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                             adaptive_threshold = 1e-3 * decay_factor
                             logger.info(f"   Adaptive threshold: {adaptive_threshold:.6f} (progress={progress:.2f})")
                             
-                            if self.args.model == 'slm':
+                            if self.args.model in ['slm', 'lfm', 'd1']:
                                 from lora_slm.slm_sora_utils import reduce_sora_state_dict_rank as reduce_sora_state_dict_rank_slm
                                 prune_fn = reduce_sora_state_dict_rank_slm
                             else:
@@ -1307,7 +1336,7 @@ def parse_args():
     parser.add_argument('--gamma-delta', type=float, default=0.5, help='Expoente de sensibilidade da acurácia no índice de capacidade γ (default: 0.5)')
     parser.add_argument('--plateau-phi-min', type=float, default=0.45, help='Piso mínimo de capacidade no platô (default: 0.45)')
     parser.add_argument('--plateau-decay-rate', type=float, default=0.025, help='Taxa de decaimento por rodada no platô (default: 0.025)')
-    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA (suportado para --model slm, lfm e d1): backbone 4-bit NF4, agrega só adaptadores LoRA 16 bits')
+    parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA/QSoRA (slm/lfm/d1 com lora ou sora_*): backbone 4-bit NF4, agrega só adaptadores 16 bits')
     args = parser.parse_args()
     if args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0):
         parser.error('--timeout deve ser positivo e finito (segundos).')

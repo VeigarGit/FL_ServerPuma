@@ -155,8 +155,11 @@ def build_client_model(
                     )
                     sys.exit(1)
                 enable_qlora_in_config(config, args.strategy)
+                mode_tag = "QSoRA" if "sora" in args.strategy else "QLoRA"
+                adapter_tag = "SoRA" if "sora" in args.strategy else "LoRA"
                 logger.info(
-                    "QLoRA ATIVADO: backbone 4-bit NF4 + DoubleQuant, adaptadores LoRA 16 bits."
+                    f"{mode_tag} ATIVADO: backbone 4-bit NF4 + DoubleQuant, "
+                    f"adaptadores {adapter_tag} 16 bits."
                 )
 
             config["model"].setdefault("paca", {})
@@ -202,6 +205,19 @@ def build_client_model(
             with config_path.open("r", encoding="utf-8") as f:
                 run_config = yaml.safe_load(f)
 
+            lfm_strategy_to_mode = {
+                "lora": "with_lora",
+                "sora_with_schedule": "with_sora_schedule",
+                "sora_no_schedule": "with_sora_no_schedule",
+            }
+            if args.strategy not in lfm_strategy_to_mode:
+                logger.error(
+                    f"--model lfm suporta apenas --strategy em {tuple(lfm_strategy_to_mode)} "
+                    f"(recebido: '{args.strategy}')."
+                )
+                sys.exit(1)
+            run_config["model"]["lora"]["mode"] = lfm_strategy_to_mode[args.strategy]
+
             if args.rank:
                 run_config["model"]["lora"]["r"] = args.rank
                 run_config["model"]["lora"]["alpha"] = 2 * args.rank
@@ -215,8 +231,11 @@ def build_client_model(
 
             run_config["is_qlora"] = bool(args.qlora)
             if args.qlora:
+                mode_tag = "QSoRA" if "sora" in args.strategy else "QLoRA"
+                adapter_tag = "SoRA" if "sora" in args.strategy else "LoRA"
                 logger.info(
-                    "QLoRA ATIVADO para LFM: backbone 4-bit NF4 + DoubleQuant, LoRA 16 bits."
+                    f"{mode_tag} ATIVADO para LFM: backbone 4-bit NF4 + DoubleQuant, "
+                    f"{adapter_tag} 16 bits."
                 )
 
             model, _ = setup_lfm_model(run_config, device, is_qlora=bool(args.qlora))
@@ -232,6 +251,19 @@ def build_client_model(
             with config_path.open("r", encoding="utf-8") as f:
                 run_config = yaml.safe_load(f)
 
+            d1_strategy_to_mode = {
+                "lora": "with_lora",
+                "sora_with_schedule": "with_sora_schedule",
+                "sora_no_schedule": "with_sora_no_schedule",
+            }
+            if args.strategy not in d1_strategy_to_mode:
+                logger.error(
+                    f"--model d1 suporta apenas --strategy em {tuple(d1_strategy_to_mode)} "
+                    f"(recebido: '{args.strategy}')."
+                )
+                sys.exit(1)
+            run_config["model"]["lora"]["mode"] = d1_strategy_to_mode[args.strategy]
+
             if args.rank:
                 run_config["model"]["lora"]["r"] = args.rank
                 run_config["model"]["lora"]["alpha"] = 2 * args.rank
@@ -245,8 +277,11 @@ def build_client_model(
 
             run_config["is_qlora"] = bool(args.qlora)
             if args.qlora:
+                mode_tag = "QSoRA" if "sora" in args.strategy else "QLoRA"
+                adapter_tag = "SoRA" if "sora" in args.strategy else "LoRA"
                 logger.info(
-                    "QLoRA ATIVADO para d1-2B: backbone 4-bit NF4 + DoubleQuant, LoRA 16 bits."
+                    f"{mode_tag} ATIVADO para d1-2B: backbone 4-bit NF4 + DoubleQuant, "
+                    f"{adapter_tag} 16 bits."
                 )
 
             model, _ = setup_d1_model(
@@ -377,6 +412,7 @@ def local_training(
         from lora_d1.d1_setup import set_d1_state_dict, update_paca_runtime
         from lora_d1.qlora import build_d1_optimizer
         from lora_d1.trainer import train_epoch_d1
+        from lora_slm.sora import build_sora_gate_sparsifier
 
         if state_dict:
             set_d1_state_dict(model, state_dict)
@@ -394,6 +430,7 @@ def local_training(
         epochs = int(train_cfg.get("epochs", 1))
         is_qlora = bool(run_config.get("is_qlora", False)) if run_config else False
         optimizer = build_d1_optimizer(model, run_config or {}, is_qlora=is_qlora)
+        sparse_optimizer = build_sora_gate_sparsifier(model, run_config or {})
 
         loss, acc = 0.0, 0.0
         for _ in range(max(1, epochs)):
@@ -406,6 +443,7 @@ def local_training(
                 brier_weight=brier_weight,
                 grad_accum_steps=grad_accum,
                 max_grad_norm=max_grad_norm,
+                sparse_optimizer=sparse_optimizer,
             )
         logger.info(f"d1-2B Treino Local - Loss (CE+Brier): {loss:.4f} | Acc: {acc:.2f}%")
         return extract_trainable_model_state(model, model_type, run_config), personalized_acc
@@ -414,6 +452,7 @@ def local_training(
         from lora_lfm.lfm_setup import set_lfm_state_dict, update_paca_runtime
         from lora_lfm.qlora import build_lfm_optimizer
         from lora_lfm.trainer import train_epoch_lfm
+        from lora_slm.sora import build_sora_gate_sparsifier
 
         if state_dict:
             set_lfm_state_dict(model, state_dict)
@@ -434,6 +473,7 @@ def local_training(
         )
         is_qlora = bool(run_config.get("is_qlora", False)) if run_config else False
         optimizer = build_lfm_optimizer(model, run_config or {}, is_qlora=is_qlora)
+        sparse_optimizer = build_sora_gate_sparsifier(model, run_config or {})
 
         loss, acc = train_epoch_lfm(
             model,
@@ -443,6 +483,7 @@ def local_training(
             device,
             brier_weight=brier_weight,
             grad_accum_steps=grad_accum,
+            sparse_optimizer=sparse_optimizer,
         )
         logger.info(f"LFM Treino Local - Loss (CE+Brier): {loss:.4f} | Acc: {acc:.2f}%")
         return extract_trainable_model_state(model, model_type, run_config), personalized_acc
@@ -501,8 +542,11 @@ def local_training(
             model_type == "slm"
             and hasattr(model, "slm_model")
             and hasattr(model.slm_model, "gradient_checkpointing_enable")
+            and not getattr(model.slm_model, "is_gradient_checkpointing", False)
         ):
-            model.slm_model.gradient_checkpointing_enable()
+            model.slm_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
         is_sora = run_config["model"]["lora"]["mode"] in [

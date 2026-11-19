@@ -869,7 +869,14 @@ def run_standard_plot_results(slm_bundles: list[dict[str, Any]], suite_dir: Path
     plot_script = Path(__file__).resolve().parent / "plot_results.py"
     if not plot_script.exists():
         return
-    exp_names = [Path(b["entry"]["results_dir"]).name for b in slm_bundles]
+    results_root = suite_dir.parent
+    exp_names = []
+    for b in slm_bundles:
+        exp_path = Path(b["entry"]["results_dir"]).resolve()
+        try:
+            exp_names.append(str(exp_path.relative_to(results_root.resolve())))
+        except ValueError:
+            exp_names.append(exp_path.name)
     subprocess.run(
         [sys.executable, str(plot_script), *exp_names],
         cwd=str(plot_script.parent),

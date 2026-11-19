@@ -220,7 +220,7 @@ def parse_args():
     parser.add_argument(
         "--qlora",
         action="store_true",
-        help="Ativa QLoRA (apenas --model slm --strategy lora, modo centralizado)",
+        help="Ativa QLoRA/QSoRA (slm/lfm/d1 com lora ou sora_*, modo centralizado)",
     )
 
     # --- Simulação de Straggler (Cliente Lento / Timeout) ---

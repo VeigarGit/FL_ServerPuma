@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, prepare_model_for_kbit_training
 from transformers import AutoModel, BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
@@ -60,13 +60,33 @@ def load_quantized_lfm_backbone(
     return backbone
 
 
-def apply_qlora(backbone: nn.Module, lora_config: dict[str, Any]) -> nn.Module:
-    """Prepara o backbone 4-bit e injeta adaptadores LoRA com gradient checkpointing seguro."""
-    backbone = prepare_model_for_kbit_training(
+def _prepare_kbit_backbone(backbone: nn.Module) -> nn.Module:
+    """Congela o backbone 4-bit e ativa gradient checkpointing seguro antes dos adaptadores."""
+    for param in backbone.parameters():
+        param.requires_grad = False
+    return prepare_model_for_kbit_training(
         backbone,
         use_gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
     )
+
+
+def apply_qlora(
+    backbone: nn.Module,
+    lora_config: dict[str, Any],
+    compute_dtype: torch.dtype | None = None,
+) -> nn.Module:
+    """Prepara o backbone 4-bit e injeta adaptadores LoRA em 16 bits (sem cast para fp32)."""
+    from lora_slm.sora import apply_peft_lora_modules
+
+    backbone = _prepare_kbit_backbone(backbone)
+    target_dtype = compute_dtype
+    if target_dtype is None:
+        target_dtype = (
+            torch.bfloat16
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        )
 
     rank = lora_config.get("r", 8)
     alpha = lora_config.get("alpha", 16)
@@ -80,17 +100,40 @@ def apply_qlora(backbone: nn.Module, lora_config: dict[str, Any]) -> nn.Module:
         bias="none",
         target_modules=targets,
     )
-    return get_peft_model(backbone, peft_config)
+    return apply_peft_lora_modules(backbone, peft_config, adapter_dtype=target_dtype)
+
+
+def apply_qsora(
+    backbone: nn.Module,
+    lora_config: dict[str, Any],
+    compute_dtype: torch.dtype = torch.bfloat16,
+) -> nn.Module:
+    """Prepara o backbone 4-bit e injeta adaptadores SoRA em 16 bits (QSoRA) para LFM."""
+    from lora_slm.sora import apply_sora_modules
+
+    backbone = _prepare_kbit_backbone(backbone)
+    targets = _resolve_lora_targets(lora_config.get("target_modules", LORA_TARGETS))
+    n_wrapped = apply_sora_modules(
+        backbone,
+        target_pattern=targets,
+        r=int(lora_config.get("r", 8)),
+        lora_alpha=int(lora_config.get("alpha", 16)),
+        lora_dropout=float(lora_config.get("dropout", 0.05)),
+        adapter_dtype=compute_dtype,
+    )
+    logger.info(f"[LFM QSoRA] SoRA aplicado a {n_wrapped} módulos Linear4bit.")
+    return backbone
 
 
 def verify_qlora_freezing(model: nn.Module) -> None:
     """
     Verificação estrita de segurança: garante que 100% dos tensores 4-bit estejam congelados
-    e que apenas adaptadores LoRA e a DecisionHead tenham requires_grad=True.
+    e que apenas adaptadores LoRA/SoRA e a DecisionHead tenham requires_grad=True.
     """
     trainable_count = 0
     params4bit_trainable = 0
     params4bit_total = 0
+    offenders = []
 
     for name, param in model.named_parameters():
         param_type = type(param).__name__
@@ -101,17 +144,23 @@ def verify_qlora_freezing(model: nn.Module) -> None:
                 params4bit_trainable += 1
                 logger.error(f"[QLoRA ERROR] Parâmetro 4-bit com gradiente ativo: {name}")
         elif param.requires_grad:
+            if not ("lora_" in name or ".sora." in name or name.startswith("head.")):
+                offenders.append(name)
             trainable_count += param.numel()
 
-    if params4bit_trainable > 0:
+    if params4bit_trainable > 0 or offenders:
         raise RuntimeError(
-            f"Falha de isolamento QLoRA: {params4bit_trainable} tensores 4-bit "
-            "possuem gradiente ativo!"
+            f"Falha de isolamento QLoRA/QSoRA: {params4bit_trainable} tensores 4-bit e "
+            f"{len(offenders)} tensores de backbone treináveis ({offenders[:5]})!"
         )
 
+    adapter_dtypes = sorted(
+        {str(p.dtype) for n, p in model.named_parameters() if "lora_" in n or ".sora." in n}
+    )
     logger.info(
-        f"[QLoRA Freezing Check] Aprovado! {params4bit_total} tensores 4-bit congelados. "
-        f"Total de parâmetros treináveis (LoRA + Head): {trainable_count:,}"
+        f"[QLoRA/QSoRA Freezing Check] Aprovado! {params4bit_total} tensores 4-bit congelados. "
+        f"Total de parâmetros treináveis (Adaptadores + Head): {trainable_count:,} | "
+        f"dtype adaptadores: {adapter_dtypes}"
     )
 
 
@@ -121,15 +170,18 @@ def build_lfm_optimizer(
     is_qlora: bool = False,
 ) -> torch.optim.Optimizer:
     """
-    Constrói otimizador com dois grupos de parâmetros (DecisionHead e LoRA)
-    utilizando PagedAdamW8bit no modo QLoRA ou AdamW nativo em BF16.
+    Constrói otimizador para DecisionHead, LoRA/SoRA e portões SoRA (weight_decay=0.0),
+    utilizando PagedAdamW8bit no modo QLoRA/QSoRA ou AdamW nativo em BF16.
     """
     opt_cfg = run_config.get("optimizer", {})
-    head_lr = opt_cfg.get("head_lr", 0.0003)
-    lora_lr = opt_cfg.get("lora_lr", 0.00003)
-    weight_decay = opt_cfg.get("weight_decay", 0.01)
+    sora_cfg = run_config.get("model", {}).get("sora", {})
+    head_lr = float(opt_cfg.get("head_lr", 0.0003))
+    lora_lr = float(opt_cfg.get("lora_lr", 0.00003))
+    sparse_lr = float(sora_cfg.get("sparse_lr") or lora_lr)
+    weight_decay = float(opt_cfg.get("weight_decay", 0.01))
 
     head_params = []
+    gate_params = []
     lora_params = []
 
     for name, param in model.named_parameters():
@@ -137,13 +189,18 @@ def build_lfm_optimizer(
             continue
         if "head" in name:
             head_params.append(param)
+        elif "sora" in name and "gate" in name:
+            gate_params.append(param)
         else:
             lora_params.append(param)
 
-    param_groups = [
-        {"params": head_params, "lr": head_lr, "weight_decay": weight_decay},
-        {"params": lora_params, "lr": lora_lr, "weight_decay": weight_decay},
-    ]
+    param_groups = []
+    if head_params:
+        param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": weight_decay})
+    if lora_params:
+        param_groups.append({"params": lora_params, "lr": lora_lr, "weight_decay": weight_decay})
+    if gate_params:
+        param_groups.append({"params": gate_params, "lr": sparse_lr, "weight_decay": 0.0})
 
     if is_qlora:
         try:
@@ -163,7 +220,7 @@ def assert_adapter_only_payload(payload: dict[str, Any]) -> None:
     Invariante crítico de rede federada: assegura que nenhum peso base do backbone
     seja serializado no payload de comunicação cliente-servidor.
     """
-    allowed_pattern = re.compile(r"^(head\..*|.*lora_.*)$")
+    allowed_pattern = re.compile(r"^(head\..*|.*(?:lora_|sora\.(?:lora_A|lora_B|gate)).*)$")
     violations = [k for k in payload if not allowed_pattern.search(k)]
 
     if violations:
@@ -171,3 +228,6 @@ def assert_adapter_only_payload(payload: dict[str, Any]) -> None:
             f"Violação de isolamento de rede! {len(violations)} tensores base "
             f"encontrados no payload: {violations[:5]}"
         )
+    for key, val in payload.items():
+        if isinstance(val, torch.Tensor) and val.dtype == torch.uint8:
+            raise ValueError(f"Tensor quantizado 4-bit detectado no payload LFM: {key}")

@@ -69,7 +69,8 @@ def test_loss_and_payload_isolation():
         "backbone.base_model.model.model.language_model.layers.23"
         ".self_attn.q_proj.lora_A.default.weight"
     )
-    valid_payload = {lora_key: torch.randn(8, 2048)}
+    sora_gate_key = "backbone.model.language_model.layers.23.feed_forward.w1.sora.gate"
+    valid_payload = {lora_key: torch.randn(8, 2048), sora_gate_key: torch.ones(1, 8)}
     assert_adapter_only_payload(valid_payload)
 
     invalid_payload = {
@@ -88,8 +89,148 @@ def test_loss_and_payload_isolation():
     print("✓ test_loss_and_payload_isolation aprovado!")
 
 
+def test_lora_sora_adapter_dtype_parity():
+    """Garante que LoRA (PEFT) e SoRA mantenham adaptadores em 16 bits (sem upcast FP32)."""
+    from lora_slm.sora import apply_peft_lora_modules, apply_sora_modules
+    from peft import LoraConfig
+
+    class _DummyLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = torch.nn.Module()
+            self.language_model.q_proj = torch.nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
+            self.language_model.w1 = torch.nn.Linear(32, 64, bias=False, dtype=torch.bfloat16)
+
+        def forward(self, x):
+            return self.language_model.q_proj(x) + self.language_model.w1(x).sum(
+                dim=-1, keepdim=True
+            )
+
+    lora_model = _DummyLM()
+    lora_model.requires_grad_(False)
+    peft_cfg = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        bias="none",
+        target_modules=r".*language_model\.(q_proj|w1)",
+    )
+    lora_wrapped = apply_peft_lora_modules(lora_model, peft_cfg, adapter_dtype=torch.bfloat16)
+
+    sora_model = _DummyLM()
+    sora_model.requires_grad_(False)
+    apply_sora_modules(
+        sora_model,
+        target_pattern=r".*language_model\.(q_proj|w1)",
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        adapter_dtype=torch.bfloat16,
+    )
+
+    lora_dtypes = {
+        p.dtype for n, p in lora_wrapped.named_parameters() if p.requires_grad and "lora_" in n
+    }
+    sora_dtypes = {
+        p.dtype for n, p in sora_model.named_parameters() if p.requires_grad and ".sora." in n
+    }
+    assert lora_dtypes == {torch.bfloat16}, f"Esperado bfloat16 no LoRA, obtido {lora_dtypes}"
+    assert sora_dtypes == {torch.bfloat16}, f"Esperado bfloat16 no SoRA, obtido {sora_dtypes}"
+
+    x = torch.randn(2, 32, dtype=torch.bfloat16)
+    lora_wrapped(x).sum().backward()
+    sora_model(x).sum().backward()
+    assert all(
+        p.grad is not None and torch.isfinite(p.grad).all()
+        for p in lora_wrapped.parameters()
+        if p.requires_grad
+    )
+    print("✓ test_lora_sora_adapter_dtype_parity aprovado!")
+
+
+def test_sora_forward_and_gate_sparsifier_and_optimizer():
+    """Valida SoRALinear, GateSparsifier vetorizado e build_d1_optimizer."""
+    from lora_slm.sora import GateSparsifier, SoRALinear
+
+    from lora_d1.qlora import build_d1_optimizer
+
+    torch.manual_seed(0)
+    for dtype, atol, grad_atol in ((torch.float32, 1e-5, 1e-5), (torch.bfloat16, 1e-2, 5e-2)):
+        mod = SoRALinear(32, 64, r=8, lora_alpha=16, lora_dropout=0.0).to(dtype=dtype)
+        with torch.no_grad():
+            mod.lora_B.normal_(std=0.1)
+            mod.gate.copy_(torch.linspace(-0.3, 0.3, 8, dtype=dtype).unsqueeze(0))
+
+        x = torch.randn(4, 10, 32, dtype=dtype, requires_grad=True)
+        out = mod(x)
+        ref = ((x @ mod.lora_A.T).mul(mod.gate) @ mod.lora_B.T) * mod.scaling
+        assert torch.allclose(out, ref, atol=atol, rtol=atol)
+
+        out.sum().backward()
+        g_A, g_B, g_gate, g_x = (
+            mod.lora_A.grad.clone(),
+            mod.lora_B.grad.clone(),
+            mod.gate.grad.clone(),
+            x.grad.clone(),
+        )
+        mod.zero_grad(set_to_none=True)
+        x.grad = None
+        ref2 = ((x @ mod.lora_A.T).mul(mod.gate) @ mod.lora_B.T) * mod.scaling
+        ref2.sum().backward()
+        assert torch.allclose(g_A, mod.lora_A.grad, atol=grad_atol, rtol=grad_atol)
+        assert torch.allclose(g_B, mod.lora_B.grad, atol=grad_atol, rtol=grad_atol)
+        assert torch.allclose(g_gate, mod.gate.grad, atol=grad_atol, rtol=grad_atol)
+        assert torch.allclose(g_x, x.grad, atol=grad_atol, rtol=grad_atol)
+
+        # Valida GateSparsifier multi-tensor (_foreach_*) vs F.softshrink
+        gates_vec = [torch.nn.Parameter(torch.randn(1, 8, dtype=dtype)) for _ in range(6)]
+        gates_ref = [p.data.clone() for p in gates_vec]
+        sparsifier = GateSparsifier(gates_vec, sparse_lambda=0.15, gate_lr=0.5)
+        sparsifier.step()
+        th = 0.15 * 0.5
+        for p_vec, p_ref in zip(gates_vec, gates_ref, strict=True):
+            expected = torch.nn.functional.softshrink(p_ref, th)
+            tol = 1e-6 if dtype == torch.float32 else 5e-3
+            assert torch.allclose(p_vec.data, expected, atol=tol, rtol=tol)
+
+    # Limite threshold <= 0 / vazio não deve alterar nem falhar
+    GateSparsifier([], sparse_lambda=0.1, gate_lr=0.1).step()
+    p_zero = torch.nn.Parameter(torch.tensor([[0.123]], dtype=torch.float32))
+    GateSparsifier([p_zero], sparse_lambda=0.0, gate_lr=0.1).step()
+    assert torch.isclose(p_zero.data, torch.tensor([[0.123]]))
+
+    # Valida build_d1_optimizer em CPU (fused=False) e CUDA (fused=True)
+    cpu_mod = SoRALinear(16, 16, r=4).to(dtype=torch.bfloat16)
+    opt_cpu = build_d1_optimizer(
+        cpu_mod,
+        {"optimizer": {"lr": 1e-4}, "model": {"sora": {"sparse_lr": 1e-2}}},
+    )
+    assert opt_cpu.defaults["fused"] is False
+
+    if torch.cuda.is_available():
+        cuda_mod = SoRALinear(32, 64, r=8).to(device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            cuda_mod.lora_B.normal_(std=0.05)
+        opt_cuda = build_d1_optimizer(
+            cuda_mod,
+            {"optimizer": {"lr": 1e-4}, "model": {"sora": {"sparse_lr": 1e-2}}},
+        )
+        assert opt_cuda.defaults["fused"] is True
+        xc = torch.randn(2, 8, 32, device="cuda", dtype=torch.bfloat16)
+        cuda_mod(xc).sum().backward()
+        GateSparsifier([cuda_mod.gate], sparse_lambda=0.1, gate_lr=0.01).step()
+        opt_cuda.step()
+        opt_cuda.zero_grad(set_to_none=True)
+        for p in cuda_mod.parameters():
+            assert torch.isfinite(p).all()
+
+    print("✓ test_sora_forward_and_gate_sparsifier_and_optimizer aprovado!")
+
+
 if __name__ == "__main__":
     test_text_dataset_and_collate()
     test_multimodal_dataset_and_collate()
     test_loss_and_payload_isolation()
+    test_lora_sora_adapter_dtype_parity()
+    test_sora_forward_and_gate_sparsifier_and_optimizer()
     print("\nTODOS OS TESTES UNITÁRIOS DO DECISION-D1 FORAM APROVADOS COM SUCESSO!")

@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import AutoConfig, AutoModel, AutoTokenizer
@@ -393,7 +393,9 @@ def setup_d1_model(
     num_classes: int = 2,
     release_vision: bool = False,
 ) -> tuple[DecisionD1, Any]:
-    """Instancia o LiquidAI/d1-2B em BF16 ou 4-bit NF4 com LoRA e PaCA."""
+    """Instancia o LiquidAI/d1-2B em BF16 ou 4-bit NF4 com LoRA/SoRA e PaCA."""
+    from lora_slm.sora import SORA_MODES, apply_peft_lora_modules, apply_sora_modules
+
     torch.set_float32_matmul_precision("high")
     model_cfg = run_config.get("model", {})
     name = model_cfg.get("name", MODEL_NAME)
@@ -401,11 +403,13 @@ def setup_d1_model(
     question = model_cfg.get("question", DEFAULT_QUESTION)
     lora_cfg = model_cfg.get("lora", {})
     qcfg = model_cfg.get("qlora", {})
+    is_sora = lora_cfg.get("mode", "with_lora") in SORA_MODES
     target_device = torch.device(device)
     compute_dtype = (
         torch.bfloat16
         if target_device.type == "cuda"
         and getattr(torch, qcfg.get("compute_dtype", "bfloat16")) == torch.bfloat16
+        and torch.cuda.is_bf16_supported()
         else (torch.float16 if target_device.type == "cuda" else torch.float32)
     )
 
@@ -413,20 +417,32 @@ def setup_d1_model(
     if is_qlora:
         from lora_d1.qlora import (
             apply_qlora,
+            apply_qsora,
             load_quantized_d1_backbone,
             verify_qlora_freezing,
         )
 
-        logger.info("Carregando backbone d1-2B em 4-bit NF4 (QLoRA)...")
+        tag = "QSoRA" if is_sora else "QLoRA"
+        logger.info(f"Carregando backbone d1-2B em 4-bit NF4 ({tag})...")
         backbone = load_quantized_d1_backbone(name, revision, target_device, qcfg=qcfg)
         if release_vision:
             _release_unused_vision_modules(backbone)
-        backbone = apply_qlora(
-            backbone,
-            lora_cfg,
-            gradient_checkpointing=bool(model_cfg.get("gradient_checkpointing", True)),
-            prepare_kbit=bool(qcfg.get("prepare_kbit", False)),
-        )
+        if is_sora:
+            backbone = apply_qsora(
+                backbone,
+                lora_cfg,
+                gradient_checkpointing=bool(model_cfg.get("gradient_checkpointing", True)),
+                prepare_kbit=bool(qcfg.get("prepare_kbit", False)),
+                compute_dtype=compute_dtype,
+            )
+        else:
+            backbone = apply_qlora(
+                backbone,
+                lora_cfg,
+                gradient_checkpointing=bool(model_cfg.get("gradient_checkpointing", True)),
+                prepare_kbit=bool(qcfg.get("prepare_kbit", False)),
+                compute_dtype=compute_dtype,
+            )
         configure_d1_tokenizer(tokenizer, name, revision, config=backbone.config)
         verify_qlora_freezing(backbone)
     else:
@@ -449,14 +465,26 @@ def setup_d1_model(
             )
             backbone.config.use_cache = False
 
-        peft_config = LoraConfig(
-            r=int(lora_cfg.get("r", 8)),
-            lora_alpha=int(lora_cfg.get("alpha", 16)),
-            lora_dropout=float(lora_cfg.get("dropout", 0.05)),
-            bias=str(lora_cfg.get("bias", "none")),
-            target_modules=_resolve_lora_targets(lora_cfg.get("target_modules", LORA_TARGETS)),
-        )
-        backbone = get_peft_model(backbone, peft_config)
+        targets = _resolve_lora_targets(lora_cfg.get("target_modules", LORA_TARGETS))
+        if is_sora:
+            n_wrapped = apply_sora_modules(
+                backbone,
+                target_pattern=targets,
+                r=int(lora_cfg.get("r", 8)),
+                lora_alpha=int(lora_cfg.get("alpha", 16)),
+                lora_dropout=float(lora_cfg.get("dropout", 0.05)),
+                adapter_dtype=compute_dtype,
+            )
+            logger.info(f"[d1 SoRA] SoRA aplicado a {n_wrapped} módulos.")
+        else:
+            peft_config = LoraConfig(
+                r=int(lora_cfg.get("r", 8)),
+                lora_alpha=int(lora_cfg.get("alpha", 16)),
+                lora_dropout=float(lora_cfg.get("dropout", 0.05)),
+                bias=str(lora_cfg.get("bias", "none")),
+                target_modules=targets,
+            )
+            backbone = apply_peft_lora_modules(backbone, peft_config, adapter_dtype=compute_dtype)
         configure_d1_tokenizer(tokenizer, name, revision, config=backbone.config)
 
     ds_name = dataset or run_config.get("dataset", {}).get("name", "Banking77")

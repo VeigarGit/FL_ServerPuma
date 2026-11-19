@@ -196,6 +196,8 @@ def parse_experiment(exp_name, results_base=None):
         label = f"PUMA-GT (Naive){rank_str}"
     elif "onlypaca" in exp_name.lower() or "norank" in exp_name.lower():
         label = f"PUMA-GT{rank_str}"
+    elif "deltacoding" in exp_name.lower():
+        label = f"PUMA-GT Evolution + Delta{rank_str}"
     elif "slm" in exp_name.lower() and ("plus" in exp_name.lower() or "adaptpaca_adaptrank" in exp_name.lower()):
         label = f"PUMA-GT Evolution{rank_str}"
     elif "plus" in exp_name.lower() or "adaptpaca_adaptrank" in exp_name.lower():
@@ -378,6 +380,8 @@ def _load_server_h5(files):
         'time_mean': np.mean(time_, axis=0), 'time_std': np.std(time_, axis=0),
         'params_mean': np.mean(params, axis=0),
         'size_mb_mean': np.mean(size_, axis=0), 'size_mb_std': np.std(size_, axis=0),
+        'params_runs': params,
+        'size_runs': size_,
         'paca_mean': paca_mean,
         'rank_mean': rank_mean,
         'client_training_time_mean': client_training_time_mean,
@@ -1369,15 +1373,70 @@ DATASET_EXPERIMENTS = {
 # Configuração ativa: execuções do OxfordPets (LoRA, SoRA, PUMA-GT v1 e v2)
 EXPERIMENTOS_PARA_PLOTAR = DATASET_EXPERIMENTS["OxfordPets"]
 
+def _normalize_legacy_lora_bf16(experiments):
+    """Normaliza LoRA legado (fp32 por autocast do PEFT) para bfloat16 (2 B/param) quando comparado com pares em 16 bits."""
+    has_bf16_peer = False
+    for exp in experiments:
+        sv = exp['server']
+        p0 = float(sv['params_mean'][0]) if len(sv.get('params_mean', [])) else 0.0
+        s0 = float(sv['size_mb_mean'][0]) if len(sv.get('size_mb_mean', [])) else 0.0
+        if p0 > 0 and 1.8 <= (s0 * 1024.0 * 1024.0 / p0) <= 2.2:
+            has_bf16_peer = True
+            break
+
+    if not has_bf16_peer:
+        return
+
+    for exp in experiments:
+        if 'lora' not in exp.get('strategy', '').lower():
+            continue
+        sv = exp['server']
+        p0 = float(sv['params_mean'][0]) if len(sv.get('params_mean', [])) else 0.0
+        s0 = float(sv['size_mb_mean'][0]) if len(sv.get('size_mb_mean', [])) else 0.0
+        if p0 <= 0:
+            continue
+        old_bpp = s0 * 1024.0 * 1024.0 / p0
+        if old_bpp <= 3.0:
+            continue
+
+        new_runs = [
+            np.asarray(p_run, dtype=float) * 2.0 / (1024.0 * 1024.0)
+            for p_run in sv.get('params_runs', [])
+        ]
+        if new_runs:
+            sv['size_runs'] = new_runs
+            sv['size_mb_mean'] = np.mean(new_runs, axis=0)
+            sv['size_mb_std'] = np.std(new_runs, axis=0)
+            print(
+                f"  ℹ️ [BF16 Fair] {exp['label']}: tamanho normalizado "
+                f"de {s0:.4f} MB (~{old_bpp:.2f} B/param) → "
+                f"{sv['size_mb_mean'][0]:.4f} MB (2.00 B/param)."
+            )
+
+
 def main():
     dataset_name = None
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
+    custom_out_dir = None
+    normalize_lora_bf16 = False
+    argv = list(sys.argv[1:])
+    if "--normalize-lora-bf16" in argv:
+        normalize_lora_bf16 = True
+        argv.remove("--normalize-lora-bf16")
+    if "--out-dir" in argv:
+        idx = argv.index("--out-dir")
+        if idx + 1 >= len(argv):
+            print("❌ --out-dir requer um caminho.")
+            sys.exit(1)
+        custom_out_dir = argv[idx + 1]
+        argv = argv[:idx] + argv[idx + 2:]
+
+    if argv:
+        arg = argv[0]
         if arg in DATASET_EXPERIMENTS:
             dataset_name = arg
             exp_names = DATASET_EXPERIMENTS[arg]
         else:
-            exp_names = sys.argv[1:]
+            exp_names = argv
     else:
         exp_names = EXPERIMENTOS_PARA_PLOTAR
         dataset_name = "OxfordPets"
@@ -1406,6 +1465,9 @@ def main():
         print("\n❌ Nenhum experimento válido encontrado.")
         sys.exit(1)
 
+    if normalize_lora_bf16:
+        _normalize_legacy_lora_bf16(experiments)
+
     # Auto-detecta dataset_name a partir dos experimentos se não foi passado via CLI
     if dataset_name is None and experiments:
         dataset_name = experiments[0].get('dataset')
@@ -1417,7 +1479,9 @@ def main():
     else:
         graficos_base = os.path.join(DEFAULT_RESULTS_BASE, "graficos")
 
-    if len(experiments) == 1:
+    if custom_out_dir is not None:
+        output_dirs = [custom_out_dir]
+    elif len(experiments) == 1:
         output_dirs = [os.path.join(experiments[0]['results_dir'], "graficos")]
     elif dataset_name:
         output_dirs = [os.path.join(graficos_base, dataset_name)]
