@@ -227,10 +227,88 @@ def test_sora_forward_and_gate_sparsifier_and_optimizer():
     print("✓ test_sora_forward_and_gate_sparsifier_and_optimizer aprovado!")
 
 
+def test_lhdq_vectorized_unpack_and_return_reference():
+    """Valida decodificador Huffman vetorizado e referência direta no lhdq_encode."""
+    import numpy as np
+
+    from utils.lhdq import _huffman_pack, _huffman_unpack, lhdq_decode, lhdq_encode
+
+    def _ref_unpack(packed_bytes: bytes, total_bits: int, n_elements: int) -> np.ndarray:
+        out = np.empty(n_elements, dtype=np.int8)
+        b_idx, bit_pos, s_idx, read = 0, 7, 0, 0
+        cur = packed_bytes[0] if packed_bytes else 0
+        while s_idx < n_elements and read < total_bits:
+            b1 = (cur >> bit_pos) & 1
+            read += 1
+            bit_pos -= 1
+            if bit_pos < 0:
+                b_idx += 1
+                bit_pos = 7
+                cur = packed_bytes[b_idx] if b_idx < len(packed_bytes) else 0
+            if b1 == 1:
+                out[s_idx] = 1
+            else:
+                b2 = (cur >> bit_pos) & 1
+                read += 1
+                bit_pos -= 1
+                if bit_pos < 0:
+                    b_idx += 1
+                    bit_pos = 7
+                    cur = packed_bytes[b_idx] if b_idx < len(packed_bytes) else 0
+                out[s_idx] = 0 if b2 == 1 else 2
+            s_idx += 1
+        return out
+
+    assert _huffman_unpack(b"", 0, 0).size == 0
+    rng = np.random.default_rng(7)
+    cases = [
+        np.zeros(1, dtype=np.int8),
+        np.ones(1, dtype=np.int8),
+        np.full(1, 2, dtype=np.int8),
+        np.zeros(257, dtype=np.int8),
+        np.ones(257, dtype=np.int8),
+        np.full(257, 2, dtype=np.int8),
+    ] + [rng.integers(0, 3, size=int(rng.integers(1, 4096)), dtype=np.int8) for _ in range(20)]
+
+    for syms in cases:
+        pk, tb = _huffman_pack(syms)
+        ref = _ref_unpack(pk, tb, len(syms))
+        vec = _huffman_unpack(pk, tb, len(syms))
+        assert np.array_equal(vec, syms) and np.array_equal(vec, ref)
+
+    torch.manual_seed(11)
+    prev = {
+        "a.bf16": torch.randn(8, 128, dtype=torch.bfloat16),
+        "b.fp32": torch.randn(16, 64, dtype=torch.float32),
+        "c.resized": torch.randn(8, 32, dtype=torch.bfloat16),
+    }
+    curr = {
+        "a.bf16": prev["a.bf16"] + 0.02 * torch.randn(8, 128, dtype=torch.bfloat16),
+        "b.fp32": prev["b.fp32"] + 0.02 * torch.randn(16, 64, dtype=torch.float32),
+        "c.resized": torch.randn(4, 32, dtype=torch.bfloat16),
+        "d.new": torch.randn(2, 8, dtype=torch.bfloat16),
+        "meta.step": 42,
+    }
+    enc_only = lhdq_encode(curr, prev)
+    enc, ref_state = lhdq_encode(curr, prev, return_reference=True)
+    dec_state = lhdq_decode(enc_only, prev)
+
+    assert set(ref_state.keys()) == set(dec_state.keys()) == set(curr.keys())
+    assert ref_state["meta.step"] == dec_state["meta.step"] == 42
+    for key in ("a.bf16", "b.fp32", "c.resized", "d.new"):
+        assert torch.equal(ref_state[key], dec_state[key]), f"Divergência na chave {key}"
+    # Clones de fallback raw não devem compartilhar armazenamento mutável com curr
+    curr["d.new"].zero_()
+    assert not torch.equal(ref_state["d.new"], curr["d.new"])
+
+    print("✓ test_lhdq_vectorized_unpack_and_return_reference aprovado!")
+
+
 if __name__ == "__main__":
     test_text_dataset_and_collate()
     test_multimodal_dataset_and_collate()
     test_loss_and_payload_isolation()
     test_lora_sora_adapter_dtype_parity()
     test_sora_forward_and_gate_sparsifier_and_optimizer()
+    test_lhdq_vectorized_unpack_and_return_reference()
     print("\nTODOS OS TESTES UNITÁRIOS DO DECISION-D1 FORAM APROVADOS COM SUCESSO!")
