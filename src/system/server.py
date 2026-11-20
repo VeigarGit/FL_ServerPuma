@@ -630,8 +630,9 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         if self.args.delta_coding:
             previous = self.previous_sent_state.get(client_id)
             if previous is not None and round_num >= 2:
-                current_global_state = lhdq_encode(current_global_state, previous)
-                reference = lhdq_decode(current_global_state, previous)
+                current_global_state, reference = lhdq_encode(
+                    current_global_state, previous, return_reference=True
+                )
             else:
                 reference = {key: tensor.clone() for key, tensor in current_global_state.items()}
             self.previous_sent_state[client_id] = reference

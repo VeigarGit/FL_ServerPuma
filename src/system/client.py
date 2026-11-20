@@ -281,8 +281,9 @@ def _encode_client_payload(
     start = time.time()
     use_lhdq = delta_coding and round_num >= 1 and bool(previous_sent_state)
     if use_lhdq:
-        updated_state = lhdq_encode(updated_state, previous_sent_state)
-        previous_sent_state = lhdq_decode(updated_state, previous_sent_state)
+        updated_state, previous_sent_state = lhdq_encode(
+            updated_state, previous_sent_state, return_reference=True
+        )
     else:
         if delta_coding:
             previous_sent_state = {

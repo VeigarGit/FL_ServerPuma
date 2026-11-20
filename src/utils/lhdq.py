@@ -13,10 +13,11 @@ Uso:
     recovered = lhdq_decode(encoded, previous_state)
 """
 
-import math
-import torch
-import numpy as np
 import logging
+import math
+
+import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ def _huffman_pack(symbols: np.ndarray) -> tuple:
     # Símbolo 2 vira '00' (segundo bit = 0)
     bits[starts_2bits + 1] = (symbols[mask_2bits] == 0)
     
-    # O np.packbits automaticamente agrupa os bits em bytes MSB e faz o padding do último byte com zeros
+    # O np.packbits agrupa os bits em bytes MSB e faz padding do último byte com zeros
     packed_bytes = np.packbits(bits).tobytes()
     return packed_bytes, total_bits
 
@@ -84,47 +85,35 @@ def _huffman_pack(symbols: np.ndarray) -> tuple:
 def _huffman_unpack(packed_bytes: bytes, total_bits: int, n_elements: int) -> np.ndarray:
     """
     Desempacota bytes Huffman de volta para um array de símbolos {0, 1, 2}.
+
+    Implementação 100% vetorizada em NumPy (libera o GIL e é bit-a-bit idêntica):
+    no código {'1'→1, '01'→0, '00'→2}, todo bit '1' encerra um símbolo e
+    reinicia o estado do autômato para 0; logo o estado s(i) ∈ {0, 1} ao entrar
+    no bit i é a paridade da quantidade de '0's consecutivos imediatamente antes de i.
     """
-    symbols = np.empty(n_elements, dtype=np.int8)
-    
-    byte_idx = 0
-    bit_idx = 7  # posição do bit no byte atual (7 = MSB)
-    sym_idx = 0
-    bits_read = 0
-    
-    current_byte = packed_bytes[0] if packed_bytes else 0
-    
-    while sym_idx < n_elements and bits_read < total_bits:
-        # Lê o primeiro bit
-        first_bit = (current_byte >> bit_idx) & 1
-        bits_read += 1
-        bit_idx -= 1
-        if bit_idx < 0:
-            byte_idx += 1
-            bit_idx = 7
-            current_byte = packed_bytes[byte_idx] if byte_idx < len(packed_bytes) else 0
-        
-        if first_bit == 1:
-            # Código '1' → símbolo 0 (sem mudança)
-            symbols[sym_idx] = DECODE_FIRST_BIT_IS_1
-        else:
-            # Primeiro bit é 0, precisa ler o segundo
-            second_bit = (current_byte >> bit_idx) & 1
-            bits_read += 1
-            bit_idx -= 1
-            if bit_idx < 0:
-                byte_idx += 1
-                bit_idx = 7
-                current_byte = packed_bytes[byte_idx] if byte_idx < len(packed_bytes) else 0
-            
-            if second_bit == 1:
-                symbols[sym_idx] = DECODE_SECOND_BIT_IS_1  # '01' → símbolo -1
-            else:
-                symbols[sym_idx] = DECODE_SECOND_BIT_IS_0  # '00' → símbolo +1
-        
-        sym_idx += 1
-    
-    return symbols
+    if n_elements <= 0:
+        return np.empty(0, dtype=np.int8)
+    if total_bits <= 0 or not packed_bytes:
+        return np.zeros(n_elements, dtype=np.int8)
+
+    bits = np.unpackbits(np.frombuffer(packed_bytes, dtype=np.uint8))[:total_bits]
+    idx = np.arange(total_bits, dtype=np.int32)
+    last_one = np.maximum.accumulate(np.where(bits == 1, idx, -1))
+
+    s = np.empty(total_bits, dtype=np.int8)
+    s[0] = 0
+    if total_bits > 1:
+        s[1:] = (idx[1:] - 1 - last_one[:-1]) & 1
+
+    end_mask = (s == 1) | (bits == 1)
+    b_end = bits[end_mask]
+    s_end = s[end_mask]
+    symbols = np.where(
+        b_end == 0,
+        DECODE_SECOND_BIT_IS_0,
+        DECODE_FIRST_BIT_IS_1 - s_end,
+    ).astype(np.int8)
+    return symbols[:n_elements]
 
 
 def _quantize_delta_3level(delta: torch.Tensor) -> tuple:
@@ -147,7 +136,8 @@ def _quantize_delta_3level(delta: torch.Tensor) -> tuple:
         return symbols, mu, sigma
     
     # Usa percentis reais para definir os limites de cada terço
-    quantiles = torch.quantile(delta_flat, torch.tensor([0.3333, 0.6667], device=delta_flat.device))
+    probs = torch.tensor([0.3333, 0.6667], device=delta_flat.device)
+    quantiles = torch.quantile(delta_flat, probs)
     lower_bound = quantiles[0].item()
     upper_bound = quantiles[1].item()
     
@@ -198,16 +188,24 @@ def _dequantize_3level(symbols: np.ndarray, mu: float, sigma: float,
     return delta_values.reshape(shape)
 
 
-def lhdq_encode(current_state: dict, previous_state: dict) -> dict:
+def lhdq_encode(
+    current_state: dict,
+    previous_state: dict,
+    *,
+    return_reference: bool = False,
+) -> dict | tuple[dict, dict]:
     """
     Codifica a diferença entre o estado atual e o anterior usando LHDQ.
-    
+
     Args:
         current_state: state_dict atual (pesos float)
         previous_state: state_dict da rodada anterior (pesos float)
-    
+        return_reference: quando True, retorna também o estado reconstruído
+            diretamente a partir de `symbols` sem precisar chamar lhdq_decode().
+
     Returns:
-        dict com a estrutura:
+        dict codificado (ou tupla `(encoded, reference)` quando `return_reference=True`) com
+        a estrutura:
         {
             '__lhdq__': True,  # flag de identificação
             'keys': {
@@ -225,44 +223,49 @@ def lhdq_encode(current_state: dict, previous_state: dict) -> dict:
         }
     """
     encoded = {'__lhdq__': True, 'keys': {}}
-    
+    reference = {} if return_reference else None
+
     total_original_bytes = 0
     total_compressed_bytes = 0
-    
+
     for key in current_state:
         current_val = current_state[key]
-        
+
         if not isinstance(current_val, torch.Tensor):
             # Valores não-tensoriais (ex: contadores) são passados diretamente
             encoded['keys'][key] = {'raw': current_val}
+            if reference is not None:
+                reference[key] = current_val
             continue
-        
+
         prev_val = previous_state.get(key)
-        
+
         if prev_val is None or prev_val.shape != current_val.shape:
             # Chave nova ou shape mudou (ex: rank adaptativo) — fallback para raw
             encoded['keys'][key] = {'raw': current_val}
+            if reference is not None:
+                reference[key] = current_val.clone()
             continue
-        
+
         # Calcula o delta
         delta = current_val.float() - prev_val.float().to(current_val.device)
-        
+
         # Quantiza em 3 níveis
         symbols, mu, sigma = _quantize_delta_3level(delta)
-        
+
         # Quantiza μ e σ em float16 conforme a literatura (16 bits cada)
         mu_f16 = torch.tensor(mu, dtype=torch.float16).item()
         sigma_f16 = torch.tensor(sigma, dtype=torch.float16).item()
-        
+
         # Empacota com Huffman
         packed_bytes, total_bits = _huffman_pack(symbols)
-        
+
         # Estatísticas de compressão
         original_bytes = current_val.numel() * current_val.element_size()
         compressed_bytes = len(packed_bytes) + 4  # +4 bytes para mu/sigma (2 × float16)
         total_original_bytes += original_bytes
         total_compressed_bytes += compressed_bytes
-        
+
         encoded['keys'][key] = {
             'packed': packed_bytes,
             'total_bits': total_bits,
@@ -273,18 +276,28 @@ def lhdq_encode(current_state: dict, previous_state: dict) -> dict:
             'dtype': current_val.dtype,
             'device': str(current_val.device),
         }
-    
+        if reference is not None:
+            reconstructed_delta = _dequantize_3level(
+                symbols,
+                mu_f16,
+                sigma_f16,
+                tuple(current_val.shape),
+                prev_val.device,
+                prev_val.dtype,
+            )
+            reference[key] = prev_val + reconstructed_delta
+
     if total_original_bytes > 0:
         ratio = total_compressed_bytes / total_original_bytes
         bpp = (total_compressed_bytes * 8) / max(1, sum(
-            current_state[k].numel() for k in current_state 
+            current_state[k].numel() for k in current_state
             if isinstance(current_state[k], torch.Tensor) and k in previous_state
         ))
         logger.info(f"LHDQ encode: {total_original_bytes/1024/1024:.2f} MB → "
                      f"{total_compressed_bytes/1024/1024:.2f} MB "
                      f"(ratio={ratio:.3f}, ~{bpp:.2f} bits/param)")
-    
-    return encoded
+
+    return (encoded, reference) if return_reference else encoded
 
 
 def lhdq_decode(encoded_state: dict, previous_state: dict) -> dict:
