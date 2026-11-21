@@ -11,9 +11,9 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import CLIPModel, CLIPProcessor
+from transformers import CLIPModel
 
-from .sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier
+from .sora import GateSparsifier, SoRAWrappedLinear
 
 DEFAULT_CONFIG_PATH = Path("train_config.yml")
 VALID_LORA_MODES = {
@@ -152,7 +152,6 @@ def resolve_label_metadata(dataset_split):
         return class_names, label_to_idx
 
     class_names = [str(label) for label in unique_labels]
-    label_to_idx = {label: idx for label in unique_labels} 
     label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
     label_to_idx.update({str(label): idx for idx, label in enumerate(unique_labels)})
     return class_names, label_to_idx
@@ -224,8 +223,8 @@ def apply_sora(model, lora_config, upper_k=None):
                 try:
                     layer_idx = int(name.split("encoder.layers.")[1].split(".")[0])
                     if layer_idx < total_layers - upper_k:
-                        continue 
-                except:
+                        continue
+                except (ValueError, IndexError):
                     continue
 
             parts = name.rsplit(".", 1)
@@ -631,7 +630,6 @@ def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0
     """
     model.train()
     total_ce_loss = 0.0
-    total_sparse_loss = 0.0
     total_loss = 0.0
     
     device = next(model.parameters()).device

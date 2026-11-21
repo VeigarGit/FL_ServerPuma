@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import random
 from torch.utils.data import DataLoader, Subset
-from typing import List, Tuple
 
 class ALA_LoRA:
     def __init__(self,
@@ -116,7 +115,7 @@ class ALA_LoRA:
             for x, y in rand_loader:
                 if checkpoint is not None:
                     checkpoint()
-                if type(x) == type([]):
+                if isinstance(x, list):
                     x[0] = x[0].to(self.device)
                 else:
                     x = x.to(self.device)

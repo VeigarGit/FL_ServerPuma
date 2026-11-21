@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 import numpy as np
 
@@ -87,7 +86,7 @@ class SynExpSimple:
         total_params = self.alpha.sum()
         target_params = total_params * target_sparsity
         
-        print(f"\nSynExp - Cálculo de densidades:")
+        print("\nSynExp - Cálculo de densidades:")
         print(f"Parâmetros totais: {total_params:,}")
         print(f"Parâmetros alvo (10%): {target_params:,.0f}")
         

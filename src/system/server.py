@@ -1,15 +1,14 @@
-import socket
-import pickle
-import struct
-import threading
-import copy
-import time
 import argparse
-import sys
-import os
+import copy
 import logging
 import math
-import json
+import os
+import pickle
+import socket
+import struct
+import sys
+import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 
@@ -21,14 +20,13 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 import torch
 import torch.nn as nn
-import numpy as np
 
 #Para o Lora
 from lora_clip.clip_setup import (
-    parse_args, load_config, get_device, resolve_run_modes, 
-    build_run_config, build_output_path, build_dataloaders,
-    build_model, build_optimizer, build_scheduler, 
-    benchmark_attention, quantize_weights
+    build_model,
+    build_run_config,
+    load_config,
+    resolve_run_modes,
 )
 from lora_clip.sora import get_trainable_state_dict
 
@@ -62,7 +60,7 @@ from round_protocol import (
     CONTROL_TIMEOUT, RoundInbox, RoundSender, is_round_message, round_message,
 )
 from utils.network_utils import prepare_frame, recv_data, send_data
-from utils.fl_math import quantization, dequantization, evaluate_model, set_parameters
+from utils.fl_math import quantization, dequantization, evaluate_model
 from utils.lhdq import lhdq_encode, lhdq_decode, is_lhdq_encoded
 from server_puma import PumaEngineMixin
 from server_alignment import ServerAlignmentMixin
@@ -109,21 +107,16 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 
                 # --- INÍCIO DA SOBRESCRITA DA ESTRATÉGIA ---
                 # Pega a flag do terminal (--strategy) e força o modo no dicionário do YAML
-                if args.strategy == 'lora':
-                    print("Linha 82 =========================================")
-                    config["model"]["lora"]["mode"] = "with_lora"
-                elif args.strategy == 'sora_no_schedule':
-                    print("Linha 85 =========================================")
-                    config["model"]["lora"]["mode"] = "with_sora_no_schedule" 
-                elif args.strategy == 'sora_with_schedule':
-                    print("Linha 88 =========================================")
-                    config["model"]["lora"]["mode"] = "with_sora_schedule" 
-                elif args.strategy == 'full_ft':
-                    print("Linha 91 =========================================")
-                    config["model"]["lora"]["mode"] = "without_lora"
-                elif args.strategy == 'adalora':
-                    print("Linha AdaLoRA =========================================")
-                    config["model"]["lora"]["mode"] = "with_adalora"
+                strategy_to_mode = {
+                    'lora': 'with_lora',
+                    'sora_no_schedule': 'with_sora_no_schedule',
+                    'sora_with_schedule': 'with_sora_schedule',
+                    'full_ft': 'without_lora',
+                    'adalora': 'with_adalora',
+                }
+                if args.strategy in strategy_to_mode:
+                    config["model"]["lora"]["mode"] = strategy_to_mode[args.strategy]
+                    logger.debug(f"Estratégia {args.strategy} aplicada em {args.model}.")
 
                 if getattr(args, 'qlora', False):
                     if args.model != 'slm':
@@ -224,48 +217,24 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 self.lfm_collator = LFMCollator(tokenizer.pad_token_id)
                 self.lfm_tokenizer = tokenizer
             case 'd1':
-                import yaml
-                from lora_d1.d1_setup import setup_d1_model
-
-                config_path = Path(
-                    args.config or "src/system/lora_d1/train_config.yml"
+                from lora_d1.d1_setup import (
+                    prepare_d1_run_config,
+                    resolve_release_vision,
+                    setup_d1_model,
                 )
-                if not config_path.exists():
-                    config_path = Path("lora_d1/train_config.yml")
-                with config_path.open("r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f)
+
+                config = prepare_d1_run_config(args)
                 self.config = config
-
-                d1_strategy_to_mode = {
-                    "lora": "with_lora",
-                    "sora_with_schedule": "with_sora_schedule",
-                    "sora_no_schedule": "with_sora_no_schedule",
-                }
-                if args.strategy not in d1_strategy_to_mode:
-                    raise ValueError(
-                        f"--model d1 suporta apenas --strategy em {tuple(d1_strategy_to_mode)} "
-                        f"(recebido: '{args.strategy}')."
-                    )
-                config["model"]["lora"]["mode"] = d1_strategy_to_mode[args.strategy]
-
-                if args.rank:
-                    config["model"]["lora"]["r"] = args.rank
-                    config["model"]["lora"]["alpha"] = 2 * args.rank
-
-                if args.paca is not None and args.paca > 0:
-                    config["model"]["paca"]["enabled"] = True
-                    config["model"]["paca"]["upper_layers"] = args.paca
-                else:
-                    config["model"]["paca"]["enabled"] = False
-                    config["model"]["paca"]["upper_layers"] = None
-
-                config["is_qlora"] = bool(getattr(args, "qlora", False))
+                release_vision = resolve_release_vision(
+                    config, args.dataset, getattr(args, "dataset_dir", None)
+                )
                 self.global_model, tokenizer = setup_d1_model(
                     config,
                     args.device,
                     is_qlora=bool(getattr(args, "qlora", False)),
                     dataset=args.dataset,
                     num_classes=args.num_classes,
+                    release_vision=release_vision,
                 )
                 self.input_size = None
                 self.d1_tokenizer = tokenizer
@@ -570,9 +539,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             for k, v in current_global_state.items():
                 if '.lora_A' in k:
                     current_global_state[k] = v[:ideal_rank, :].clone()
-                elif '.lora_B' in k:
-                    current_global_state[k] = v[:, :ideal_rank].clone()
-                elif '.gate' in k:
+                elif '.lora_B' in k or k.endswith('.gate') or '.sora.gate' in k:
                     current_global_state[k] = v[:, :ideal_rank].clone()
             logger.info(f"Rank filtro {client_id}: rank={ideal_rank}/{self.args.rank}")
 
@@ -1067,7 +1034,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                             logger.info(f"   Adaptive threshold: {adaptive_threshold:.6f} (progress={progress:.2f})")
                             
                             if self.args.model in ['slm', 'lfm', 'd1']:
-                                from lora_slm.slm_sora_utils import reduce_sora_state_dict_rank as reduce_sora_state_dict_rank_slm
+                                from peft_common.sora_utils import reduce_sora_state_dict_rank as reduce_sora_state_dict_rank_slm
                                 prune_fn = reduce_sora_state_dict_rank_slm
                             else:
                                 prune_fn = reduce_sora_state_dict_rank
@@ -1091,8 +1058,9 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                                 # Atualiza o estado agregado com as matrizes reduzidas
                                 aggregated_state = pruned_state
                                 
-                                # Redimensiona o modelo global localmente no servidor
-                                self.global_model = resize_model_to_pruned(self.global_model, aggregated_state)
+                                # Redimensiona o modelo global localmente no servidor quando não for feito logo abaixo
+                                if self.args.model not in ('d1', 'lfm') and not self.qlora:
+                                    self.global_model = resize_model_to_pruned(self.global_model, aggregated_state)
                     
                     with self.lock:
                         self.global_state = aggregated_state
@@ -1269,7 +1237,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             logger.info("All client connections closed.")
             
         if self.args.save_model:
-            logger.info(f"Salvando adaptadores e gates treinados...")
+            logger.info("Salvando adaptadores e gates treinados...")
             save_path = Path(self.args.save_model)
             save_path.parent.mkdir(parents=True, exist_ok=True)
 

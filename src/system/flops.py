@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from collections import defaultdict
-import math
 
 def count_flops(model, input_size=(1, 3, 32, 32), verbose=False):
     """
@@ -218,7 +216,7 @@ def estimate_flops(model, input_size=(1, 3, 32, 32)):
     flops = 0
     
     # Contar camadas convolucionais
-    for name, module in model.named_modules():
+    for _name, module in model.named_modules():
         if isinstance(module, nn.Conv2d):
             # Calcular tamanho de saída
             h_out = (height + 2*module.padding[0] - module.dilation[0]*(module.kernel_size[0]-1)-1)//module.stride[0] + 1
@@ -230,7 +228,6 @@ def estimate_flops(model, input_size=(1, 3, 32, 32)):
             
             # Atualizar dimensões para próxima camada
             height, width = h_out, w_out
-            channels = module.out_channels
             
         elif isinstance(module, nn.Linear):
             # FLOPs da camada linear
