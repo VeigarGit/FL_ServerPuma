@@ -310,6 +310,22 @@ def _load_server_model(model, global_state, model_type, qlora):
         resize_model_to_pruned(model, global_state)
 
 
+def _evaluate_client_model(
+    model: nn.Module,
+    data_loader: DataLoader,
+    model_type: str,
+    run_config: dict | None = None,
+) -> tuple[float, float]:
+    """Despacha avaliação usando a função e métrica de perda canônicas do modelo."""
+    if model_type == "d1":
+        from lora_d1.trainer import evaluate_d1
+
+        brier_weight = float((run_config or {}).get("training", {}).get("brier_weight", 1.0))
+        device = next(model.parameters()).device
+        return evaluate_d1(model, data_loader, device, brier_weight=brier_weight)
+    return evaluate_model(model, data_loader)
+
+
 def _evaluate_global_before_training(
     model: nn.Module,
     global_state: dict,
@@ -320,18 +336,24 @@ def _evaluate_global_before_training(
     *,
     fixed_timeout: bool = False,
     local_weights: dict | None = None,
+    run_config: dict | None = None,
+    preserve_local: bool | None = None,
 ) -> tuple[float, float, float]:
     """Avalia o modelo global recebido antes do treino local, preservando pesos locais."""
     eval_start = time.time()
+    if preserve_local is None:
+        preserve_local = model_type not in ("slm", "lfm", "d1")
     if fixed_timeout or round_num + 1 >= 2:
         old_local_weights = local_weights
-        if old_local_weights is None and model_type in ["clip", "slm", "lfm", "d1"]:
+        if preserve_local and old_local_weights is None and model_type == "clip":
             old_local_weights = {
                 n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad
             }
         _load_server_model(model, global_state, model_type, qlora)
-        test_accuracy, test_loss = evaluate_model(model, test_loader)
-        if old_local_weights is not None:
+        test_accuracy, test_loss = _evaluate_client_model(
+            model, test_loader, model_type, run_config=run_config
+        )
+        if preserve_local and old_local_weights is not None:
             for n, p in model.named_parameters():
                 if (
                     p.requires_grad
@@ -340,7 +362,9 @@ def _evaluate_global_before_training(
                 ):
                     p.data.copy_(old_local_weights[n])
     else:
-        test_accuracy, test_loss = evaluate_model(model, test_loader)
+        test_accuracy, test_loss = _evaluate_client_model(
+            model, test_loader, model_type, run_config=run_config
+        )
     return test_accuracy, test_loss, time.time() - eval_start
 
 
@@ -351,14 +375,19 @@ def _evaluate_post_training(
     test_loader: DataLoader,
     fallback_test_acc: float,
     history: ClientHistory,
+    run_config: dict | None = None,
 ) -> float:
     """Executa avaliação pós-treino local respeitando --skip-post-eval e --skip-train-eval."""
     post_eval_start = time.time()
     if not args.skip_post_eval:
-        local_test_acc, _ = evaluate_model(model, test_loader)
+        local_test_acc, _ = _evaluate_client_model(
+            model, test_loader, args.model, run_config=run_config
+        )
         history.local_acc.append(local_test_acc)
         if not args.skip_train_eval:
-            train_accuracy, _ = evaluate_model(model, train_loader)
+            train_accuracy, _ = _evaluate_client_model(
+                model, train_loader, args.model, run_config=run_config
+            )
             history.train_acc.append(train_accuracy)
         else:
             train_accuracy = 0.0
@@ -482,9 +511,11 @@ def run_centralized_client(
                 eval_state = global_state
                 if control is not None and args.model == "cnn" and round_id >= 2 and prune == 1:
                     eval_state = map_sequential_to_simplemodel(global_state)
+                pre_eval_loaded = (control is not None) or (round_num + 1 >= 2)
                 test_accuracy, test_loss, client_pre_eval_time = _evaluate_global_before_training(
                     model, eval_state, evaluation_loader, round_num, args.model, args.qlora,
                     fixed_timeout=control is not None, local_weights=fedala_weights,
+                    run_config=run_config,
                 )
                 logger.info(
                     f"Client {args.client_idx}: Global Model Test Accuracy: {test_accuracy:.2f}% | "
@@ -511,6 +542,7 @@ def run_centralized_client(
                     model_type=args.model,
                     run_config=run_config if args.model != "cnn" else None,
                     checkpoint=checkpoint,
+                    state_loaded=(pre_eval_loaded and args.model == "d1"),
                 )
                 client_training_time = time.time() - train_start
                 history.ala_acc.append(
@@ -522,7 +554,13 @@ def run_centralized_client(
                     CheckedBatches(train_loader, checkpoint) if checkpoint else train_loader
                 )
                 client_post_eval_time = _evaluate_post_training(
-                    args, model, train_eval_loader, evaluation_loader, test_accuracy, history,
+                    args,
+                    model,
+                    train_eval_loader,
+                    evaluation_loader,
+                    test_accuracy,
+                    history,
+                    run_config=run_config,
                 )
                 if checkpoint is not None:
                     checkpoint()
@@ -596,8 +634,9 @@ def run_centralized_client(
                 if version != model_version + bool(result["accepted"]):
                     raise ConnectionError(f"Versão agregada inválida na rodada {round_id}.")
                 if args.client_idx not in result["accepted"]:
-                    ala.weights = None
-                    ala.start_phase = True
+                    if ala is not None:
+                        ala.weights = None
+                        ala.start_phase = True
                     fedala_weights = None
                 else:
                     fedala_weights = local_weights
@@ -640,12 +679,14 @@ def main():
 
     model, run_config = build_client_model(args, device)
     train_loader, test_loader, test_majority_baseline = build_client_dataloaders(
-        args, device, run_config
+        args, device, run_config, tokenizer=getattr(model, "tokenizer", None)
     )
 
     loss = nn.CrossEntropyLoss()
     if args.model == "clip":
         ala = ALA_LoRA(args.client_idx, loss, train_loader, 32, 80, 1.0, device)
+    elif args.model in ("slm", "lfm", "d1"):
+        ala = None
     else:
         ala = ALA(args.client_idx, loss, train_loader, 32, 80, 2, 1.0, device)
 

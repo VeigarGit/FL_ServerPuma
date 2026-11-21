@@ -1,8 +1,12 @@
+import logging
+import math
 from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+logger = logging.getLogger(__name__)
 
 
 def dequantization(global_state: dict) -> dict:
@@ -41,38 +45,40 @@ def quantization(state_dict: dict) -> dict:
 def evaluate_model(model: nn.Module, data_loader: DataLoader):
     """Avalia o modelo e retorna (Acurácia, Loss Média)."""
     model.eval()
-    correct = 0
-    total = 0
     loss_fn = nn.CrossEntropyLoss()
-    total_loss = 0.0
     device = next(model.parameters()).device
-    
-    #print(f"\n[DIAGNÓSTICO] Iniciando evaluate_model no device: {device}")
-    
+    host_keys = tuple(getattr(model, "host_input_keys", ()))
+    total_loss_tensor = torch.zeros((), device=device, dtype=torch.float32)
+    correct_tensor = torch.zeros((), device=device, dtype=torch.long)
+    total = 0
+
     with torch.no_grad():
         model_dtype = getattr(model, "compute_dtype", None) or next(model.parameters()).dtype
-        for batch_idx, batch_data in enumerate(data_loader):
+        for batch_data in data_loader:
             if isinstance(batch_data, (dict, Mapping)):
                 x = batch_data
                 y = batch_data.get("targets", batch_data.get("labels", None))
             else:
                 x, y = batch_data
 
-            y = y.to(device)
+            y = y.to(device, non_blocking=True)
 
             if isinstance(x, torch.Tensor):
                 if x.is_floating_point():
-                    x = x.to(device, dtype=model_dtype)
+                    x = x.to(device, dtype=model_dtype, non_blocking=True)
                 else:
-                    x = x.to(device)
+                    x = x.to(device, non_blocking=True)
             elif isinstance(x, (dict, Mapping)):
-                # É um dicionário ou BatchFeature / UserDict (SLM / LFM)
-                for k in list(x.keys()):
-                    if isinstance(x[k], torch.Tensor):
-                        if getattr(x[k], "is_floating_point", lambda: False)():
-                            x[k] = x[k].to(device, dtype=model_dtype)
-                        else:
-                            x[k] = x[k].to(device)
+                # Evita mutar o lote original; preserva host_input_keys na CPU quando aplicável
+                moved = dict(x)
+                for k, v in moved.items():
+                    if k in host_keys or not isinstance(v, torch.Tensor):
+                        continue
+                    if v.is_floating_point():
+                        moved[k] = v.to(device, dtype=model_dtype, non_blocking=True)
+                    else:
+                        moved[k] = v.to(device, non_blocking=True)
+                x = moved
 
             autocast_dtype = (
                 model_dtype
@@ -84,35 +90,24 @@ def evaluate_model(model: nn.Module, data_loader: DataLoader):
                     output = model(x) if hasattr(model, "head") else model(**x)
                 else:
                     output = model(x)
-            
+
             if isinstance(output, (dict, Mapping)):
                 output = output.get("logits", output)
-                
+
             y = y.view(-1)
-            
-            # TESTE C: Verificando valores corrompidos (A Teoria da Divisão por Zero)
-            if torch.isnan(output).any():
-                print(
-                    "[Teste C] ALERTA: A saída do modelo gerou NaNs "
-                    "(valores infinitos ou inválidos)!"
-                )
-                
             loss = loss_fn(output, y)
-            
-            # TESTE D: Isolando a sincronização com a CPU
-            # print(f"[Teste D] Chamando loss.item()...")
-            total_loss += loss.item()
-            #print(f"[Teste D] loss.item() extraído!")
-            
+            total_loss_tensor += loss.detach().float()
             _, predicted = torch.max(output, 1)
             total += y.size(0)
-            
-            #print(f"[Teste D] Chamando sum().item()...")
-            correct += (predicted == y).sum().item()
-            #print(f"[Teste D] sum().item() extraído! Batch concluído.\n")
+            correct_tensor += (predicted == y).sum()
 
-    accuracy = 100 * correct / total
-    average_loss = total_loss / len(data_loader)
+    total_loss = total_loss_tensor.item()
+    correct = correct_tensor.item()
+    if not math.isfinite(total_loss):
+        logger.warning("evaluate_model detectou loss não finita (NaN/Inf) na avaliação.")
+
+    accuracy = 100 * correct / total if total > 0 else 0.0
+    average_loss = total_loss / len(data_loader) if len(data_loader) > 0 else 0.0
     return accuracy, average_loss
 
 def set_parameters(model: nn.Module, state_new: nn.Module):

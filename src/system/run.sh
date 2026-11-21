@@ -191,8 +191,8 @@ Compressão:
   --delta-coding              Ativa LHDQ (Low Huffman-coded Delta Quantization) em vez de int8
 
 QLoRA:
-  --qlora                     Backbone 4-bit NF4 + DoubleQuant, adaptadores LoRA 16 bits
-                              (requer --model slm|lfm|d1 --strategy lora; suporta INT8 e LHDQ)
+  --qlora                     Backbone 4-bit NF4 + DoubleQuant, adaptadores LoRA/SoRA 16 bits
+                              (requer --model slm|lfm|d1 --strategy lora|sora_with_schedule|sora_no_schedule; suporta INT8 e LHDQ)
 
 Outros:
   --help                      Exibir esta mensagem

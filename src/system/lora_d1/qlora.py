@@ -12,6 +12,7 @@ from transformers import AutoModel, BitsAndBytesConfig
 logger = logging.getLogger(__name__)
 
 LORA_TARGETS = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|in_proj|out_proj|w1|w2|w3)"
+ADAPTER_KEY_PATTERN = re.compile(r".*(?:lora_|sora\.(?:lora_A|lora_B|gate)).*")
 SKIP_QUANT_MODULES = (
     "vision_tower",
     "model.vision_tower",
@@ -28,6 +29,11 @@ DEFAULT_QLORA_CONFIG: dict[str, Any] = {
     "optimizer": "adamw",
     "prepare_kbit": False,
 }
+
+
+def is_d1_adapter_key(name: str) -> bool:
+    """Retorna True se a chave pertence a um tensor de adaptador LoRA/SoRA do d1-2B."""
+    return bool(ADAPTER_KEY_PATTERN.search(name))
 
 
 def _resolve_lora_targets(targets: str | list[str] | None) -> str | list[str]:
@@ -67,6 +73,8 @@ def load_quantized_d1_backbone(
     """Carrega o backbone LiquidAI/d1-2B em 4-bit NF4 congelado."""
     bnb_config = make_bnb_config(qcfg)
     target_device = str(device) if isinstance(device, torch.device) else device
+    if target_device == "cpu" or not torch.cuda.is_available():
+        raise RuntimeError("[d1 QLoRA] BitsAndBytes 4-bit requer GPU CUDA.")
     device_map = {"": target_device} if target_device.startswith("cuda") else "auto"
 
     backbone = AutoModel.from_pretrained(
@@ -118,7 +126,7 @@ def apply_qlora(
     compute_dtype: torch.dtype | None = None,
 ) -> nn.Module:
     """Congela o backbone 4-bit e injeta adaptadores LoRA no compute_dtype de 16 bits."""
-    from lora_slm.sora import apply_peft_lora_modules
+    from peft_common.sora import apply_peft_lora_modules
 
     backbone = _prepare_kbit_backbone(
         backbone, gradient_checkpointing=gradient_checkpointing, prepare_kbit=prepare_kbit
@@ -150,7 +158,7 @@ def apply_qsora(
     compute_dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
     """Congela o backbone 4-bit e injeta adaptadores SoRA em 16 bits (QSoRA) no d1-2B."""
-    from lora_slm.sora import apply_sora_modules
+    from peft_common.sora import apply_sora_modules
 
     backbone = _prepare_kbit_backbone(
         backbone, gradient_checkpointing=gradient_checkpointing, prepare_kbit=prepare_kbit
@@ -184,7 +192,7 @@ def verify_qlora_freezing(model: nn.Module) -> None:
                 params4bit_trainable += 1
                 logger.error(f"[d1 QLoRA] Parâmetro 4-bit com gradiente ativo: {name}")
         elif param.requires_grad:
-            if not ("lora_" in name or ".sora." in name):
+            if not is_d1_adapter_key(name):
                 offenders.append(name)
             trainable_count += param.numel()
 
@@ -195,7 +203,7 @@ def verify_qlora_freezing(model: nn.Module) -> None:
         )
 
     adapter_dtypes = sorted(
-        {str(p.dtype) for n, p in model.named_parameters() if "lora_" in n or ".sora." in n}
+        {str(p.dtype) for n, p in model.named_parameters() if is_d1_adapter_key(n)}
     )
     logger.info(
         f"[d1 QLoRA/QSoRA] Freezing OK: {params4bit_total} tensores 4-bit congelados | "
@@ -243,17 +251,14 @@ def build_d1_optimizer(
             return bnb.optim.PagedAdamW8bit(param_groups)
 
     use_fused = bool(param_groups) and all(
-        p.is_cuda and p.is_floating_point()
-        for group in param_groups
-        for p in group["params"]
+        p.is_cuda and p.is_floating_point() for group in param_groups for p in group["params"]
     )
     return torch.optim.AdamW(param_groups, fused=use_fused)
 
 
 def assert_adapter_only_payload(payload: dict[str, Any]) -> None:
     """Assegura que somente adaptadores LoRA/SoRA trafeguem pela rede federada."""
-    allowed_pattern = re.compile(r".*(?:lora_|sora\.(?:lora_A|lora_B|gate)).*")
-    violations = [k for k in payload if not allowed_pattern.search(k)]
+    violations = [k for k in payload if not is_d1_adapter_key(k)]
     if violations:
         raise ValueError(
             f"Violação de isolamento de rede d1! {len(violations)} tensores não-PEFT "

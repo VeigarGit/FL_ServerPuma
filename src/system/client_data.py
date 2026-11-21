@@ -107,6 +107,7 @@ def load_data(
     d1_config=None,
     num_classes=100,
     dataset_dir=None,
+    tokenizer=None,
 ):
     """Carrega a partição local .npz e prepara o DataLoader para CNN, CLIP, SLM, LFM ou d1."""
     train_data = read_client_data(dataset, client_idx, is_train, dataset_dir=dataset_dir)
@@ -130,10 +131,11 @@ def load_data(
         question = model_cfg.get("question", DEFAULT_QUESTION)
         attention_mode = model_cfg.get("attention", "set")
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name, revision=revision, trust_remote_code=True
-        )
-        configure_d1_tokenizer(tokenizer, model_name, revision)
+        if tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, revision=revision, trust_remote_code=True
+            )
+            configure_d1_tokenizer(tokenizer, model_name, revision)
 
         ds_cfg = d1_config.get("dataset", {}) if d1_config else {}
         classes_file = ds_cfg.get("classes_file")
@@ -251,7 +253,7 @@ def load_data(
 
 
 def build_client_dataloaders(
-    args: argparse.Namespace, device: torch.device, run_config: dict | None
+    args: argparse.Namespace, device: torch.device, run_config: dict | None, tokenizer=None
 ) -> tuple[DataLoader, DataLoader, float | None]:
     """Carrega train_loader, test_loader e calcula o baseline da classe majoritária."""
     try:
@@ -277,6 +279,7 @@ def build_client_dataloaders(
             d1_config=d1_cfg,
             num_classes=args.num_classes,
             dataset_dir=args.dataset_dir,
+            tokenizer=tokenizer,
         )
         test_loader = load_data(
             args.dataset,
@@ -293,6 +296,7 @@ def build_client_dataloaders(
             d1_config=d1_cfg,
             num_classes=args.num_classes,
             dataset_dir=args.dataset_dir,
+            tokenizer=tokenizer,
         )
         test_majority_baseline = None
         if hasattr(test_loader.dataset, "tensors"):

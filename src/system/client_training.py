@@ -240,42 +240,18 @@ def build_client_model(
 
             model, _ = setup_lfm_model(run_config, device, is_qlora=bool(args.qlora))
         case "d1":
-            import yaml
-            from lora_d1.d1_setup import setup_d1_model
-
-            config_path = (
-                Path(args.config) if args.config else Path("src/system/lora_d1/train_config.yml")
+            from lora_d1.d1_setup import (
+                prepare_d1_run_config,
+                resolve_release_vision,
+                setup_d1_model,
             )
-            if not config_path.exists():
-                config_path = Path("lora_d1/train_config.yml")
-            with config_path.open("r", encoding="utf-8") as f:
-                run_config = yaml.safe_load(f)
 
-            d1_strategy_to_mode = {
-                "lora": "with_lora",
-                "sora_with_schedule": "with_sora_schedule",
-                "sora_no_schedule": "with_sora_no_schedule",
-            }
-            if args.strategy not in d1_strategy_to_mode:
-                logger.error(
-                    f"--model d1 suporta apenas --strategy em {tuple(d1_strategy_to_mode)} "
-                    f"(recebido: '{args.strategy}')."
-                )
+            try:
+                run_config = prepare_d1_run_config(args)
+            except ValueError as exc:
+                logger.error(str(exc))
                 sys.exit(1)
-            run_config["model"]["lora"]["mode"] = d1_strategy_to_mode[args.strategy]
 
-            if args.rank:
-                run_config["model"]["lora"]["r"] = args.rank
-                run_config["model"]["lora"]["alpha"] = 2 * args.rank
-
-            if args.paca is not None and args.paca > 0:
-                run_config["model"]["paca"]["enabled"] = True
-                run_config["model"]["paca"]["upper_layers"] = args.paca
-            else:
-                run_config["model"]["paca"]["enabled"] = False
-                run_config["model"]["paca"]["upper_layers"] = None
-
-            run_config["is_qlora"] = bool(args.qlora)
             if args.qlora:
                 mode_tag = "QSoRA" if "sora" in args.strategy else "QLoRA"
                 adapter_tag = "SoRA" if "sora" in args.strategy else "LoRA"
@@ -284,12 +260,16 @@ def build_client_model(
                     f"{adapter_tag} 16 bits."
                 )
 
+            release_vision = resolve_release_vision(
+                run_config, args.dataset, getattr(args, "dataset_dir", None)
+            )
             model, _ = setup_d1_model(
                 run_config,
                 device,
                 is_qlora=bool(args.qlora),
                 dataset=args.dataset,
                 num_classes=args.num_classes,
+                release_vision=release_vision,
             )
         case _:
             logger.error(f"Modelo inválido: {args.model}")
@@ -391,6 +371,7 @@ def local_training(
     model_type="cnn",
     run_config=None,
     checkpoint=None,
+    state_loaded: bool = False,
 ):
     """Executa sincronização de pesos globais, FedALA e uma época de treino local."""
     if checkpoint is not None:
@@ -412,10 +393,15 @@ def local_training(
         from lora_d1.d1_setup import set_d1_state_dict, update_paca_runtime
         from lora_d1.qlora import build_d1_optimizer
         from lora_d1.trainer import train_epoch_d1
-        from lora_slm.sora import build_sora_gate_sparsifier
+        from peft_common.sora import build_sora_gate_sparsifier
 
-        if state_dict:
+        if state_dict and not state_loaded:
             set_d1_state_dict(model, state_dict)
+
+        if alaarg == 0 and round_num == 1:
+            logger.info(
+                "d1-2B opera em modo FedAvg (--ala 0 ignorado; FedALA não se aplica a d1)."
+            )
 
         paca_cfg = run_config["model"].get("paca", {}) if run_config else {}
         if paca_cfg.get("enabled"):
@@ -430,7 +416,9 @@ def local_training(
         epochs = int(train_cfg.get("epochs", 1))
         is_qlora = bool(run_config.get("is_qlora", False)) if run_config else False
         optimizer = build_d1_optimizer(model, run_config or {}, is_qlora=is_qlora)
-        sparse_optimizer = build_sora_gate_sparsifier(model, run_config or {})
+        sparse_optimizer = build_sora_gate_sparsifier(
+            model, run_config or {}, round_num=round_num
+        )
 
         loss, acc = 0.0, 0.0
         for _ in range(max(1, epochs)):
@@ -452,7 +440,7 @@ def local_training(
         from lora_lfm.lfm_setup import set_lfm_state_dict, update_paca_runtime
         from lora_lfm.qlora import build_lfm_optimizer
         from lora_lfm.trainer import train_epoch_lfm
-        from lora_slm.sora import build_sora_gate_sparsifier
+        from peft_common.sora import build_sora_gate_sparsifier
 
         if state_dict:
             set_lfm_state_dict(model, state_dict)
@@ -473,7 +461,9 @@ def local_training(
         )
         is_qlora = bool(run_config.get("is_qlora", False)) if run_config else False
         optimizer = build_lfm_optimizer(model, run_config or {}, is_qlora=is_qlora)
-        sparse_optimizer = build_sora_gate_sparsifier(model, run_config or {})
+        sparse_optimizer = build_sora_gate_sparsifier(
+            model, run_config or {}, round_num=round_num
+        )
 
         loss, acc = train_epoch_lfm(
             model,

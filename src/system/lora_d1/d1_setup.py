@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from peft import LoraConfig
@@ -16,12 +17,114 @@ from torch.utils.data import Dataset
 from transformers import AutoConfig, AutoModel, AutoTokenizer
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
+from lora_d1.qlora import assert_adapter_only_payload, is_d1_adapter_key
+
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "LiquidAI/d1-2B"
 MODEL_REVISION = "a6bce774e6dde338dcc3036ceb5d91f78bf4c19e"
 LORA_TARGETS = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|in_proj|out_proj|w1|w2|w3)"
 DEFAULT_QUESTION = "Identify the customer's intent or class."
+D1_STRATEGY_TO_MODE: dict[str, str] = {
+    "lora": "with_lora",
+    "sora_with_schedule": "with_sora_schedule",
+    "sora_no_schedule": "with_sora_no_schedule",
+}
+
+
+def detect_text_only_dataset(dataset: str, dataset_dir: str | Path | None = None) -> bool:
+    """Detecta se a partição train/0.npz armazena amostras textuais (str)."""
+    candidates: list[Path] = []
+    if dataset_dir is not None:
+        candidates.append(Path(dataset_dir) / "train" / "0.npz")
+    candidates.extend(
+        [
+            Path("src/dataset") / dataset / "train" / "0.npz",
+            Path(__file__).resolve().parents[2] / "dataset" / dataset / "train" / "0.npz",
+        ]
+    )
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            with np.load(path, allow_pickle=True) as loaded:
+                raw = loaded["data"].item()
+            xs = raw.get("x", []) if isinstance(raw, dict) else []
+            if len(xs) > 0:
+                return isinstance(xs[0], (str, np.str_))
+        except Exception:
+            return False
+    return False
+
+
+def resolve_release_vision(
+    run_config: dict[str, Any] | None,
+    dataset: str | None = None,
+    dataset_dir: str | Path | None = None,
+) -> bool:
+    """Resolve se vision_tower e multi_modal_projector devem ser liberados."""
+    raw = (run_config or {}).get("model", {}).get("release_vision", "auto")
+    if isinstance(raw, bool):
+        return raw
+    if str(raw).lower() == "auto" and dataset:
+        return detect_text_only_dataset(dataset, dataset_dir=dataset_dir)
+    return False
+
+
+def prepare_d1_run_config(args: Any) -> dict[str, Any]:
+    """Carrega e valida a configuração do d1-2B combinando YAML e flags da CLI."""
+    import yaml
+
+    cfg_arg = getattr(args, "config", None)
+    if not cfg_arg or cfg_arg == "lora_clip/train_config.yml":
+        config_path = Path("src/system/lora_d1/train_config.yml")
+    else:
+        config_path = Path(cfg_arg)
+    if not config_path.exists():
+        config_path = Path(__file__).resolve().parent / "train_config.yml"
+    with config_path.open("r", encoding="utf-8") as f:
+        run_config = yaml.safe_load(f) or {}
+
+    strategy = getattr(args, "strategy", "lora")
+    if strategy not in D1_STRATEGY_TO_MODE:
+        raise ValueError(
+            f"--model d1 suporta apenas --strategy em {tuple(D1_STRATEGY_TO_MODE)} "
+            f"(recebido: '{strategy}')."
+        )
+
+    model_cfg = run_config.setdefault("model", {})
+    lora_cfg = model_cfg.setdefault("lora", {})
+    paca_cfg = model_cfg.setdefault("paca", {})
+    sora_cfg = model_cfg.setdefault("sora", {})
+
+    lora_cfg["mode"] = D1_STRATEGY_TO_MODE[strategy]
+
+    rank = getattr(args, "rank", None)
+    if rank:
+        if "alpha" not in lora_cfg or int(lora_cfg.get("r", 8)) != int(rank):
+            lora_cfg["alpha"] = 2 * int(rank)
+        lora_cfg["r"] = int(rank)
+
+    paca = getattr(args, "paca", None)
+    if paca is not None and paca > 0:
+        paca_cfg["enabled"] = True
+        paca_cfg["upper_layers"] = int(paca)
+    else:
+        paca_cfg["enabled"] = False
+        paca_cfg["upper_layers"] = None
+
+    sparse_lr = getattr(args, "sparse_lr", None)
+    if sparse_lr is not None:
+        sora_cfg["sparse_lr"] = float(sparse_lr)
+    max_lambda = getattr(args, "max_lambda", None)
+    if max_lambda is not None:
+        sora_cfg["max_lambda"] = float(max_lambda)
+
+    is_qlora = bool(getattr(args, "qlora", False))
+    if is_qlora and getattr(args, "mode", "centralized") != "centralized":
+        raise ValueError("--qlora para d1 é suportado apenas no modo centralizado.")
+    run_config["is_qlora"] = is_qlora
+    return run_config
 
 
 def resolve_d1_package(
@@ -130,6 +233,7 @@ class D1DecisionDataset(Dataset):
         bos = bos if isinstance(bos, str) else ""
         suffix, slot_offsets = d1_prompt.suffix_layout(tokenizer, choice, lead, "desc")
         slot_offset = slot_offsets[0]
+        suf_ids = tokenizer.encode(suffix, add_special_tokens=False)
 
         for sample, label in data:
             is_image = isinstance(sample, Image.Image)
@@ -159,7 +263,6 @@ class D1DecisionDataset(Dataset):
             ids = tokenizer.encode(prefix + suffix, add_special_tokens=False)
             if not is_image and len(ids) > max_length:
                 # Preserva o sufixo integralmente (pergunta + opções) truncando o texto do estado
-                suf_ids = tokenizer.encode(suffix, add_special_tokens=False)
                 budget = max(1, max_length - len(suf_ids))
                 pre_ids = tokenizer.encode(prefix, add_special_tokens=False)[:budget]
                 ids = pre_ids + suf_ids
@@ -230,6 +333,8 @@ class D1Collator:
 class DecisionD1(nn.Module):
     """Wrapper diferenciável sobre LiquidAI/d1-2B com leitura via slot_logits nativos."""
 
+    host_input_keys = ("image_grid_thw", "video_grid_thw")
+
     def __init__(
         self,
         backbone: nn.Module,
@@ -291,8 +396,13 @@ class DecisionD1(nn.Module):
             question=question_mask,
             **vision_kwargs,
         )
-        gather_t = self.gather_tokens.to(res.codes.device)
-        forms_t = self.forms.to(res.codes.device)
+        codes_device = res.codes.device
+        gather_t = (
+            self.gather_tokens
+            if self.gather_tokens.device == codes_device
+            else self.gather_tokens.to(codes_device)
+        )
+        forms_t = self.forms if self.forms.device == codes_device else self.forms.to(codes_device)
         return res.codes[:, gather_t][:, forms_t].max(dim=-1).values.float()
 
 
@@ -309,28 +419,39 @@ def _get_encoder_layers(model: nn.Module):
 
 
 def _apply_paca_gradient_boundary(model: nn.Module, upper_k: int | None) -> None:
-    """Desconecta retropropagação abaixo das upper_k camadas superiores via forward hook."""
+    """Desconecta grafo/autograd abaixo das upper_k camadas superiores via hooks."""
     layers = _get_encoder_layers(model)
     total_layers = len(layers)
-    if upper_k is None or upper_k >= total_layers:
+    if upper_k is None or upper_k <= 0 or upper_k >= total_layers:
         return
     boundary_idx = total_layers - upper_k - 1
 
-    def detach_hook(module, inputs, output):
-        if not module.training:
+    def detach_input_pre_hook(module, args, kwargs):
+        if not (module.training and torch.is_grad_enabled()):
+            return args, kwargs
+        if args and isinstance(args[0], torch.Tensor):
+            args = (args[0].detach(),) + args[1:]
+        elif "hidden_states" in kwargs and isinstance(kwargs["hidden_states"], torch.Tensor):
+            kwargs = dict(kwargs)
+            kwargs["hidden_states"] = kwargs["hidden_states"].detach()
+        return args, kwargs
+
+    def boundary_output_hook(module, inputs, output):
+        if not (module.training and torch.is_grad_enabled()):
             return output
         if isinstance(output, tuple):
-            return (output[0].detach(),) + output[1:]
-        return output.detach()
+            return (output[0].detach().requires_grad_(True),) + output[1:]
+        return output.detach().requires_grad_(True)
 
-    handle = layers[boundary_idx].register_forward_hook(detach_hook)
+    pre_handle = layers[0].register_forward_pre_hook(detach_input_pre_hook, with_kwargs=True)
+    boundary_handle = layers[boundary_idx].register_forward_hook(boundary_output_hook)
     if not hasattr(model, "_paca_hooks"):
         model._paca_hooks = []
-    model._paca_hooks.append(handle)
+    model._paca_hooks.extend([pre_handle, boundary_handle])
 
 
 def update_paca_runtime(model: nn.Module, new_upper_k: int | None) -> None:
-    """Atualiza dinamicamente os forward hooks e flags requires_grad das camadas LoRA."""
+    """Atualiza dinamicamente hooks, checkpointing e flags requires_grad das camadas LoRA."""
     layers = _get_encoder_layers(model)
     total_layers = len(layers)
 
@@ -339,14 +460,25 @@ def update_paca_runtime(model: nn.Module, new_upper_k: int | None) -> None:
             handle.remove()
         model._paca_hooks = []
 
-    if new_upper_k is not None:
+    for layer in layers:
+        if hasattr(layer, "_paca_orig_gradient_checkpointing"):
+            layer.gradient_checkpointing = layer._paca_orig_gradient_checkpointing
+
+    if new_upper_k is not None and 0 < new_upper_k < total_layers:
+        boundary_idx = total_layers - new_upper_k - 1
+        for idx in range(boundary_idx + 1):
+            layer = layers[idx]
+            if hasattr(layer, "gradient_checkpointing"):
+                if not hasattr(layer, "_paca_orig_gradient_checkpointing"):
+                    layer._paca_orig_gradient_checkpointing = layer.gradient_checkpointing
+                layer.gradient_checkpointing = False
         _apply_paca_gradient_boundary(model, new_upper_k)
 
     boundary_layer = (
         0 if (new_upper_k is None or new_upper_k >= total_layers) else total_layers - new_upper_k
     )
     for name, param in model.named_parameters():
-        if ("lora" not in name and "sora" not in name) or ".layers." not in name:
+        if not is_d1_adapter_key(name) or ".layers." not in name:
             continue
         try:
             layer_idx = int(name.split(".layers.")[1].split(".")[0])
@@ -359,10 +491,12 @@ def get_d1_state_dict(model: nn.Module, trainable_only: bool = True) -> dict[str
     """Extrai exclusivamente os adaptadores LoRA/SoRA do DecisionD1 na CPU."""
     state_dict: dict[str, torch.Tensor] = {}
     for name, param in model.named_parameters():
-        if "lora" in name or "sora" in name:
+        if is_d1_adapter_key(name):
             if trainable_only and not param.requires_grad:
                 continue
-            state_dict[name] = param.detach().cpu()
+            detached = param.detach()
+            state_dict[name] = detached.cpu() if detached.is_cuda else detached.clone()
+    assert_adapter_only_payload(state_dict)
     return state_dict
 
 
@@ -370,6 +504,7 @@ def set_d1_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> 
     """Carrega adaptadores agregados no DecisionD1 preservando device/dtype e rank dinâmico."""
     from utils.fl_math import resize_model_to_pruned
 
+    assert_adapter_only_payload(state_dict)
     resize_model_to_pruned(model, state_dict)
 
 
@@ -391,10 +526,10 @@ def setup_d1_model(
     is_qlora: bool = False,
     dataset: str | None = None,
     num_classes: int = 2,
-    release_vision: bool = False,
+    release_vision: bool | str | None = None,
 ) -> tuple[DecisionD1, Any]:
     """Instancia o LiquidAI/d1-2B em BF16 ou 4-bit NF4 com LoRA/SoRA e PaCA."""
-    from lora_slm.sora import SORA_MODES, apply_peft_lora_modules, apply_sora_modules
+    from peft_common.sora import SORA_MODES, apply_peft_lora_modules, apply_sora_modules
 
     torch.set_float32_matmul_precision("high")
     model_cfg = run_config.get("model", {})
@@ -405,6 +540,12 @@ def setup_d1_model(
     qcfg = model_cfg.get("qlora", {})
     is_sora = lora_cfg.get("mode", "with_lora") in SORA_MODES
     target_device = torch.device(device)
+    ds_name = dataset or run_config.get("dataset", {}).get("name", "Banking77")
+    should_release_vision = (
+        release_vision
+        if isinstance(release_vision, bool)
+        else resolve_release_vision(run_config, dataset=ds_name)
+    )
     compute_dtype = (
         torch.bfloat16
         if target_device.type == "cuda"
@@ -425,7 +566,7 @@ def setup_d1_model(
         tag = "QSoRA" if is_sora else "QLoRA"
         logger.info(f"Carregando backbone d1-2B em 4-bit NF4 ({tag})...")
         backbone = load_quantized_d1_backbone(name, revision, target_device, qcfg=qcfg)
-        if release_vision:
+        if should_release_vision:
             _release_unused_vision_modules(backbone)
         if is_sora:
             backbone = apply_qsora(
@@ -453,13 +594,15 @@ def setup_d1_model(
             dtype=compute_dtype,
             trust_remote_code=True,
         )
-        if release_vision:
+        if should_release_vision:
             _release_unused_vision_modules(backbone)
         backbone.requires_grad_(False)
         backbone.eval()
         if model_cfg.get("gradient_checkpointing", True) and hasattr(
             backbone, "gradient_checkpointing_enable"
         ):
+            if hasattr(backbone, "enable_input_require_grads"):
+                backbone.enable_input_require_grads()
             backbone.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
@@ -487,7 +630,6 @@ def setup_d1_model(
             backbone = apply_peft_lora_modules(backbone, peft_config, adapter_dtype=compute_dtype)
         configure_d1_tokenizer(tokenizer, name, revision, config=backbone.config)
 
-    ds_name = dataset or run_config.get("dataset", {}).get("name", "Banking77")
     classes_file = run_config.get("dataset", {}).get("classes_file")
     if dataset and dataset != run_config.get("dataset", {}).get("name"):
         classes_file = None
@@ -505,6 +647,9 @@ def setup_d1_model(
     model.has_lora = True
     if not is_qlora:
         model = model.to(target_device)
+    else:
+        model.gather_tokens = model.gather_tokens.to(target_device)
+        model.forms = model.forms.to(target_device)
 
     paca_cfg = model_cfg.get("paca", {})
     if paca_cfg.get("enabled", False):
