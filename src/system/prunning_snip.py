@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 
 def snip_pruning(model, dataloader, criterion, pruning_ratio, device):
     model.train()

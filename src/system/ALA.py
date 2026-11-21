@@ -143,7 +143,7 @@ class ALA:
             for x, y in rand_loader:
                 if checkpoint is not None:
                     checkpoint()
-                if type(x) == type([]):
+                if isinstance(x, list):
                     x[0] = x[0].to(self.device)
                 else:
                     x = x.to(self.device)

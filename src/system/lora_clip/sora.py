@@ -75,8 +75,6 @@ def prune_sora_to_lora_and_report(model, min_rank=2):
     LoRA estático extremamente compacto e eficiente para inferência.
     Respeita um rank mínimo (min_rank) por módulo para evitar over-pruning.
     """
-    import sys
-    import pickle
     total_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
     sora_modules = 0
     

@@ -4,22 +4,21 @@ import torch
 import torch.nn as nn
 import yaml
 from datasets import ClassLabel, load_dataset
-from peft import AdaLoraConfig, LoraConfig
+from peft import LoraConfig
 from sklearn.metrics import accuracy_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoProcessor, AutoModel
+from transformers import AutoModel
 from PIL import Image
 
 try:
-    from sora import SoRAWrappedLinear, SparseAdamW, GateSparsifier, apply_peft_lora_modules
+    from sora import GateSparsifier, SoRAWrappedLinear, apply_peft_lora_modules
 except ImportError:
     from lora_slm.sora import (
-        SoRAWrappedLinear,
-        SparseAdamW,
         GateSparsifier,
+        SoRAWrappedLinear,
         apply_peft_lora_modules,
     )
 
@@ -246,8 +245,8 @@ def apply_sora(model, lora_config, upper_k=None, adapter_dtype=None):
                 try:
                     layer_idx = int(name.split(".layers.")[1].split(".")[0])
                     if layer_idx < total_layers - upper_k:
-                        continue 
-                except:
+                        continue
+                except (ValueError, IndexError):
                     continue
 
             parts = name.rsplit(".", 1)
@@ -316,7 +315,7 @@ def update_paca_runtime(model, new_upper_k):
                 if param.requires_grad: param.requires_grad = False
             else:
                 if not param.requires_grad: param.requires_grad = True
-        except:
+        except (ValueError, IndexError):
             continue
 
 def build_model(config, num_classes, device):
@@ -341,7 +340,6 @@ def build_model(config, num_classes, device):
     upper_k = paca_config.get("upper_layers") if paca_config.get("enabled") else None
 
     if mode == "with_lora":
-        total_layers = len(_get_encoder_layers(model))
         layers_to_transform = None  # Allows dynamic expansion of PaCA in runtime
         peft_config = LoraConfig(
             r=lora_config["r"],
@@ -438,7 +436,6 @@ def build_scheduler(optimizer, config):
 def train_epoch(model, loader, optimizer, sparse_optimizer=None, sparse_lambda=0.0, accumulation_steps=1):
     model.train()
     total_ce_loss = 0.0
-    total_sparse_loss = 0.0
     total_loss = 0.0
     device = next(model.parameters()).device
     model_dtype = getattr(model, "compute_dtype", None) or next(model.parameters()).dtype
