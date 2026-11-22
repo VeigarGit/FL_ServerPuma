@@ -128,9 +128,9 @@ def _quantize_delta_3level(delta: torch.Tensor) -> tuple:
     delta_flat = delta.float().flatten()
     
     mu = delta_flat.mean().item()
-    sigma = delta_flat.std().item()
-    
-    if sigma < 1e-10:
+    sigma = delta_flat.std().item() if delta_flat.numel() > 1 else 0.0
+
+    if not math.isfinite(sigma) or sigma < 1e-10:
         n = delta_flat.numel()
         symbols = np.ones(n, dtype=np.int8)
         return symbols, mu, sigma

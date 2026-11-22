@@ -182,6 +182,42 @@ def parse_args():
         "O cliente usa o valor na posição client_idx %% len(lista)",
     )
     parser.add_argument(
+        "--adaptive-paca",
+        action="store_true",
+        help="Informa ao cliente que o PaCA recebido vem do motor γ^c (acopla θ_bar do PLD)",
+    )
+    parser.add_argument(
+        "--pld",
+        action="store_true",
+        help="Ativa Progressive Layer Dropping (Zhang & He, NeurIPS 2020)",
+    )
+    parser.add_argument(
+        "--pld-theta",
+        type=float,
+        default=0.5,
+        help="Taxa limite de retenção θ_bar ∈ (0, 1] no PLD (default: 0.5)",
+    )
+    parser.add_argument(
+        "--pld-mode",
+        type=str,
+        default="round",
+        choices=["round", "batch"],
+        help="Granularidade do sorteio PLD: round (por rodada/cliente) ou batch (Alg. 1)",
+    )
+    parser.add_argument(
+        "--pld-direction",
+        type=str,
+        default="top_drop",
+        choices=["top_drop", "bottom_drop", "uniform"],
+        help="Distribuição de drop por profundidade no PLD (default: top_drop)",
+    )
+    parser.add_argument(
+        "--pld-decay",
+        type=float,
+        default=5.0,
+        help="Constante de decaimento temporal γ_pld = decay / rounds (default: 5.0)",
+    )
+    parser.add_argument(
         "--prune",
         type=int,
         default=1,
@@ -258,14 +294,16 @@ def _decode_server_payload(
     start = time.time()
     if is_lhdq_encoded(global_state):
         global_state = lhdq_decode(global_state, previous_recv_state)
-        previous_recv_state = {
+        ref_update = {
             k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()
         }
+        previous_recv_state = {**previous_recv_state, **ref_update}
     else:
         if delta_coding:
-            previous_recv_state = {
+            ref_update = {
                 k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()
             }
+            previous_recv_state = {**previous_recv_state, **ref_update}
         else:
             global_state = dequantization(global_state)
     return global_state, previous_recv_state, time.time() - start
@@ -281,15 +319,17 @@ def _encode_client_payload(
     start = time.time()
     use_lhdq = delta_coding and round_num >= 1 and bool(previous_sent_state)
     if use_lhdq:
-        updated_state, previous_sent_state = lhdq_encode(
+        updated_state, ref_update = lhdq_encode(
             updated_state, previous_sent_state, return_reference=True
         )
+        previous_sent_state = {**previous_sent_state, **ref_update}
     else:
         if delta_coding:
-            previous_sent_state = {
+            ref_update = {
                 k: v.clone() if isinstance(v, torch.Tensor) else v
                 for k, v in updated_state.items()
             }
+            previous_sent_state = {**previous_sent_state, **ref_update}
         else:
             updated_state = quantization(updated_state)
     return updated_state, previous_sent_state, time.time() - start

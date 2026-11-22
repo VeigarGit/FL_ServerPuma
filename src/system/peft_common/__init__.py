@@ -1,5 +1,6 @@
 """Núcleo compartilhado de adaptadores esparsos SoRA/PEFT e poda de rank."""
 
+from .pld import ProgressiveLayerDropper, apply_pld_runtime
 from .sora import (
     SORA_MODES,
     GateSparsifier,
@@ -20,11 +21,13 @@ from .sora_utils import reduce_sora_state_dict_rank
 
 __all__ = [
     "GateSparsifier",
+    "ProgressiveLayerDropper",
     "SORA_MODES",
     "SoRALinear",
     "SoRAWrappedLinear",
     "SparseAdamW",
     "apply_peft_lora_modules",
+    "apply_pld_runtime",
     "apply_sora_modules",
     "build_sora_gate_sparsifier",
     "get_trainable_state_dict",
