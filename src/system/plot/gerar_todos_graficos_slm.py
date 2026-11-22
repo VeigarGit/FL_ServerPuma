@@ -549,7 +549,17 @@ if __name__ == "__main__":
     parser.add_argument("--exclude-onlypaca", action="store_true")
     parser.add_argument("--normalize-lora-bf16", action="store_true")
     parser.add_argument("--out-subdir", type=str, default=None)
+    parser.add_argument(
+        "--delta-suffix",
+        type=str,
+        default="_deltacoding",
+        help="Sufixo das pastas PUMA-GT E + Delta Coding (ex: _deltacoding ou _deltacoding_v2).",
+    )
     args = parser.parse_args()
+
+    if args.delta_suffix != "_deltacoding":
+        for cfg in DATASET_CONFIGS.values():
+            cfg["puma_delta"] = f"{cfg['puma']}{args.delta_suffix}"
 
     inc_delta = args.include_delta or args.four_strategies
     exc_onlypaca = args.exclude_onlypaca or args.four_strategies
