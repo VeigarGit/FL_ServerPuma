@@ -63,6 +63,14 @@ class ALA_LoRA:
         # Retrieve parameters as dicts
         params_g_dict = dict(global_model.named_parameters())
         params_dict = dict(local_model.named_parameters())
+
+        # Sincroniza adaptadores congelados (camadas dropadas pelo PLD/PaCA anteriormente)
+        with torch.no_grad():
+            for n, p in params_dict.items():
+                if not p.requires_grad and ("lora" in n or "sora" in n) and n in params_g_dict:
+                    gp = params_g_dict[n]
+                    if p.data.shape == gp.data.shape:
+                        p.data.copy_(gp.data.to(device=p.device, dtype=p.dtype))
         
         # Filter explicitly trainable parameters (LoRA, SoRA, Classifier Heads)
         trainable_names = [n for n, p in params_dict.items() if p.requires_grad]
@@ -99,6 +107,10 @@ class ALA_LoRA:
         # Initialize the weights to all ones in the beginning
         if self.weights is None:
             self.weights = {n: torch.ones_like(params_dict[n].data).to(self.device) for n in trainable_names}
+        else:
+            for n in trainable_names:
+                if n not in self.weights:
+                    self.weights[n] = torch.ones_like(params_dict[n].data).to(self.device)
 
         # Save backups of the original weights to RAM/GPU-RAM without doing deepcopy of whole model
         local_backup = {n: params_dict[n].data.clone() for n in trainable_names}

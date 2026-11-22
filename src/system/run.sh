@@ -92,6 +92,13 @@ ADAPTIVE_PACA_MIN=""
 ADAPTIVE_PACA_COOLDOWN=""
 ANNEALING_RATIO=""
 
+# Progressive Layer Dropping (PLD)
+PLD=0
+PLD_THETA=0.5
+PLD_MODE="round"
+PLD_DIRECTION="top_drop"
+PLD_DECAY=5.0
+
 # Rank Adaptativo
 ADAPTIVE_RANK=0
 ADAPTIVE_RANK_MIN=2
@@ -173,6 +180,13 @@ Opções de PaCA:
   --paca-min <n>              PaCA mínimo para modo aleatório (padrão: 1)
   --paca-max <n>              PaCA máximo para modo aleatório (padrão: 12)
   --paca-list <lista>         Lista de PaCA por cliente (ex: "4,8,12")
+
+Opções de Progressive Layer Dropping (PLD):
+  --pld                       Habilitar Progressive Layer Dropping (Zhang & He, NeurIPS 2020)
+  --pld-theta <valor>         Taxa limite de retenção θ_bar ∈ (0, 1] (padrão: 0.5)
+  --pld-mode <round|batch>    Granularidade do sorteio PLD (padrão: round)
+  --pld-direction <dir>       Direção por profundidade: top_drop, bottom_drop ou uniform (padrão: top_drop)
+  --pld-decay <valor>         Constante de decaimento temporal γ_pld = decay / rounds (padrão: 5.0)
 
 Opções de Rank Adaptativo:
   --adaptive-rank             Habilitar rank adaptativo no servidor
@@ -274,6 +288,13 @@ while [ $# -gt 0 ]; do
         --paca-min) PACA_MIN="$2"; shift 2 ;;
         --paca-max) PACA_MAX="$2"; CUSTOM_PACA_MAX=1; shift 2 ;;
         --paca-list) PACA_LIST="$2"; shift 2 ;;
+
+        # Progressive Layer Dropping (PLD)
+        --pld) PLD=1; shift 1 ;;
+        --pld-theta) PLD_THETA="$2"; shift 2 ;;
+        --pld-mode) PLD_MODE="$2"; shift 2 ;;
+        --pld-direction) PLD_DIRECTION="$2"; shift 2 ;;
+        --pld-decay) PLD_DECAY="$2"; shift 2 ;;
 
         # Rank Adaptativo
         --adaptive-rank) ADAPTIVE_RANK=1; shift 1 ;;
@@ -455,6 +476,13 @@ fi
 if [ "$ADAPTIVE_RANK" -eq 1 ]; then
     echo "  Rank Adaptativo:    ATIVADO (min: $ADAPTIVE_RANK_MIN, max: $ADAPTIVE_RANK_MAX)"
 fi
+if [ "$PLD" -eq 1 ]; then
+    if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+        echo "  PLD (PUMA-PLD):     ATIVADO (mode=$PLD_MODE, dir=$PLD_DIRECTION, θ_bar=γ^c·PaCA/L, decay=$PLD_DECAY)"
+    else
+        echo "  PLD:                ATIVADO (mode=$PLD_MODE, dir=$PLD_DIRECTION, θ_bar=$PLD_THETA, decay=$PLD_DECAY)"
+    fi
+fi
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then echo "  Salvar modelo: SIM ($SAVE_MODEL_PATH)"; fi
 if [ -n "$LOAD_MODEL_FLAG" ]; then echo "  Carregar modelo: SIM ($LOAD_MODEL_PATH)"; fi
@@ -497,6 +525,10 @@ else
         EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_pacalist"
     else
         EXP_NAME="${SESSION_NAME}_${DATASET}_${MODEL}_${STRATEGY}_prune${PRUNE}_ala${ALA}_paca${PACA}"
+    fi
+    # Sufixo PLD
+    if [ "$PLD" -eq 1 ]; then
+        EXP_NAME="${EXP_NAME}_pld"
     fi
     # Sufixo de compressão LHDQ
     if [ "$DELTA_CODING" -eq 1 ]; then
@@ -584,6 +616,9 @@ for RUN in $(seq $START_RUN $END_RUN); do
     if [ "$QLORA" -eq 1 ]; then
         SERVER_CMD="$SERVER_CMD --qlora"
     fi
+    if [ "$PLD" -eq 1 ]; then
+        SERVER_CMD="$SERVER_CMD --pld --pld-theta $PLD_THETA --pld-mode $PLD_MODE --pld-direction $PLD_DIRECTION --pld-decay $PLD_DECAY"
+    fi
     SERVER_CMD="$SERVER_CMD 2>&1 | tee $LOG_DIR/server.log"
 
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
@@ -653,6 +688,12 @@ for RUN in $(seq $START_RUN $END_RUN); do
         fi
         if [ "$QLORA" -eq 1 ]; then
             CLIENT_CMD="$CLIENT_CMD --qlora"
+        fi
+        if [ "$PLD" -eq 1 ]; then
+            CLIENT_CMD="$CLIENT_CMD --pld --pld-theta $PLD_THETA --pld-mode $PLD_MODE --pld-direction $PLD_DIRECTION --pld-decay $PLD_DECAY"
+            if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+                CLIENT_CMD="$CLIENT_CMD --adaptive-paca"
+            fi
         fi
         if [ "$STRAGGLER_IDX" -ge 0 ]; then
             CLIENT_CMD="$CLIENT_CMD --straggler-idx $STRAGGLER_IDX --straggler-delay $STRAGGLER_DELAY --straggler-round $STRAGGLER_ROUND"

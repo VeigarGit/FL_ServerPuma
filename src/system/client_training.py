@@ -70,6 +70,22 @@ def resolve_device(args: argparse.Namespace) -> torch.device:
     return torch.device(args.device)
 
 
+def _build_pld_config(args: argparse.Namespace) -> dict:
+    """Monta a subconfiguração do Progressive Layer Dropping a partir das flags CLI."""
+    return {
+        "enabled": bool(getattr(args, "pld", False)),
+        "theta_bar": float(getattr(args, "pld_theta", 0.5)),
+        "mode": getattr(args, "pld_mode", "round"),
+        "direction": getattr(args, "pld_direction", "top_drop"),
+        "decay_constant": float(getattr(args, "pld_decay", 5.0)),
+        "adaptive_paca": bool(getattr(args, "adaptive_paca", False)),
+        "total_rounds": int(getattr(args, "rounds", 1)),
+        "client_idx": int(getattr(args, "client_idx", 0)),
+        "run_id": int(getattr(args, "run_id", 1)),
+        "seed": int(getattr(args, "seed", 42)),
+    }
+
+
 def resolve_heterogeneous_paca(args: argparse.Namespace) -> None:
     """Ajusta args.paca in-place quando configurado via lista determinística ou sorteio."""
     if args.paca_list is not None:
@@ -173,6 +189,8 @@ def build_client_model(
                 config["model"]["paca"]["enabled"] = False
                 config["model"]["paca"]["upper_layers"] = None
 
+            config["model"]["pld"] = _build_pld_config(args)
+
             if args.model == "clip":
                 run_mode = resolve_run_modes(config)[0]
                 run_config = build_run_config(config, run_mode=run_mode)
@@ -229,6 +247,7 @@ def build_client_model(
                 run_config["model"]["paca"]["enabled"] = False
                 run_config["model"]["paca"]["upper_layers"] = None
 
+            run_config["model"]["pld"] = _build_pld_config(args)
             run_config["is_qlora"] = bool(args.qlora)
             if args.qlora:
                 mode_tag = "QSoRA" if "sora" in args.strategy else "QLoRA"
@@ -251,6 +270,8 @@ def build_client_model(
             except ValueError as exc:
                 logger.error(str(exc))
                 sys.exit(1)
+
+            run_config.setdefault("model", {})["pld"] = _build_pld_config(args)
 
             if args.qlora:
                 mode_tag = "QSoRA" if "sora" in args.strategy else "QLoRA"
@@ -358,6 +379,26 @@ def _log_trainable_param_count(model: nn.Module) -> None:
         model._last_trainable_count = trainable_count
 
 
+def _apply_layer_schedule(
+    model: nn.Module,
+    model_type: str,
+    round_num: int,
+    run_config: dict | None,
+    update_paca_fn,
+) -> None:
+    """Aplica PLD ou PaCA em runtime conforme configurado em run_config."""
+    model_cfg = (run_config or {}).get("model", {})
+    if model_cfg.get("pld", {}).get("enabled", False):
+        from peft_common.pld import apply_pld_runtime
+
+        apply_pld_runtime(model, model_type, round_num, run_config or {})
+        return
+
+    paca_cfg = model_cfg.get("paca", {})
+    if paca_cfg.get("enabled"):
+        update_paca_fn(model, paca_cfg.get("upper_layers"))
+
+
 def local_training(
     model,
     state_dict,
@@ -403,9 +444,7 @@ def local_training(
                 "d1-2B opera em modo FedAvg (--ala 0 ignorado; FedALA não se aplica a d1)."
             )
 
-        paca_cfg = run_config["model"].get("paca", {}) if run_config else {}
-        if paca_cfg.get("enabled"):
-            update_paca_runtime(model, paca_cfg.get("upper_layers"))
+        _apply_layer_schedule(model, model_type, round_num, run_config, update_paca_runtime)
 
         _log_trainable_param_count(model)
 
@@ -445,9 +484,7 @@ def local_training(
         if state_dict:
             set_lfm_state_dict(model, state_dict)
 
-        paca_cfg = run_config["model"].get("paca", {}) if run_config else {}
-        if paca_cfg.get("enabled"):
-            update_paca_runtime(model, paca_cfg.get("upper_layers"))
+        _apply_layer_schedule(model, model_type, round_num, run_config, update_paca_runtime)
 
         _log_trainable_param_count(model)
 
@@ -522,9 +559,7 @@ def local_training(
         else:
             from lora_slm.slm_setup import build_optimizer, train_epoch, update_paca_runtime
 
-        paca_config = run_config["model"].get("paca", {})
-        if paca_config.get("enabled"):
-            update_paca_runtime(model, paca_config.get("upper_layers"))
+        _apply_layer_schedule(model, model_type, round_num, run_config, update_paca_runtime)
 
         _log_trainable_param_count(model)
 

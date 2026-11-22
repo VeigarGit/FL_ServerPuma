@@ -393,15 +393,19 @@ def build_model(config, num_classes, device):
 
     mode = lora_config["mode"]
     
-    # Verifica configurações de PaCA (ajuste apenas em camadas superiores)
+    # Verifica configurações de PaCA (ajuste apenas em camadas superiores) e PLD
     paca_config = config["model"].get("paca", {})
     upper_k = paca_config.get("upper_layers") if paca_config.get("enabled") else None
+    pld_enabled = bool(config["model"].get("pld", {}).get("enabled", False))
+    inject_upper_k = None if pld_enabled else upper_k
 
     if mode == "with_lora":
-        # PaCA: restringe LoRA às últimas upper_k camadas do encoder
+        # PaCA: restringe LoRA às últimas upper_k camadas do encoder (no PLD, injeta em todas)
         # Referência: PEFT LoraConfig.layers_to_transform (documentação oficial HuggingFace)
         total_layers = len(vision_model.encoder.layers)
-        layers_to_transform = list(range(total_layers - upper_k, total_layers)) if upper_k else None
+        layers_to_transform = (
+            list(range(total_layers - inject_upper_k, total_layers)) if inject_upper_k else None
+        )
         
         peft_config = LoraConfig(
             r=lora_config["r"],
@@ -413,10 +417,12 @@ def build_model(config, num_classes, device):
         )
         model.vision_model = get_peft_model(model.vision_model, peft_config)
     elif mode == "with_adalora":
-        # PaCA: restringe LoRA às últimas upper_k camadas do encoder
+        # PaCA: restringe LoRA às últimas upper_k camadas do encoder (no PLD, injeta em todas)
         # Referência: PEFT LoraConfig.layers_to_transform (documentação oficial HuggingFace)
         total_layers = len(vision_model.encoder.layers)
-        layers_to_transform = list(range(total_layers - upper_k, total_layers)) if upper_k else None
+        layers_to_transform = (
+            list(range(total_layers - inject_upper_k, total_layers)) if inject_upper_k else None
+        )
         adalora_config = config["model"]["adalora"]
 
         peft_config = AdaLoraConfig(
@@ -460,11 +466,11 @@ def build_model(config, num_classes, device):
     #     )
     #     model.vision_model = get_peft_model(model.vision_model, peft_config)
     elif mode in SORA_MODES:
-        apply_sora(model, lora_config, upper_k=upper_k)
+        apply_sora(model, lora_config, upper_k=inject_upper_k)
 
     # PaCA: Registra hook para interromper backward pass nas camadas inferiores
-    if upper_k is not None:
-        _apply_paca_gradient_boundary(model, upper_k)
+    if inject_upper_k is not None:
+        _apply_paca_gradient_boundary(model, inject_upper_k)
 
     # Função auxiliar externa para resumo de parâmetros (omitida no snippet por brevidade)
     # print_trainable_summary(model, mode) 

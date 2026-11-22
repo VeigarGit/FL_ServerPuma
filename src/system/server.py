@@ -142,6 +142,8 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                     config["model"]["paca"]["enabled"] = False
                     config["model"]["paca"]["upper_layers"] = None
 
+                config["model"]["pld"] = {"enabled": bool(getattr(args, "pld", False))}
+
                 if args.model == 'clip':
                     run_mode = resolve_run_modes(config)[0]
                     run_config = build_run_config(config, run_mode=run_mode)
@@ -513,22 +515,27 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         current_global_state = self.current_round_state.copy()
 
         # --- PaCA DINÂMICO (para CLIP e SLM, a partir do round 2, se ativado) ---
-        if self.args.model in ("clip", "slm", "lfm", "d1") and round_num >= 1 and getattr(self.args, 'adaptive_paca', False):
+        if (
+            self.args.model in ("clip", "slm", "lfm", "d1")
+            and round_num >= 1
+            and getattr(self.args, 'adaptive_paca', False)
+        ):
             ideal_paca = self.calculate_adaptive_paca(client_id)
             self.clients_info[client_id]['current_paca'] = ideal_paca
 
-            # Filtra: remove chaves de camadas fora do PaCA ideal
-            min_layer = self.total_encoder_layers - ideal_paca
-            if min_layer > 0:
-                keys_before = len(current_global_state)
-                current_global_state = {
-                    k: v for k, v in current_global_state.items()
-                    if not self._is_excluded_by_paca(k, min_layer)
-                }
-                keys_after = len(current_global_state)
-                if keys_before != keys_after:
-                    logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
-                                f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
+            # No PLD qualquer camada 0..L-1 pode ser sorteada; não filtramos por PaCA
+            if not getattr(self.args, 'pld', False):
+                min_layer = self.total_encoder_layers - ideal_paca
+                if min_layer > 0:
+                    keys_before = len(current_global_state)
+                    current_global_state = {
+                        k: v for k, v in current_global_state.items()
+                        if not self._is_excluded_by_paca(k, min_layer)
+                    }
+                    keys_after = len(current_global_state)
+                    if keys_before != keys_after:
+                        logger.info(f"PaCA filtro {client_id}: {keys_before} -> {keys_after} chaves "
+                                    f"(PaCA={ideal_paca}/{self.total_encoder_layers})")
 
         # --- RANK ADAPTATIVO (para CLIP e SLM, a partir do round 2, se ativado) ---
         if self.args.model in ("clip", "slm", "lfm", "d1") and round_num >= 1 and getattr(self.args, 'adaptive_rank', False):
@@ -602,7 +609,7 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 )
             else:
                 reference = {key: tensor.clone() for key, tensor in current_global_state.items()}
-            self.previous_sent_state[client_id] = reference
+            self.previous_sent_state[client_id] = {**(previous or {}), **reference}
         else:
             current_global_state = quantization(current_global_state)
 
@@ -634,7 +641,8 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             raise ValueError("pesos inválidos ou incompatíveis")
 
         if self.args.delta_coding:
-            self.previous_recv_state[client_id] = state.copy()
+            prev_recv = self.previous_recv_state.get(client_id, {})
+            self.previous_recv_state[client_id] = {**prev_recv, **state}
         info = self.clients_info[client_id]
         self.client_data[client_id] = data
         dataset_size = data if isinstance(data, (int, float)) else 1.0
@@ -645,10 +653,35 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             info["last_loss"] = loss
             info["acc_history"].append(accuracy)
 
-        if self.args.model in ("clip", "slm", "lfm", "d1") and self.args.adaptive_paca:
+        if (
+            self.args.model in ("clip", "slm", "lfm", "d1")
+            and self.args.adaptive_paca
+            and not getattr(self.args, 'pld', False)
+        ):
             min_layer = self.total_encoder_layers - info["current_paca"]
             if min_layer > 0:
-                state = {key: value for key, value in state.items() if not self._is_excluded_by_paca(key, min_layer)}
+                state = {
+                    key: value
+                    for key, value in state.items()
+                    if not self._is_excluded_by_paca(key, min_layer)
+                }
+
+        if getattr(self.args, 'pld', False) and self.args.model in ("clip", "slm", "lfm", "d1"):
+            from peft_common.pld import extract_layer_idx
+
+            trained_layers = sorted(
+                {
+                    layer_idx
+                    for key in state
+                    if (layer_idx := extract_layer_idx(key)) is not None
+                }
+            )
+            logger.info(
+                f"PLD update cliente {client_id}: {len(trained_layers)}/{self.total_encoder_layers}"
+                f" camadas treinadas {trained_layers}"
+            )
+            if trained_layers:
+                info["last_pld_layers"] = len(trained_layers)
 
         processing_time = quant_time + (time.monotonic() - decode_start)
         training_time = training_time if isinstance(training_time, (int, float)) else elapsed
@@ -745,8 +778,14 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
         quant_times = {}
         frames = {}
         reuse_result = (
-            round_id > 1 and not self.args.adaptive_paca and not self.args.adaptive_rank
+            round_id > 1
+            and not self.args.adaptive_paca
+            and not self.args.adaptive_rank
             and not (self.args.model == "cnn" and self.prune == 1)
+            and not (
+                getattr(self.args, 'pld', False)
+                and (self.args.adaptive_paca or self.args.adaptive_rank)
+            )
         )
         for client_id in senders:
             if reuse_result:
@@ -1188,11 +1227,26 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                         break
 
                 if client_updates or inbox is not None:
-                    paca_list = [self.clients_info[cid].get('current_paca', self.args.paca) for cid in sorted(self.clients_info.keys())]
+                    use_pld = getattr(self.args, 'pld', False)
+                    paca_list = [
+                        (
+                            self.clients_info[cid].get(
+                                "last_pld_layers",
+                                self.clients_info[cid].get("current_paca", self.args.paca),
+                            )
+                            if use_pld
+                            else self.clients_info[cid].get('current_paca', self.args.paca)
+                        )
+                        for cid in sorted(self.clients_info.keys())
+                    ]
                     self.rs_client_paca.append(paca_list)
-                    if getattr(self.args, 'adaptive_paca', False) and paca_list:
+                    if (getattr(self.args, 'adaptive_paca', False) or use_pld) and paca_list:
                         paca_counts = {p: paca_list.count(p) for p in sorted(set(paca_list))}
-                        logger.info(f"Round {round_num + 1}: PaCA distribution: {paca_counts} (min={min(paca_list)}, max={max(paca_list)}, avg={sum(paca_list)/len(paca_list):.1f})")
+                        avg_paca = sum(paca_list) / len(paca_list)
+                        logger.info(
+                            f"Round {round_num + 1}: PaCA/PLD layers distribution: {paca_counts} "
+                            f"(min={min(paca_list)}, max={max(paca_list)}, avg={avg_paca:.1f})"
+                        )
                     
                     rank_list = [self.clients_info[cid].get('current_rank', self.args.rank) for cid in sorted(self.clients_info.keys())]
                     self.rs_client_rank.append(rank_list)
@@ -1306,6 +1360,37 @@ def parse_args():
     parser.add_argument('--plateau-phi-min', type=float, default=0.45, help='Piso mínimo de capacidade no platô (default: 0.45)')
     parser.add_argument('--plateau-decay-rate', type=float, default=0.025, help='Taxa de decaimento por rodada no platô (default: 0.025)')
     parser.add_argument('--qlora', action='store_true', help='Ativa QLoRA/QSoRA (slm/lfm/d1 com lora ou sora_*): backbone 4-bit NF4, agrega só adaptadores 16 bits')
+    parser.add_argument(
+        '--pld',
+        action='store_true',
+        help='Ativa Progressive Layer Dropping (Zhang & He, NeurIPS 2020)',
+    )
+    parser.add_argument(
+        '--pld-theta',
+        type=float,
+        default=0.5,
+        help='Taxa limite de retenção θ_bar ∈ (0, 1] no PLD (default: 0.5)',
+    )
+    parser.add_argument(
+        '--pld-mode',
+        type=str,
+        default='round',
+        choices=['round', 'batch'],
+        help='Modo de sorteio PLD: round ou batch (default: round)',
+    )
+    parser.add_argument(
+        '--pld-direction',
+        type=str,
+        default='top_drop',
+        choices=['top_drop', 'bottom_drop', 'uniform'],
+        help='Direção do drop por profundidade no PLD (default: top_drop)',
+    )
+    parser.add_argument(
+        '--pld-decay',
+        type=float,
+        default=5.0,
+        help='Constante de decaimento temporal γ_pld = decay / rounds (default: 5.0)',
+    )
     args = parser.parse_args()
     if args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0):
         parser.error('--timeout deve ser positivo e finito (segundos).')
