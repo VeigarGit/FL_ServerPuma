@@ -609,7 +609,10 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
                 )
             else:
                 reference = {key: tensor.clone() for key, tensor in current_global_state.items()}
-            self.previous_sent_state[client_id] = {**(previous or {}), **reference}
+            if getattr(self.args, "pld", False):
+                self.previous_sent_state[client_id] = {**(previous or {}), **reference}
+            else:
+                self.previous_sent_state[client_id] = reference
         else:
             current_global_state = quantization(current_global_state)
 
@@ -641,8 +644,11 @@ class FederatedLearningServer(PumaEngineMixin, ServerAlignmentMixin, ServerDataM
             raise ValueError("pesos inválidos ou incompatíveis")
 
         if self.args.delta_coding:
-            prev_recv = self.previous_recv_state.get(client_id, {})
-            self.previous_recv_state[client_id] = {**prev_recv, **state}
+            if getattr(self.args, "pld", False):
+                prev_recv = self.previous_recv_state.get(client_id, {})
+                self.previous_recv_state[client_id] = {**prev_recv, **state}
+            else:
+                self.previous_recv_state[client_id] = state
         info = self.clients_info[client_id]
         self.client_data[client_id] = data
         dataset_size = data if isinstance(data, (int, float)) else 1.0

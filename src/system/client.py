@@ -288,7 +288,10 @@ def parse_args():
 
 
 def _decode_server_payload(
-    global_state: dict, previous_recv_state: dict, delta_coding: bool
+    global_state: dict,
+    previous_recv_state: dict,
+    delta_coding: bool,
+    keep_missing: bool = False,
 ) -> tuple[dict, dict, float]:
     """Descomprime o payload recebido do servidor (LHDQ ou INT8) e atualiza a referência."""
     start = time.time()
@@ -297,13 +300,17 @@ def _decode_server_payload(
         ref_update = {
             k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()
         }
-        previous_recv_state = {**previous_recv_state, **ref_update}
+        previous_recv_state = (
+            {**previous_recv_state, **ref_update} if keep_missing else ref_update
+        )
     else:
         if delta_coding:
             ref_update = {
                 k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in global_state.items()
             }
-            previous_recv_state = {**previous_recv_state, **ref_update}
+            previous_recv_state = (
+                {**previous_recv_state, **ref_update} if keep_missing else ref_update
+            )
         else:
             global_state = dequantization(global_state)
     return global_state, previous_recv_state, time.time() - start
@@ -314,6 +321,7 @@ def _encode_client_payload(
     previous_sent_state: dict,
     round_num: int,
     delta_coding: bool,
+    keep_missing: bool = False,
 ) -> tuple[dict, dict, float]:
     """Comprime os pesos locais (LHDQ ou INT8 padrão) para envio."""
     start = time.time()
@@ -322,14 +330,18 @@ def _encode_client_payload(
         updated_state, ref_update = lhdq_encode(
             updated_state, previous_sent_state, return_reference=True
         )
-        previous_sent_state = {**previous_sent_state, **ref_update}
+        previous_sent_state = (
+            {**previous_sent_state, **ref_update} if keep_missing else ref_update
+        )
     else:
         if delta_coding:
             ref_update = {
                 k: v.clone() if isinstance(v, torch.Tensor) else v
                 for k, v in updated_state.items()
             }
-            previous_sent_state = {**previous_sent_state, **ref_update}
+            previous_sent_state = (
+                {**previous_sent_state, **ref_update} if keep_missing else ref_update
+            )
         else:
             updated_state = quantization(updated_state)
     return updated_state, previous_sent_state, time.time() - start
@@ -540,7 +552,10 @@ def run_centralized_client(
                 global_state = result_state
             else:
                 global_state, previous_recv_state, client_dequant_time = _decode_server_payload(
-                    global_state, previous_recv_state, args.delta_coding,
+                    global_state,
+                    previous_recv_state,
+                    args.delta_coding,
+                    keep_missing=bool(getattr(args, "pld", False)),
                 )
             evaluation_loader = (
                 CheckedBatches(test_loader, checkpoint) if checkpoint else test_loader
@@ -610,7 +625,11 @@ def run_centralized_client(
                     if preserve_fedala:
                         local_weights = updated_state
                 updated_state, candidate, client_quant_time = _encode_client_payload(
-                    updated_state, previous_sent_state, round_num, args.delta_coding
+                    updated_state,
+                    previous_sent_state,
+                    round_num,
+                    args.delta_coding,
+                    keep_missing=bool(getattr(args, "pld", False)),
                 )
 
                 client_eval_time = client_pre_eval_time + client_post_eval_time
