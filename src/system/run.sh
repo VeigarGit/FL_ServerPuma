@@ -44,6 +44,8 @@ CLIENT_COUNT=2
 ROUNDS=5
 ROUND_TIMEOUT_FLAG=
 DATASET="MNIST"
+DATASET_CLIENTS=""
+SKIP_DATASET=0
 BATCH_SIZE=32
 CUSTOM_BATCH_SIZE=0
 MAX_CLIENTS=25
@@ -142,6 +144,8 @@ Opções de Treinamento:
   -r, --rounds <n>            Número de rodadas (padrão: 5)
   --timeout <segundos>        Prazo fixo de coleta por rodada
   -d, --dataset <nome>        Dataset: Nome do dataset (deve existir um generate_Nome.py) (padrão: MNIST)
+  --dataset-clients <n>       Número de clientes para gerar/validar o dataset (padrão: --clients)
+  --skip-dataset              Pular geração/validação do dataset (usa os arquivos já existentes)
   --batch-size <n>            Tamanho do batch (padrão: 32)
   --max-clients <n>           Máximo de clientes permitidos (padrão: 22)
   --simulations <n>           Número de simulações (padrão: 1)
@@ -239,6 +243,8 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         -d|--dataset) DATASET="$2"; shift 2 ;;
+        --dataset-clients) DATASET_CLIENTS="$2"; shift 2 ;;
+        --skip-dataset) SKIP_DATASET=1; shift 1 ;;
         --batch-size) BATCH_SIZE="$2"; CUSTOM_BATCH_SIZE=1; shift 2 ;;
         --max-clients) MAX_CLIENTS="$2"; shift 2 ;;
         --simulations) SIMULATIONS="$2"; shift 2 ;;
@@ -491,17 +497,22 @@ if [ "$QLORA" -eq 1 ]; then echo "  QLoRA:              ATIVADO (NF4 + DoubleQua
 echo "===================================="
 
 # ---- Preparação do Dataset ----
-# Busca o script no diretório dataset
-SCRIPT_PATH=$(find ../dataset -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
-if [ -n "$SCRIPT_PATH" ]; then
-    if [ "$DATASET" = "MNIST" ]; then
-        uv run --no-sync "$SCRIPT_PATH" noniid - dir --num-clients "$CLIENT_COUNT"
-    else
-        uv run --no-sync "$SCRIPT_PATH" noniid - dir "$CLIENT_COUNT"
-    fi
+if [ "$SKIP_DATASET" -eq 1 ]; then
+    echo "[INFO] --skip-dataset ativado: pulando geração/validação de '$DATASET'."
 else
-    echo "[ERRO] Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
-    exit 1
+    DATASET_CLIENT_TARGET="${DATASET_CLIENTS:-$CLIENT_COUNT}"
+    # Busca o script no diretório dataset
+    SCRIPT_PATH=$(find ../dataset -maxdepth 1 -iname "generate_${DATASET}.py" -print -quit)
+    if [ -n "$SCRIPT_PATH" ]; then
+        if [ "$DATASET" = "MNIST" ]; then
+            uv run --no-sync "$SCRIPT_PATH" noniid - dir --num-clients "$DATASET_CLIENT_TARGET"
+        else
+            uv run --no-sync "$SCRIPT_PATH" noniid - dir "$DATASET_CLIENT_TARGET"
+        fi
+    else
+        echo "[ERRO] Dataset não reconhecido ou script de geração não encontrado para: $DATASET"
+        exit 1
+    fi
 fi
 
 if [ -n "$SAVE_MODEL_FLAG" ]; then
