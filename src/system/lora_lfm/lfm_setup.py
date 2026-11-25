@@ -460,7 +460,7 @@ def setup_lfm_model(
 
     # Configuração de PaCA
     paca_cfg = model_cfg.get("paca", {})
-    if paca_cfg.get("enabled", False):
+    if paca_cfg.get("enabled", False) and not paca_cfg.get("keep_all_trainable", False):
         upper_k = paca_cfg.get("upper_layers", 4)
         update_paca_runtime(model, upper_k)
         logger.info(f"PaCA ativado nas {upper_k} camadas superiores do LFM3")

@@ -281,40 +281,72 @@ def _get_encoder_layers(model):
 def _apply_paca_gradient_boundary(model, upper_k):
     layers = _get_encoder_layers(model)
     total_layers = len(layers)
-    if upper_k is None or upper_k >= total_layers: return
+    if upper_k is None or upper_k <= 0 or upper_k >= total_layers:
+        return
     boundary_idx = total_layers - upper_k - 1
-    
-    def detach_hook(module, input, output):
-        if not module.training: return output
+
+    def detach_input_pre_hook(module, args, kwargs):
+        if not (module.training and torch.is_grad_enabled()):
+            return args, kwargs
+        if args and isinstance(args[0], torch.Tensor):
+            args = (args[0].detach(),) + args[1:]
+        elif "hidden_states" in kwargs and isinstance(kwargs["hidden_states"], torch.Tensor):
+            kwargs = dict(kwargs)
+            kwargs["hidden_states"] = kwargs["hidden_states"].detach()
+        return args, kwargs
+
+    def boundary_output_hook(module, inputs, output):
+        if not (module.training and torch.is_grad_enabled()):
+            return output
         if isinstance(output, tuple):
-            return (output[0].detach(),) + output[1:]
-        return output.detach()
-    
-    handle = layers[boundary_idx].register_forward_hook(detach_hook)
-    if not hasattr(model, '_paca_hooks'):
+            return (output[0].detach().requires_grad_(True),) + output[1:]
+        return output.detach().requires_grad_(True)
+
+    pre_handle = layers[0].register_forward_pre_hook(detach_input_pre_hook, with_kwargs=True)
+    boundary_handle = layers[boundary_idx].register_forward_hook(boundary_output_hook)
+    if not hasattr(model, "_paca_hooks"):
         model._paca_hooks = []
-    model._paca_hooks.append(handle)
+    model._paca_hooks.extend([pre_handle, boundary_handle])
+
 
 def update_paca_runtime(model, new_upper_k):
     layers = _get_encoder_layers(model)
     total_layers = len(layers)
-    if hasattr(model, '_paca_hooks'):
+    if hasattr(model, "_paca_hooks"):
         for handle in model._paca_hooks:
             handle.remove()
         model._paca_hooks = []
-    if new_upper_k is not None:
+
+    for layer in layers:
+        if hasattr(layer, "_paca_orig_gradient_checkpointing"):
+            layer.gradient_checkpointing = layer._paca_orig_gradient_checkpointing
+
+    if new_upper_k is not None and 0 < new_upper_k < total_layers:
+        boundary_idx = total_layers - new_upper_k - 1
+        for idx in range(boundary_idx + 1):
+            layer = layers[idx]
+            if hasattr(layer, "gradient_checkpointing"):
+                if not hasattr(layer, "_paca_orig_gradient_checkpointing"):
+                    layer._paca_orig_gradient_checkpointing = layer.gradient_checkpointing
+                layer.gradient_checkpointing = False
         _apply_paca_gradient_boundary(model, new_upper_k)
-        
-    boundary_layer = 0 if (new_upper_k is None or new_upper_k >= total_layers) else total_layers - new_upper_k
+
+    boundary_layer = (
+        0 if (new_upper_k is None or new_upper_k >= total_layers) else total_layers - new_upper_k
+    )
     for name, param in model.named_parameters():
-        if "sora" not in name and "lora" not in name: continue
-        if ".layers." not in name: continue
+        if "sora" not in name and "lora" not in name:
+            continue
+        if ".layers." not in name:
+            continue
         try:
             layer_idx = int(name.split(".layers.")[1].split(".")[0])
             if layer_idx < boundary_layer:
-                if param.requires_grad: param.requires_grad = False
+                if param.requires_grad:
+                    param.requires_grad = False
             else:
-                if not param.requires_grad: param.requires_grad = True
+                if not param.requires_grad:
+                    param.requires_grad = True
         except (ValueError, IndexError):
             continue
 

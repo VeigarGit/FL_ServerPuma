@@ -75,7 +75,8 @@ def train_epoch_lfm(
             loss = decision_loss(logits, targets, brier_weight=brier_weight)
             loss_scaled = loss / grad_accum_steps
 
-        loss_scaled.backward()
+        if loss_scaled.requires_grad:
+            loss_scaled.backward()
 
         with torch.no_grad():
             preds = logits.argmax(dim=-1)

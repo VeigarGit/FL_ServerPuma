@@ -397,7 +397,8 @@ def build_model(config, num_classes, device):
     paca_config = config["model"].get("paca", {})
     upper_k = paca_config.get("upper_layers") if paca_config.get("enabled") else None
     pld_enabled = bool(config["model"].get("pld", {}).get("enabled", False))
-    inject_upper_k = None if pld_enabled else upper_k
+    adaptive_paca = bool(paca_config.get("adaptive", False))
+    inject_upper_k = None if (pld_enabled or adaptive_paca) else upper_k
 
     if mode == "with_lora":
         # PaCA: restringe LoRA às últimas upper_k camadas do encoder (no PLD, injeta em todas)

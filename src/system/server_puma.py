@@ -166,9 +166,20 @@ class PumaEngineMixin:
         com rede de segurança (Panic Reversal) e Cooldown de reduções.
         """
         client_info = self.clients_info.get(client_id, {})
-        max_paca = self.args.paca
-        paca_min = getattr(self.args, "adaptive_paca_min", 2)
-        current_paca = client_info.get("current_paca", max_paca)
+        total_layers = getattr(self, "total_encoder_layers", None) or 1
+        raw_paca = getattr(self.args, "paca", None)
+        max_paca = (
+            min(int(raw_paca), int(total_layers))
+            if (raw_paca is not None and int(raw_paca) > 0)
+            else int(total_layers)
+        )
+        paca_min = max(1, min(int(getattr(self.args, "adaptive_paca_min", 2)), max_paca))
+        raw_current = client_info.get("current_paca", max_paca)
+        current_paca = (
+            max(paca_min, min(int(raw_current), max_paca))
+            if (raw_current is not None and int(raw_current) > 0)
+            else max_paca
+        )
         acc_history = client_info.get("acc_history", [])
         current_round = len(self.rs_aux_simple_avg_acc)
         cooldown_rounds = getattr(self.args, "adaptive_paca_cooldown", 2)
