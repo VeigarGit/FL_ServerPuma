@@ -62,13 +62,16 @@ def _is_adapter_param(param_name: str, model_type: str) -> bool:
     return "lora" in param_name or "sora" in param_name
 
 
-def _clear_pld_batch_hooks(model: nn.Module) -> None:
+def clear_pld_batch_hooks(model: nn.Module) -> None:
     """Remove hooks de Switchable-Transformer registrados em rodadas anteriores."""
     hooks = getattr(model, "_pld_batch_hooks", None)
     if hooks:
         for handle in hooks:
             handle.remove()
     model._pld_batch_hooks = []
+
+
+_clear_pld_batch_hooks = clear_pld_batch_hooks
 
 
 class ProgressiveLayerDropper:
@@ -163,18 +166,26 @@ def _register_batch_pld_hooks(
     model: nn.Module,
     layers: Any,
     probs: list[float],
-    rng: random.Random,
+    window_start: int = 0,
 ) -> None:
-    """Registra hooks Switchable-Transformer (Eq. 1) por mini-batch nas camadas."""
-    _clear_pld_batch_hooks(model)
+    """Registra hooks Switchable-Transformer (Eq. 1) por mini-batch na janela ativa.
+
+    Usa o RNG nativo do PyTorch (`torch.rand`) no dispositivo do tensor de entrada para
+    garantir determinismo idêntico entre forward e recomputação sob
+    `torch.utils.checkpoint(..., preserve_rng_state=True)` (gradient checkpointing).
+    """
+    clear_pld_batch_hooks(model)
     hooks: list[Any] = []
 
-    for layer_idx, layer in enumerate(layers):
-        p_l = probs[layer_idx]
+    for rel_idx, p_l in enumerate(probs):
+        layer = layers[window_start + rel_idx]
 
         def _make_hook(keep_prob: float):
             def _switchable_hook(module, args, kwargs, output):
                 if not (module.training and torch.is_grad_enabled()):
+                    return output
+
+                if keep_prob >= 1.0 - 1e-9:
                     return output
 
                 x_in = None
@@ -192,13 +203,9 @@ def _register_batch_pld_hooks(
                 if not isinstance(x_out, torch.Tensor) or x_out.shape != x_in.shape:
                     return output
 
-                if keep_prob >= 1.0 - 1e-9:
-                    return output
-
-                if rng.random() > keep_prob:
-                    new_hidden = x_in
-                else:
-                    new_hidden = x_in + (x_out - x_in) * (1.0 / keep_prob)
+                # RNG do PyTorch é salvo/restaurado automaticamente pelo gradient checkpointing
+                keep = bool(torch.rand((), device=x_in.device).item() <= keep_prob)
+                new_hidden = x_in if not keep else x_in + (x_out - x_in) * (1.0 / keep_prob)
 
                 if isinstance(output, tuple):
                     return (new_hidden,) + output[1:]
@@ -217,8 +224,15 @@ def apply_pld_runtime(
     round_num: int,
     run_config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Aplica o Progressive Layer Dropping em runtime antes do treino local da rodada."""
-    _clear_pld_batch_hooks(model)
+    """Aplica o Progressive Layer Dropping em runtime antes do treino local da rodada.
+
+    Quando combinado com PaCA (fixo ou adaptativo), opera de forma ortogonal:
+      - PaCA define a janela elegível das `k_c` camadas superiores `[L - k_c, ..., L - 1]`,
+        garantindo o corte real de backward nas camadas `0 .. L - k_c - 1`.
+      - PLD aplica o schedule progressivo 2D (Eq. 2 e Eq. 3) com `theta_bar = pld_theta`
+        sobre as `k_c` camadas elegíveis da janela ativa.
+    """
+    clear_pld_batch_hooks(model)
 
     model_cfg = run_config.get("model", {})
     pld_cfg = model_cfg.get("pld", {})
@@ -231,16 +245,19 @@ def apply_pld_runtime(
             f"Nenhuma camada encoder encontrada para aplicar PLD em '{model_type}'."
         )
 
-    if pld_cfg.get("adaptive_paca", False) and paca_cfg.get("upper_layers"):
-        theta_bar = max(0.20, min(1.0, float(paca_cfg["upper_layers"]) / total_layers))
+    if paca_cfg.get("enabled", False) and paca_cfg.get("upper_layers"):
+        paca_k = max(1, min(total_layers, int(paca_cfg["upper_layers"])))
     else:
-        theta_bar = max(0.15, min(1.0, float(pld_cfg.get("theta_bar", 0.5))))
+        paca_k = total_layers
+    window_start = total_layers - paca_k
+    window_size = paca_k
 
+    theta_bar = max(0.15, min(1.0, float(pld_cfg.get("theta_bar", 0.5))))
     mode = pld_cfg.get("mode", "round")
     direction = pld_cfg.get("direction", "top_drop")
     decay_constant = float(pld_cfg.get("decay_constant", 5.0))
     total_rounds = max(1, int(pld_cfg.get("total_rounds", 1)))
-    min_active = min(max(1, int(pld_cfg.get("min_active", 2))), total_layers)
+    min_active = min(max(1, int(pld_cfg.get("min_active", 2))), window_size)
 
     base_seed = int(pld_cfg.get("seed", 42))
     run_id = int(pld_cfg.get("run_id", 1))
@@ -249,7 +266,7 @@ def apply_pld_runtime(
     rng = random.Random(round_seed)
 
     dropper = ProgressiveLayerDropper(
-        total_layers=total_layers,
+        total_layers=window_size,
         total_steps=total_rounds,
         theta_bar=theta_bar,
         direction=direction,
@@ -261,12 +278,13 @@ def apply_pld_runtime(
     theta_t = dropper.compute_theta(step, theta_bar=theta_bar)
 
     if mode == "round":
-        active_layers, probs = dropper.sample_active_layers(
+        active_rel, probs_rel = dropper.sample_active_layers(
             step,
             theta_bar=theta_bar,
             min_active=min_active,
             rng=rng,
         )
+        active_layers = {window_start + idx for idx in active_rel}
         l_min = min(active_layers)
         effective_upper_k = total_layers - l_min
         update_paca_runtime(model, effective_upper_k)
@@ -279,11 +297,16 @@ def apply_pld_runtime(
                 continue
             param.requires_grad = layer_idx in active_layers
 
+        probs_full = [0.0] * window_start + probs_rel
         sorted_active = sorted(active_layers)
         logger.info(
-            "PLD [round] r=%d | θ(t)=%.3f | θ_bar=%.3f | dir=%s | "
-            "ativas=%d/%d %s | l_min=%d",
+            "PLD [round] r=%d | janela=[%d..%d] (PaCA=%d/%d) | θ(t)=%.3f | θ_bar=%.3f | "
+            "dir=%s | ativas=%d/%d %s | l_min=%d",
             round_num,
+            window_start,
+            total_layers - 1,
+            paca_k,
+            total_layers,
             theta_t,
             theta_bar,
             direction,
@@ -297,29 +320,42 @@ def apply_pld_runtime(
             "direction": direction,
             "theta_t": theta_t,
             "theta_bar": theta_bar,
-            "probs": probs,
+            "probs": probs_full,
             "active_layers": sorted_active,
+            "window_start": window_start,
+            "paca_k": paca_k,
             "l_min": l_min,
         }
 
-    probs = dropper.compute_keep_probs(step, theta_bar=theta_bar)
-    update_paca_runtime(model, total_layers)
-    _register_batch_pld_hooks(model, layers, probs, rng)
+    probs_rel = dropper.compute_keep_probs(step, theta_bar=theta_bar)
+    if window_size <= min_active:
+        probs_rel = [1.0] * window_size
+    update_paca_runtime(model, paca_k)
+    _register_batch_pld_hooks(model, layers, probs_rel, window_start=window_start)
+    probs_full = [0.0] * window_start + probs_rel
+    active_window = list(range(window_start, total_layers))
     logger.info(
-        "PLD [batch] r=%d | θ(t)=%.3f | θ_bar=%.3f | dir=%s | p_min=%.3f | p_max=%.3f",
+        "PLD [batch] r=%d | janela=[%d..%d] (PaCA=%d/%d) | θ(t)=%.3f | θ_bar=%.3f | "
+        "dir=%s | p_min=%.3f | p_max=%.3f",
         round_num,
+        window_start,
+        total_layers - 1,
+        paca_k,
+        total_layers,
         theta_t,
         theta_bar,
         direction,
-        min(probs),
-        max(probs),
+        min(probs_rel),
+        max(probs_rel),
     )
     return {
         "mode": mode,
         "direction": direction,
         "theta_t": theta_t,
         "theta_bar": theta_bar,
-        "probs": probs,
-        "active_layers": list(range(total_layers)),
-        "l_min": 0,
+        "probs": probs_full,
+        "active_layers": active_window,
+        "window_start": window_start,
+        "paca_k": paca_k,
+        "l_min": window_start,
     }

@@ -484,7 +484,7 @@ if [ "$ADAPTIVE_RANK" -eq 1 ]; then
 fi
 if [ "$PLD" -eq 1 ]; then
     if [ "$ADAPTIVE_PACA" -eq 1 ]; then
-        echo "  PLD (PUMA-PLD):     ATIVADO (mode=$PLD_MODE, dir=$PLD_DIRECTION, θ_bar=γ^c·PaCA/L, decay=$PLD_DECAY)"
+        echo "  PLD (PUMA-PLD):     ATIVADO (mode=$PLD_MODE, dir=$PLD_DIRECTION, θ_bar=$PLD_THETA na janela PaCA adaptativa, decay=$PLD_DECAY)"
     else
         echo "  PLD:                ATIVADO (mode=$PLD_MODE, dir=$PLD_DIRECTION, θ_bar=$PLD_THETA, decay=$PLD_DECAY)"
     fi
@@ -700,11 +700,11 @@ for RUN in $(seq $START_RUN $END_RUN); do
         if [ "$QLORA" -eq 1 ]; then
             CLIENT_CMD="$CLIENT_CMD --qlora"
         fi
+        if [ "$ADAPTIVE_PACA" -eq 1 ]; then
+            CLIENT_CMD="$CLIENT_CMD --adaptive-paca"
+        fi
         if [ "$PLD" -eq 1 ]; then
             CLIENT_CMD="$CLIENT_CMD --pld --pld-theta $PLD_THETA --pld-mode $PLD_MODE --pld-direction $PLD_DIRECTION --pld-decay $PLD_DECAY"
-            if [ "$ADAPTIVE_PACA" -eq 1 ]; then
-                CLIENT_CMD="$CLIENT_CMD --adaptive-paca"
-            fi
         fi
         if [ "$STRAGGLER_IDX" -ge 0 ]; then
             CLIENT_CMD="$CLIENT_CMD --straggler-idx $STRAGGLER_IDX --straggler-delay $STRAGGLER_DELAY --straggler-round $STRAGGLER_ROUND"

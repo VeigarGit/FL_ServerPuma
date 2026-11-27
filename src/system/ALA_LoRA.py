@@ -65,12 +65,20 @@ class ALA_LoRA:
         params_dict = dict(local_model.named_parameters())
 
         # Sincroniza adaptadores congelados (camadas dropadas pelo PLD/PaCA anteriormente)
+        to_resize_frozen = {}
         with torch.no_grad():
             for n, p in params_dict.items():
                 if not p.requires_grad and ("lora" in n or "sora" in n) and n in params_g_dict:
                     gp = params_g_dict[n]
                     if p.data.shape == gp.data.shape:
                         p.data.copy_(gp.data.to(device=p.device, dtype=p.dtype))
+                    else:
+                        to_resize_frozen[n] = gp.data
+        if to_resize_frozen:
+            from utils.fl_math import resize_model_to_pruned
+
+            resize_model_to_pruned(local_model, to_resize_frozen)
+            params_dict = dict(local_model.named_parameters())
         
         # Filter explicitly trainable parameters (LoRA, SoRA, Classifier Heads)
         trainable_names = [n for n, p in params_dict.items() if p.requires_grad]

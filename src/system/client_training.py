@@ -189,6 +189,7 @@ def build_client_model(
                 config["model"]["paca"]["enabled"] = False
                 config["model"]["paca"]["upper_layers"] = None
 
+            config["model"]["paca"]["adaptive"] = bool(getattr(args, "adaptive_paca", False))
             config["model"]["pld"] = _build_pld_config(args)
 
             if args.model == "clip":
@@ -247,6 +248,7 @@ def build_client_model(
                 run_config["model"]["paca"]["enabled"] = False
                 run_config["model"]["paca"]["upper_layers"] = None
 
+            run_config["model"]["paca"]["adaptive"] = bool(getattr(args, "adaptive_paca", False))
             run_config["model"]["pld"] = _build_pld_config(args)
             run_config["is_qlora"] = bool(args.qlora)
             if args.qlora:
@@ -271,7 +273,11 @@ def build_client_model(
                 logger.error(str(exc))
                 sys.exit(1)
 
-            run_config.setdefault("model", {})["pld"] = _build_pld_config(args)
+            model_cfg = run_config.setdefault("model", {})
+            model_cfg.setdefault("paca", {})["adaptive"] = bool(
+                getattr(args, "adaptive_paca", False)
+            )
+            model_cfg["pld"] = _build_pld_config(args)
 
             if args.qlora:
                 mode_tag = "QSoRA" if "sora" in args.strategy else "QLoRA"
@@ -434,6 +440,7 @@ def local_training(
         from lora_d1.d1_setup import set_d1_state_dict, update_paca_runtime
         from lora_d1.qlora import build_d1_optimizer
         from lora_d1.trainer import train_epoch_d1
+        from peft_common.pld import clear_pld_batch_hooks
         from peft_common.sora import build_sora_gate_sparsifier
 
         if state_dict and not state_loaded:
@@ -460,18 +467,21 @@ def local_training(
         )
 
         loss, acc = 0.0, 0.0
-        for _ in range(max(1, epochs)):
-            loss, acc = train_epoch_d1(
-                model,
-                train_loader,
-                optimizer,
-                None,
-                device,
-                brier_weight=brier_weight,
-                grad_accum_steps=grad_accum,
-                max_grad_norm=max_grad_norm,
-                sparse_optimizer=sparse_optimizer,
-            )
+        try:
+            for _ in range(max(1, epochs)):
+                loss, acc = train_epoch_d1(
+                    model,
+                    train_loader,
+                    optimizer,
+                    None,
+                    device,
+                    brier_weight=brier_weight,
+                    grad_accum_steps=grad_accum,
+                    max_grad_norm=max_grad_norm,
+                    sparse_optimizer=sparse_optimizer,
+                )
+        finally:
+            clear_pld_batch_hooks(model)
         logger.info(f"d1-2B Treino Local - Loss (CE+Brier): {loss:.4f} | Acc: {acc:.2f}%")
         return extract_trainable_model_state(model, model_type, run_config), personalized_acc
 
@@ -479,6 +489,7 @@ def local_training(
         from lora_lfm.lfm_setup import set_lfm_state_dict, update_paca_runtime
         from lora_lfm.qlora import build_lfm_optimizer
         from lora_lfm.trainer import train_epoch_lfm
+        from peft_common.pld import clear_pld_batch_hooks
         from peft_common.sora import build_sora_gate_sparsifier
 
         if state_dict:
@@ -502,16 +513,20 @@ def local_training(
             model, run_config or {}, round_num=round_num
         )
 
-        loss, acc = train_epoch_lfm(
-            model,
-            train_loader,
-            optimizer,
-            None,
-            device,
-            brier_weight=brier_weight,
-            grad_accum_steps=grad_accum,
-            sparse_optimizer=sparse_optimizer,
-        )
+        loss, acc = 0.0, 0.0
+        try:
+            loss, acc = train_epoch_lfm(
+                model,
+                train_loader,
+                optimizer,
+                None,
+                device,
+                brier_weight=brier_weight,
+                grad_accum_steps=grad_accum,
+                sparse_optimizer=sparse_optimizer,
+            )
+        finally:
+            clear_pld_batch_hooks(model)
         logger.info(f"LFM Treino Local - Loss (CE+Brier): {loss:.4f} | Acc: {acc:.2f}%")
         return extract_trainable_model_state(model, model_type, run_config), personalized_acc
 
@@ -522,6 +537,9 @@ def local_training(
         needs_ala = alaarg == 0 and round_num >= 2 and model_type != "slm"
 
         if needs_ala:
+            from peft_common.pld import clear_pld_batch_hooks
+
+            clear_pld_batch_hooks(model)
             global_model = copy.deepcopy(model)
             global_model = resize_model_to_pruned(global_model, state_dict)
             logger.info(f"Client {ala.cid}: Applying FedALA_LoRA (Adaptive Local Aggregation)...")
@@ -554,14 +572,12 @@ def local_training(
 
     # === 1. SELEÇÃO DE OTIMIZADOR E LOOP DE ÉPOCA ===
     if model_type in ["clip", "slm"]:
+        from peft_common.pld import clear_pld_batch_hooks
+
         if model_type == "clip":
             from lora_clip.clip_setup import build_optimizer, train_epoch, update_paca_runtime
         else:
             from lora_slm.slm_setup import build_optimizer, train_epoch, update_paca_runtime
-
-        _apply_layer_schedule(model, model_type, round_num, run_config, update_paca_runtime)
-
-        _log_trainable_param_count(model)
 
         if (
             model_type == "slm"
@@ -572,6 +588,17 @@ def local_training(
             model.slm_model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
+            slm_cfg = getattr(model.slm_model, "config", None)
+            if slm_cfg is not None:
+                if hasattr(slm_cfg, "use_cache"):
+                    slm_cfg.use_cache = False
+                text_cfg = getattr(slm_cfg, "text_config", None)
+                if text_cfg is not None and hasattr(text_cfg, "use_cache"):
+                    text_cfg.use_cache = False
+
+        _apply_layer_schedule(model, model_type, round_num, run_config, update_paca_runtime)
+
+        _log_trainable_param_count(model)
 
         optimizer, sparse_optimizer = build_optimizer(model, run_config)
         is_sora = run_config["model"]["lora"]["mode"] in [
@@ -582,20 +609,25 @@ def local_training(
             run_config["model"].get("sora", {}).get("sparse_lambda", 0.0) if is_sora else 0.0
         )
 
-        if model_type == "slm":
-            accumulation_steps = run_config.get("training", {}).get(
-                "gradient_accumulation_steps", 1
-            )
-            metrics = train_epoch(
-                model,
-                train_loader,
-                optimizer,
-                sparse_optimizer,
-                sparse_lambda,
-                accumulation_steps,
-            )
-        else:
-            metrics = train_epoch(model, train_loader, optimizer, sparse_optimizer, sparse_lambda)
+        try:
+            if model_type == "slm":
+                accumulation_steps = run_config.get("training", {}).get(
+                    "gradient_accumulation_steps", 1
+                )
+                metrics = train_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    sparse_optimizer,
+                    sparse_lambda,
+                    accumulation_steps,
+                )
+            else:
+                metrics = train_epoch(
+                    model, train_loader, optimizer, sparse_optimizer, sparse_lambda
+                )
+        finally:
+            clear_pld_batch_hooks(model)
 
         logger.info(
             f"Métricas do Treino Local - CE Loss: {metrics['ce_loss']:.4f} | "
